@@ -6,7 +6,9 @@ Run it under the chip queue, which sources ``tpu-env.sh`` and holds chip 0:
         --model qwen3-32b --checkpoint PATH --workload 1k/8k
 
 Prefix caching stays on. Pass ``--no-prefix-cache`` for the InferenceX runs,
-which disable it. A step that compiles after warmup fails the run.
+which disable it. A step that compiles after warmup fails the run. The same
+count is ``resin:compilations_total`` on ``/metrics``; pass it to
+``check_server.py --compilation-metric``.
 """
 
 from __future__ import annotations
