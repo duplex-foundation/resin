@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any, cast
 
 import pytest
 
@@ -88,10 +89,10 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
 
     monkeypatch.setattr(tpu_serve, "create_runner", create_runner)
     monkeypatch.setattr(tpu_serve, "create_recipe", create_recipe)
-    resin = ModuleType("resin")
+    resin = cast(Any, ModuleType("resin"))
     resin.Engine = Engine
     resin.SchedulerConfig = lambda **kwargs: kwargs
-    server = ModuleType("resin.server")
+    server = cast(Any, ModuleType("resin.server"))
     server.HttpServer = Server
     monkeypatch.setitem(sys.modules, "resin", resin)
     monkeypatch.setitem(sys.modules, "resin.server", server)

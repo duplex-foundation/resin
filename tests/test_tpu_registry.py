@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from types import ModuleType
+from typing import Any, cast
 
 import pytest
 
@@ -91,7 +92,7 @@ def test_tpu_factory_uses_the_workload_shape(monkeypatch, tmp_path):
 
     package = ModuleType("resin_models_tpu")
     plug = ModuleType("resin_models_tpu.qwen3")
-    plug.load_model = load_model
+    cast(Any, plug).load_model = load_model
     monkeypatch.setitem(sys.modules, "resin_models_tpu", package)
     monkeypatch.setitem(sys.modules, "resin_models_tpu.qwen3", plug)
 
