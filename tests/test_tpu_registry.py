@@ -60,8 +60,14 @@ def test_pinned_chip_still_needs_the_queue(monkeypatch):
     monkeypatch.delenv("JAX_PLATFORMS", raising=False)
     monkeypatch.setenv("TPU_VISIBLE_CHIPS", "0")
     monkeypatch.setenv("TPU_CHIPS_PER_HOST_BOUNDS", "1,1,1")
+    monkeypatch.delenv("TPU_HOST_BOUNDS", raising=False)
+    monkeypatch.delenv("TPU_WORKER_ID", raising=False)
     monkeypatch.delenv("RESIN_TPU_QUEUED", raising=False)
     monkeypatch.setattr("socket.gethostname", lambda: "dev-tpu-tpu7x8b-0")
+    with pytest.raises(RuntimeError, match="chip 0"):
+        require_tpu_chip()
+    monkeypatch.setenv("TPU_HOST_BOUNDS", "1,1,1")
+    monkeypatch.setenv("TPU_WORKER_ID", "0")
     require_tpu_chip()
     with pytest.raises(RuntimeError, match="chip queue"):
         require_tpu_chip(queued=True)

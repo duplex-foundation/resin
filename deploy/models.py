@@ -455,9 +455,11 @@ def require_tpu_chip(*, queued: bool = False) -> None:
 
     Importing JAX on the TPU host initializes every visible chip, so this
     checks the environment before any JAX import. ``JAX_PLATFORMS=cpu`` is
-    the off-chip path and skips the check. ``queued`` also requires
-    ``RESIN_TPU_QUEUED=1``, which ``scripts/tpu_serve.sh`` sets under the
-    chip queue.
+    the off-chip path and skips the check. The pin is the one ``tpu-env.sh``
+    exports, including the host bounds that keep JAX off the other host.
+    ``queued`` also requires ``RESIN_TPU_QUEUED=1``, which
+    ``scripts/tpu_serve.sh`` sets under the chip queue. The queue itself
+    clears its lock flag before the child starts, so the child cannot see it.
     """
 
     if os.environ.get("JAX_PLATFORMS") == "cpu":
@@ -468,6 +470,8 @@ def require_tpu_chip(*, queued: bool = False) -> None:
     pinned = (
         os.environ.get("TPU_VISIBLE_CHIPS") == "0"
         and os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS") == "1,1,1"
+        and os.environ.get("TPU_HOST_BOUNDS") == "1,1,1"
+        and os.environ.get("TPU_WORKER_ID") == "0"
     )
     if not pinned:
         raise RuntimeError(

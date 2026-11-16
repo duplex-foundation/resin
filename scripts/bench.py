@@ -919,7 +919,10 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workload",
         choices=tuple(TPU_WORKLOADS),
-        help="TPU server shape (required for TPU presets): 1k/1k, 1k/8k, or 8k/1k",
+        help=(
+            "TPU server shape, required for TPU presets. On the TPU host, run "
+            "under tpu-queue.sh with RESIN_TPU_QUEUED=1"
+        ),
     )
     parser.add_argument(
         "--prompt-source",
