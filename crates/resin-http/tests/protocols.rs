@@ -1494,3 +1494,219 @@ async fn responses_keep_output_indices_when_text_precedes_multiple_tool_calls() 
         assert_eq!(item["type"], kind);
     }
 }
+
+fn completion_request(mut body: Value) -> Request<Body> {
+    body["model"] = json!("test-model");
+    Request::post("/v1/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn recorded_completion(body: Value) -> Value {
+    let (status, response) = json_response(recording_router(1), completion_request(body)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    serde_json::from_str(response["choices"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn completions_forward_raw_text_and_token_prompts_without_messages() {
+    let text = recorded_completion(json!({"prompt": "Once upon"})).await;
+    assert_eq!(text["prompt"], "Once upon");
+    assert_eq!(text["messages"], json!([]));
+    assert_eq!(text["max_output_tokens"], Value::Null);
+    assert!(text["id"].as_str().unwrap().starts_with("cmpl_"));
+
+    let ids = recorded_completion(json!({"prompt": [5, 6, 7], "max_tokens": 4})).await;
+    assert_eq!(ids["prompt"], json!([5, 6, 7]));
+    assert_eq!(ids["max_output_tokens"], 4);
+
+    let single = recorded_completion(json!({"prompt": ["only one"]})).await;
+    assert_eq!(single["prompt"], "only one");
+    let single_ids = recorded_completion(json!({"prompt": [[1, 2]]})).await;
+    assert_eq!(single_ids["prompt"], json!([1, 2]));
+}
+
+#[tokio::test]
+async fn completions_response_uses_the_text_completion_shape() {
+    let (status, body) = json_response(
+        test_router(),
+        completion_request(json!({"prompt": "hi", "max_tokens": 8})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["model"], "test-model");
+    assert_eq!(body["choices"][0]["index"], 0);
+    assert_eq!(body["choices"][0]["text"], "hello");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert!(body["choices"][0]["logprobs"].is_null());
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 5);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+}
+
+#[tokio::test]
+async fn completions_stream_text_finish_reason_and_usage() {
+    let events = stream_events(
+        test_router(),
+        completion_request(json!({
+            "prompt": "hi", "stream": true, "stream_options": {"include_usage": true},
+        })),
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .all(|event| event["object"] == "text_completion")
+    );
+    let text = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["text"].as_str())
+        .collect::<String>();
+    assert_eq!(text, "hello");
+    let finish = events
+        .iter()
+        .find(|event| event["choices"][0]["finish_reason"] == "stop")
+        .expect("a chunk carries the finish reason");
+    assert_eq!(finish["choices"][0]["text"], "");
+    let usage = events.last().unwrap();
+    assert_eq!(usage["choices"], json!([]));
+    assert_eq!(usage["usage"]["completion_tokens"], 2);
+
+    let without_usage = stream_events(
+        test_router(),
+        completion_request(json!({"prompt": "hi", "stream": true})),
+    )
+    .await;
+    assert!(
+        without_usage
+            .iter()
+            .all(|event| event.get("usage").is_none())
+    );
+}
+
+#[tokio::test]
+async fn completions_reject_unsupported_or_malformed_requests() {
+    for (body, status) in [
+        (json!({"prompt": ""}), StatusCode::BAD_REQUEST),
+        (json!({"prompt": []}), StatusCode::BAD_REQUEST),
+        (json!({"prompt": ["a", "b"]}), StatusCode::BAD_REQUEST),
+        (json!({"prompt": [[1], [2]]}), StatusCode::BAD_REQUEST),
+        (json!({"prompt": "hi", "n": 2}), StatusCode::BAD_REQUEST),
+        (
+            json!({"prompt": "hi", "echo": true}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"prompt": "hi", "logprobs": 1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"prompt": "hi", "max_tokens": 0}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({"prompt": "hi", "stop": ""}), StatusCode::BAD_REQUEST),
+        (
+            json!({"prompt": "hi", "temperature": -1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
+        (json!({"prompt": [-1]}), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            json!({"prompt": [1, "a"]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = test_router()
+            .oneshot(completion_request(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{body}");
+    }
+    let wrong_model = Request::post("/v1/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"model": "other", "prompt": "hi"}).to_string(),
+        ))
+        .unwrap();
+    let (code, _) = json_response(test_router(), wrong_model).await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn completions_accept_null_optional_fields_sent_by_benchmark_clients() {
+    let request = recorded_completion(json!({
+        "prompt": "hi", "max_tokens": 3, "temperature": 0.0, "top_p": 1.0,
+        "logprobs": null, "ignore_eos": true, "stop": null, "n": 1, "echo": false,
+    }))
+    .await;
+    assert_eq!(request["temperature"], 0.0);
+    assert_eq!(request["ignore_eos"], true);
+    assert_eq!(request["logprobs"], false);
+}
+
+#[tokio::test]
+async fn ignore_eos_is_a_typed_completions_flag_that_chat_rejects() {
+    let default = recorded_completion(json!({"prompt": "hi"})).await;
+    assert_eq!(default["ignore_eos"], false);
+    for (value, expected) in [
+        (json!(true), true),
+        (json!(false), false),
+        (json!(null), false),
+    ] {
+        let body = json!({"prompt": "hi", "ignore_eos": value});
+        let request = recorded_completion(body).await;
+        assert_eq!(request["ignore_eos"], expected);
+        assert!(
+            !request["extra"]
+                .as_object()
+                .unwrap()
+                .contains_key("ignore_eos")
+        );
+    }
+
+    let chat = |value: Value| {
+        let body = json!({
+            "model": "test-model", "ignore_eos": value,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, body) = json_response(test_router(), chat(json!(true))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/completions")
+    );
+    for value in [json!(false), json!(null)] {
+        let (status, _) = json_response(test_router(), chat(value)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn completions_follow_the_openai_route_flag() {
+    let (jobs, _receiver) = mpsc::channel::<GenerationJob>(1);
+    let app = router(
+        "test-model",
+        jobs,
+        None,
+        RouteConfig {
+            enable_openai: false,
+            ..RouteConfig::default()
+        },
+        None,
+    );
+    let response = app
+        .oneshot(completion_request(json!({"prompt": "hi"})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

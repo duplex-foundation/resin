@@ -216,7 +216,11 @@ uv run python scripts/lfm2_serve.py
 
 Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
 counts, elapsed generation time, and output tokens per second. The same process
-serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
+serves `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`,
+and `/v1/models`. `/v1/completions` tokenizes the `prompt` as given: it applies no
+chat template, adds no BOS token, and reads special-token spellings as plain
+text. Send token IDs to control those. It accepts `ignore_eos` for fixed-length
+benchmarks.
 Both examples explicitly use the CPU Torch runner.
 
 ## Modal HTTP endpoints

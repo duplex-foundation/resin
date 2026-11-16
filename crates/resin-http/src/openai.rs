@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     AppState,
     protocol::{
-        ConversationRequest, FinishReason, GenerationEvent, ResponseAccumulator, ResponseOutput,
-        json_error,
+        ConversationRequest, FinishReason, GenerationEvent, RawPrompt, ResponseAccumulator,
+        ResponseOutput, json_error,
     },
     ui::index_html,
 };
@@ -72,7 +72,74 @@ pub(crate) struct ChatRequest {
     prompt_logprobs: bool,
     routed_dp_rank: Option<Value>,
     stop: Option<OneOrManyStrings>,
+    ignore_eos: Option<bool>,
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: StreamOptions,
+    n: Option<u32>,
+    cache_salt: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+/// The OpenAI `prompt` field: text or token IDs, alone or as a one-item batch.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PromptInput {
+    Text(String),
+    TokenIds(Vec<u32>),
+    Texts(Vec<String>),
+    TokenIdBatches(Vec<Vec<u32>>),
+}
+
+impl PromptInput {
+    fn into_raw(self) -> RequestResult<RawPrompt> {
+        let prompt = match self {
+            Self::Text(text) => RawPrompt::Text(text),
+            Self::TokenIds(ids) => RawPrompt::TokenIds(ids),
+            Self::Texts(texts) => RawPrompt::Text(single(texts)?),
+            Self::TokenIdBatches(batches) => RawPrompt::TokenIds(single(batches)?),
+        };
+        match &prompt {
+            RawPrompt::Text(text) if text.is_empty() => {
+                Err(invalid_request("prompt must not be empty"))
+            }
+            RawPrompt::TokenIds(ids) if ids.is_empty() => {
+                Err(invalid_request("prompt must not be empty"))
+            }
+            _ => Ok(prompt),
+        }
+    }
+}
+
+fn single<T>(mut batch: Vec<T>) -> RequestResult<T> {
+    match (batch.pop(), batch.is_empty()) {
+        (Some(prompt), true) => Ok(prompt),
+        _ => Err(invalid_request(
+            "Resin currently supports one prompt per request",
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CompletionRequest {
+    model: String,
+    priority: Option<i32>,
+    prompt: PromptInput,
+    max_tokens: Option<usize>,
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+    #[serde(default = "default_top_p")]
+    top_p: f64,
+    top_k: Option<u32>,
+    seed: Option<i64>,
+    logprobs: Option<u32>,
+    echo: Option<bool>,
+    ignore_eos: Option<bool>,
+    routed_dp_rank: Option<Value>,
+    stop: Option<OneOrManyStrings>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -190,6 +257,11 @@ fn chat_request(
     if body.n.unwrap_or(1) != 1 {
         return Err(invalid_request("Resin currently supports only n=1"));
     }
+    if body.ignore_eos == Some(true) {
+        return Err(invalid_request(
+            "ignore_eos is supported only by /v1/completions",
+        ));
+    }
     let max_output_tokens = body.max_completion_tokens.or(body.max_tokens);
     if max_output_tokens == Some(0) && !body.prompt_logprobs {
         return Err(invalid_request(
@@ -201,6 +273,7 @@ fn chat_request(
         priority: request_priority(state, body.priority)?,
         model: body.model,
         messages: body.messages,
+        prompt: None,
         tools: function_tools(body.tools)?,
         max_output_tokens,
         temperature: body.temperature,
@@ -212,6 +285,7 @@ fn chat_request(
         prompt_logprobs: body.prompt_logprobs,
         routed_dp_rank,
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
+        ignore_eos: false,
         reasoning_effort: body.reasoning_effort,
         cache_salt: body.cache_salt,
         extra: body.extra,
@@ -359,6 +433,163 @@ fn chat_chunk(
     })
 }
 
+pub async fn completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CompletionRequest>,
+) -> Response {
+    let stream = body.stream;
+    let include_usage = body.stream_options.include_usage;
+    let request = match completion_request(&state, &headers, body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let receiver = match state.enqueue(request.clone()) {
+        Ok(receiver) => receiver,
+        Err((status, message)) => {
+            return (status, Json(json_error(message, "server_error"))).into_response();
+        }
+    };
+    if stream {
+        completion_stream(request, receiver, include_usage).into_response()
+    } else {
+        completion_response(request, receiver).await
+    }
+}
+
+fn completion_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: CompletionRequest,
+) -> RequestResult<ConversationRequest> {
+    let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
+    validate_model(state, &body.model)?;
+    validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
+    validate_stops(body.stop.as_ref())?;
+    if body.n.unwrap_or(1) != 1 {
+        return Err(invalid_request("Resin currently supports only n=1"));
+    }
+    if body.echo == Some(true) {
+        return Err(invalid_request("Resin does not support echo"));
+    }
+    if body.logprobs.is_some() {
+        return Err(invalid_request(
+            "/v1/completions does not return logprobs; use /v1/chat/completions",
+        ));
+    }
+    if body.max_tokens == Some(0) {
+        return Err(invalid_request("max_tokens must be positive"));
+    }
+    let prompt = body.prompt.into_raw()?;
+    Ok(ConversationRequest {
+        id: state.request_id("cmpl"),
+        priority: request_priority(state, body.priority)?,
+        model: body.model,
+        messages: Vec::new(),
+        prompt: Some(prompt),
+        tools: Vec::new(),
+        max_output_tokens: body.max_tokens,
+        temperature: body.temperature,
+        top_p: body.top_p,
+        top_k: body.top_k,
+        seed: body.seed,
+        logprobs: false,
+        top_logprobs: 0,
+        prompt_logprobs: false,
+        routed_dp_rank,
+        stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
+        ignore_eos: body.ignore_eos.unwrap_or(false),
+        reasoning_effort: None,
+        cache_salt: body.cache_salt,
+        extra: body.extra,
+    })
+}
+
+async fn completion_response(
+    request: ConversationRequest,
+    receiver: mpsc::Receiver<GenerationEvent>,
+) -> Response {
+    let response = match ResponseAccumulator::collect(receiver).await {
+        Ok(response) => response,
+        Err(message) => return internal_error(message),
+    };
+    let reason = response.reason.expect("collector requires completion");
+    Json(json!({
+        "id": request.id,
+        "object": "text_completion",
+        "created": unix_seconds(),
+        "model": request.model,
+        "choices": [{
+            "index": 0,
+            "text": response.text,
+            "finish_reason": reason.openai(false),
+            "logprobs": null,
+        }],
+        "usage": usage(response.input_tokens, response.cached_tokens, response.output_tokens),
+    }))
+    .into_response()
+}
+
+fn completion_stream(
+    request: ConversationRequest,
+    mut receiver: mpsc::Receiver<GenerationEvent>,
+    include_usage: bool,
+) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
+    let output = stream! {
+        let mut terminated = false;
+        let created = unix_seconds();
+        while let Some(event) = receiver.recv().await {
+            match event {
+                GenerationEvent::TextDelta { delta, .. } => {
+                    yield Ok(Event::default().data(completion_chunk(&request, created, &delta, None).to_string()));
+                }
+                GenerationEvent::Finished { reason, input_tokens, cached_tokens, output_tokens, .. } => {
+                    terminated = true;
+                    let chunk = completion_chunk(&request, created, "", Some(reason.openai(false)));
+                    yield Ok(Event::default().data(chunk.to_string()));
+                    if include_usage {
+                        yield Ok(Event::default().data(json!({
+                            "id": request.id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [],
+                            "usage": usage(input_tokens, cached_tokens, output_tokens),
+                        }).to_string()));
+                    }
+                    break;
+                }
+                GenerationEvent::Error { message } => {
+                    terminated = true;
+                    yield Ok(Event::default().data(json_error(message, "server_error").to_string()));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !terminated {
+            yield Ok(Event::default().data(json_error("the inference stream ended before completion", "server_error").to_string()));
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(output).keep_alive(KeepAlive::default())
+}
+
+fn completion_chunk(
+    request: &ConversationRequest,
+    created: u64,
+    text: &str,
+    finish_reason: Option<&str>,
+) -> Value {
+    json!({
+        "id": request.id,
+        "object": "text_completion",
+        "created": created,
+        "model": request.model,
+        "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason}],
+    })
+}
+
 pub async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -466,6 +697,7 @@ fn responses_request(
         priority: request_priority(state, body.priority)?,
         model: body.model,
         messages,
+        prompt: None,
         tools: function_tools(body.tools)?,
         max_output_tokens,
         temperature: body.temperature,
@@ -477,6 +709,7 @@ fn responses_request(
         prompt_logprobs: body.prompt_logprobs,
         routed_dp_rank,
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
+        ignore_eos: false,
         reasoning_effort,
         cache_salt: body.cache_salt,
         extra: body.extra,

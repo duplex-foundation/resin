@@ -11,6 +11,10 @@ pub struct ConversationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
     pub messages: Vec<Value>,
+    /// A raw prompt replaces `messages`: the engine tokenizes it as given and
+    /// skips the model recipe's conversation rendering and response grammar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<RawPrompt>,
     pub tools: Vec<Value>,
     /// Omission lets the engine use the context budget left by the rendered prompt.
     pub max_output_tokens: Option<usize>,
@@ -23,10 +27,20 @@ pub struct ConversationRequest {
     pub prompt_logprobs: bool,
     pub routed_dp_rank: Option<usize>,
     pub stop: Vec<String>,
+    /// Keep generating through the model's stop tokens until a length limit or stop sequence.
+    #[serde(default)]
+    pub ignore_eos: bool,
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub cache_salt: Option<String>,
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum RawPrompt {
+    Text(String),
+    TokenIds(Vec<u32>),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

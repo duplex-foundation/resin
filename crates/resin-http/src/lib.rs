@@ -29,7 +29,7 @@ pub use metrics::{
 pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    TokenLogprob,
+    RawPrompt, TokenLogprob,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -41,7 +41,7 @@ pub type TokenCounter =
 /// Static configuration for HTTP route handlers.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteConfig {
-    /// Enable OpenAI API endpoints (/v1/responses, /v1/chat/completions).
+    /// Enable OpenAI API endpoints (/v1/responses, /v1/chat/completions, /v1/completions).
     pub enable_openai: bool,
 
     /// Enable Anthropic API endpoints (/v1/messages).
@@ -146,6 +146,7 @@ pub fn router(
         router = router
             .route("/v1/models", get(openai::models))
             .route("/v1/chat/completions", post(openai::chat_completions))
+            .route("/v1/completions", post(openai::completions))
             .route("/v1/responses", post(openai::responses))
             .route("/v1/responses/input_tokens", post(openai::input_tokens));
     }
