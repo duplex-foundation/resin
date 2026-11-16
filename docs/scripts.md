@@ -22,6 +22,8 @@ configuration belongs in `deploy/models.py`.
 | [sync_type_libraries.py](../scripts/sync_type_libraries.py)   | Make locked Linux dependency sources available to `ty` on the development host without importing those libraries or running their installation hooks.                                                       |
 | [normalize_stubs.py](../scripts/normalize_stubs.py)           | Add property types, protocol bases and imports missing from generated native bindings. Called by the build script.                                                                                          |
 | [cloc.py](../scripts/cloc.py)                                 | Count production Rust/Python code using Tokei, excluding tests and grouping the report by package.                                                                                                          |
+| [tpu-queue.sh](../scripts/tpu-queue.sh)                       | Queue one chip-0 job behind `/tmp/resin-tpu-chip0.lock` (the same `flock` other jobs use), source `tpu-env.sh`, and append a JSONL record of the image, commit, and command.                               |
+| [tpu-env.sh](../scripts/tpu-env.sh)                           | Pin a shell to chip 0 on `dev-tpu-tpu7x8b-0`. `tpu-queue.sh` sources this while it holds the chip lock.                                                                                                      |
 
 ## Deployment modules
 
