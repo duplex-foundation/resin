@@ -635,12 +635,6 @@ def _ragged_paged_attention_kernel_loop(
                     def _update_cur_bkv():
                         start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-                effective_bkv_sz = jnp.maximum(
-                    jnp.minimum(effective_kv_len - bkv_idx * bkv_sz, bkv_sz), 0
-                )
-                num_loops = cdiv(effective_bkv_sz, bkv_csz)
-
-                @pl.loop(0, num_loops, unroll=False)
                 def attention_loop(idx):
                     prev_lm_slice = None
                     prev_p = None
@@ -691,6 +685,15 @@ def _ragged_paged_attention_kernel_loop(
                     flash_attention_step2_pv(
                         prev_p, prev_v, prev_exp_m_diff, acc_ref.at[*prev_lm_slice]
                     )
+
+                if bkv_csz == bkv_sz:
+                    attention_loop(jnp.int32(0))
+                else:
+                    effective_bkv_sz = jnp.maximum(
+                        jnp.minimum(effective_kv_len - bkv_idx * bkv_sz, bkv_sz), 0
+                    )
+                    num_loops = cdiv(effective_bkv_sz, bkv_csz)
+                    pl.loop(0, num_loops, unroll=False)(attention_loop)
 
             acc = acc_ref[...]
             l_denom = broadcast_minor(l_ref[...], acc.shape)
