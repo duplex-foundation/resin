@@ -668,77 +668,66 @@ def _clamp_mixed_vmem(
 
 
 def _build_tpu7x_rpa_mixed_tuned_table() -> dict[_MixedTableKey, RpaBlockSizes]:
-    shapes = (
-        (32, 4, 128),
-        (64, 8, 128),
-        (16, 2, 128),
-        (16, 2, 256),
-        (16, 4, 256),
-        (32, 4, 256),
-        (32, 8, 256),
-        (8, 2, 256),
-    )
+    # Restricted to shapes swept on TPU7x chip 0: Qwen3-32B tp=2 (32, 4, 128) at
+    # page_size=256. Unswept shapes (tp=1, head_dim=256, page_size=128) fall back
+    # to get_default_block_sizes until measured on hardware.
+    page_size = 256
+    q_heads, kv_heads, aligned_hd = 32, 4, 128
+    group_pow2 = next_power_of_2(q_heads // kv_heads)
+    target_bq = max(1, 2048 // group_pow2)
+    target_bq_c = max(1, 1024 // group_pow2)
     table: dict[_MixedTableKey, RpaBlockSizes] = {}
-    for page_size in (128, 256):
-        for kv_name in ("float8_e4m3fn", "float8_e5m2", "bfloat16"):
-            q_dtype = jnp.bfloat16
-            kv_dtype = jnp.dtype(kv_name)
-            for q_heads, kv_heads, aligned_hd in shapes:
-                group_pow2 = next_power_of_2(q_heads // kv_heads)
-                target_bq = max(1, 2048 // group_pow2)
-                target_bq_c = max(1, 1024 // group_pow2)
-                for q_bucket in (128, 256, 512, 1024, 2048, 4096, 8192):
-                    bq = max(1, min(target_bq, max(1, q_bucket // 2)))
-                    bq_c = max(1, min(target_bq_c, bq))
-                    while bq % bq_c != 0:
-                        bq_c -= 1
-                    for kv_bucket in (256, 512, 1024, 2048, 4096, 8192):
-                        if kv_bucket < page_size:
-                            continue
-                        cur_bq = bq
-                        cur_bq_c = bq_c
-                        if kv_bucket <= 2048:
-                            if page_size == 256 and q_bucket <= 1024:
-                                cur_bq = min(128, cur_bq)
-                                cur_bq_c = min(64, cur_bq)
-                                bkv = min(1024, kv_bucket)
-                                bkv_c = min(256, bkv)
-                            else:
-                                cur_bq_c = min(64 if page_size == 256 else 128, cur_bq)
-                                bkv = min(512, kv_bucket)
-                                bkv_c = min(512 if page_size == 128 else 256, bkv)
-                        else:
-                            bkv = min(2048, kv_bucket)
-                            bkv_c = min(1024, bkv)
-                        while cur_bq % cur_bq_c != 0:
-                            cur_bq_c -= 1
-                        bkv = max(page_size, (bkv // page_size) * page_size)
-                        bkv_c = max(page_size, (bkv_c // page_size) * page_size)
-                        while bkv % bkv_c != 0:
-                            bkv_c -= page_size
-                        cand = _clamp_mixed_vmem(
-                            RpaBlockSizes(cur_bq, bkv, cur_bq_c, bkv_c),
-                            actual_num_kv_heads=kv_heads,
-                            actual_num_q_heads_per_kv_head=q_heads // kv_heads,
-                            actual_head_dim=aligned_hd,
-                            min_kv_unit=page_size,
-                            q_dtype=q_dtype,
-                            kv_dtype=kv_dtype,
-                            max_scratch=int(
-                                _MIXED_VMEM_SCRATCH_FRACTION * _TPU7X_VMEM_BYTES
-                            ),
-                        )
-                        table[
-                            (
-                                page_size,
-                                kv_name,
-                                q_heads,
-                                kv_heads,
-                                aligned_hd,
-                                q_bucket,
-                                kv_bucket,
-                            )
-                        ] = cand
+    for kv_name in ("float8_e4m3fn", "float8_e5m2", "bfloat16"):
+        q_dtype = jnp.bfloat16
+        kv_dtype = jnp.dtype(kv_name)
+        for q_bucket in (128, 256, 512, 1024, 2048, 4096, 8192):
+            bq = max(1, min(target_bq, max(1, q_bucket // 2)))
+            bq_c = max(1, min(target_bq_c, bq))
+            while bq % bq_c != 0:
+                bq_c -= 1
+            for kv_bucket in (256, 512, 1024, 2048, 4096, 8192):
+                cur_bq = bq
+                cur_bq_c = bq_c
+                if kv_bucket <= 2048:
+                    if q_bucket <= 1024:
+                        cur_bq = min(128, cur_bq)
+                        cur_bq_c = min(64, cur_bq)
+                        bkv = min(1024, kv_bucket)
+                        bkv_c = min(256, bkv)
+                    else:
+                        cur_bq_c = min(64, cur_bq)
+                        bkv = min(512, kv_bucket)
+                        bkv_c = min(256, bkv)
+                else:
+                    bkv = min(2048, kv_bucket)
+                    bkv_c = min(1024, bkv)
+                while cur_bq % cur_bq_c != 0:
+                    cur_bq_c -= 1
+                bkv = max(page_size, (bkv // page_size) * page_size)
+                bkv_c = max(page_size, (bkv_c // page_size) * page_size)
+                while bkv % bkv_c != 0:
+                    bkv_c -= page_size
+                cand = _clamp_mixed_vmem(
+                    RpaBlockSizes(cur_bq, bkv, cur_bq_c, bkv_c),
+                    actual_num_kv_heads=kv_heads,
+                    actual_num_q_heads_per_kv_head=q_heads // kv_heads,
+                    actual_head_dim=aligned_hd,
+                    min_kv_unit=page_size,
+                    q_dtype=q_dtype,
+                    kv_dtype=kv_dtype,
+                    max_scratch=int(_MIXED_VMEM_SCRATCH_FRACTION * _TPU7X_VMEM_BYTES),
+                )
+                table[
+                    (
+                        page_size,
+                        kv_name,
+                        q_heads,
+                        kv_heads,
+                        aligned_hd,
+                        q_bucket,
+                        kv_bucket,
+                    )
+                ] = cand
     return table
 
 
@@ -796,6 +785,8 @@ def get_rpa_block_sizes(
                 max_scratch=int(cap_frac * eff_limit),
             )
     elif case == RpaCase.MIXED and version == 7:
+        # kv_bucket keys on the static arena horizon (pages_per_seq - 1) * page_size
+        # rather than runtime prompt length, matching per-workload max_model_len.
         table_kv = pages_per_seq * page_size
         horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
         kv_bucket = _largest_pow2_multiple(min(horizon_kv, 8192), page_size)

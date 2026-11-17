@@ -442,6 +442,7 @@ class TestFp8Weights:
             mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
         ):
             export_modes: tuple[DecodeMatmulMode, ...] = (
+                "auto",
                 "pallas",
                 "n_split_pallas",
                 "xla",
@@ -457,10 +458,25 @@ class TestFp8Weights:
                     decode_matmul_mode=mode,
                     impl=ragged_paged_attention,
                 )
+                if mode == "auto":
+                    assert model._resolve_prefill_matmul_backend(512) == "xla"
+                    assert model._resolve_prefill_matmul_backend(1024) == "xla"
+                    assert model._resolve_prefill_matmul_backend(2048) == "pallas"
+                    assert model._resolve_prefill_matmul_backend(4096) == "pallas"
+                    assert model._resolve_prefill_matmul_backend(8192) == "pallas"
+                    assert model._resolve_decode_matmul_mode(8) == "xla"
+                    assert model._resolve_decode_matmul_mode(256) == "xla"
+                    assert model._resolve_decode_matmul_mode(288) == "pallas"
+                    assert model._resolve_decode_matmul_mode(320) == "pallas"
+
                 tokens_to_check = (
-                    ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320), (4096, 320))
-                    if mode == "pallas"
-                    else ((320, 320),)
+                    ((8, 8), (320, 320), (1024, 320), (4096, 320))
+                    if mode == "auto"
+                    else (
+                        ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320))
+                        if mode == "pallas"
+                        else ((320, 320),)
+                    )
                 )
                 for tokens, seqs in tokens_to_check:
                     inp = ModelInputs(
@@ -488,9 +504,15 @@ class TestFp8Weights:
                         jax.jit(model.hidden_states, donate_argnums=(1,)),
                         platforms=["tpu"],
                     )(params, caches, inp)
-                    mlir = exported.mlir_module()
-                    assert "tpu_custom_call" in mlir
-                    assert "func.func private @_run(" not in mlir
+                    mlir_txt = exported.mlir_module()
+                    assert "tpu_custom_call" in mlir_txt
+                    assert "func.func private @_run(" not in mlir_txt
+                    if mode == "auto" and tokens == 1024:
+                        assert "fp8_gate_up_swiglu_512_" not in mlir_txt
+                        assert "fp8_w8a8_matmul_" not in mlir_txt
+                    elif mode == "auto" and tokens == 4096:
+                        assert "fp8_gate_up_swiglu_512_1280_5120" in mlir_txt
+                        assert "fp8_w8a8_matmul_256_5120_5120" in mlir_txt
 
     def test_decode_matmul_modes_tp2_vs_tp1_parity_and_zero_pmax(
         self, tmp_path

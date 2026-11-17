@@ -372,6 +372,11 @@ class Qwen3Model:
             impl=self.impl,
         )
 
+    def _resolve_prefill_matmul_backend(self, tokens: int) -> MatmulBackend:
+        if self.prefill_matmul_backend == "auto" and get_tpu_version() >= 7:
+            return "xla" if tokens <= 1024 else "pallas"
+        return self.prefill_matmul_backend
+
     def _hidden_states_fp8_sequence_parallel(
         self, params: Qwen3Params, caches: Caches, inputs: ModelInputs
     ) -> tuple[jax.Array, Caches]:
@@ -380,11 +385,7 @@ class Qwen3Model:
         tokens = inputs.input_ids.shape[0]
         q_width = config.num_attention_heads * config.head_dim
         layers = params.layers
-        backend: MatmulBackend = (
-            ("xla" if tokens <= 1024 else "pallas")
-            if self.prefill_matmul_backend == "auto" and get_tpu_version() >= 7
-            else self.prefill_matmul_backend
-        )
+        backend = self._resolve_prefill_matmul_backend(tokens)
 
         x = jax.shard_map(
             lambda ids, emb: emb[ids],
@@ -503,9 +504,10 @@ class Qwen3Model:
         is_prefill = tokens >= _PREFILL_MATMUL_MIN_TOKENS
         dec_interp = (not is_prefill) and self._force_decode_pallas_interpret
         if is_prefill:
-            col_backend: MatmulBackend = self.prefill_matmul_backend
-            gu_backend: MatmulBackend = self.prefill_matmul_backend
-            row_backend: MatmulBackend = self.prefill_matmul_backend
+            pref_be = self._resolve_prefill_matmul_backend(tokens)
+            col_backend: MatmulBackend = pref_be
+            gu_backend: MatmulBackend = pref_be
+            row_backend: MatmulBackend = pref_be
             row_sync_tp_scale = True
             row_n_split = 1
         else:

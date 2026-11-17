@@ -1656,9 +1656,11 @@ class TestPrefillKernels:
         w_gate = quantize_fp8_weight(
             jnp.asarray(rng.standard_normal((256, 256)) * 0.02, jnp.bfloat16)
         )
-        w_up = quantize_fp8_weight(
-            jnp.asarray(rng.standard_normal((256, 256)) * 0.02, jnp.bfloat16)
-        )
+        w_up_np = rng.standard_normal((256, 256)).astype(np.float32) * 0.02
+        # Skew the second TP shard's FFN magnitudes by 10x so dropping lax.pmax on
+        # local_abs_max leaves shard 0's scale 10x too small and clips shard 1.
+        w_up_np[128:] *= 10.0
+        w_up = quantize_fp8_weight(jnp.asarray(w_up_np, jnp.bfloat16))
         w_gu_q = jnp.concatenate([w_gate.qvalue, w_up.qvalue], axis=0)
         w_gu_s = jnp.concatenate([w_gate.scale, w_up.scale], axis=0)
         gated_pal, local_abs = pallas_fp8_gate_up_swiglu(
@@ -1750,6 +1752,18 @@ class TestPrefillKernels:
                     backend=backend,
                     interpret=interp,
                 )
+                if backend == "pallas":
+                    assert abs_sh is not None
+                    full_abs = np.max(np.abs(np.asarray(g_sh, np.float32)), axis=-1)
+                    shard_arrays = [
+                        np.asarray(shard.data, np.float32)
+                        for shard in abs_sh.addressable_shards
+                    ]
+                    np.testing.assert_array_equal(shard_arrays[0], shard_arrays[1])
+                    for s_arr in shard_arrays:
+                        np.testing.assert_allclose(
+                            s_arr, full_abs, rtol=1e-2, atol=1e-2
+                        )
                 rs_out = sharded_fp8_matmul_reduce_scatter(
                     g_sh,
                     w_down_q,
@@ -1786,12 +1800,14 @@ class TestPrefillKernels:
             static_validate_inputs,
         )
 
-        # 1. Validate every _TPU7X_RPA_MIXED_TUNED_BLOCKS entry for divisibility,
-        # page alignment, and <= 48 MiB VMEM cap.
-        vmem_cap = 48 * 1024 * 1024
+        # 1. Validate every _TPU7X_RPA_MIXED_TUNED_BLOCKS entry matches the swept
+        # Qwen3-32B tp=2 (32, 4, 128), page_size=256 domain and <= 28.8 MiB (0.45 * 64 MiB) cap.
+        tpu7x_vmem_bytes = 64 * 1024 * 1024
+        vmem_cap = int(0.45 * tpu7x_vmem_bytes)
         assert len(_TPU7X_RPA_MIXED_TUNED_BLOCKS) > 0
         for key, blocks in _TPU7X_RPA_MIXED_TUNED_BLOCKS.items():
             page_size, kv_name, q_heads, kv_heads, aligned_hd, q_bucket, kv_bucket = key
+            assert (page_size, q_heads, kv_heads, aligned_hd) == (256, 32, 4, 128)
             assert isinstance(blocks, RpaBlockSizes)
             assert blocks.bq_sz % blocks.bq_csz == 0
             assert blocks.bkv_sz % blocks.bkv_csz == 0
@@ -1809,6 +1825,85 @@ class TestPrefillKernels:
             )
             assert vmem <= vmem_cap
 
+        # Pin the swept Qwen3-32B tp=2 selections and runtime 64 MiB VMEM clamping.
+        pinned_qwen3_tp2 = {
+            (jnp.float8_e4m3fn, 9, 1024): RpaBlockSizes(128, 1024, 64, 256),
+            (jnp.bfloat16, 9, 1024): RpaBlockSizes(128, 1024, 64, 256),
+            (jnp.float8_e4m3fn, 9, 4096): RpaBlockSizes(256, 512, 64, 256),
+            (jnp.bfloat16, 9, 4096): RpaBlockSizes(256, 512, 64, 256),
+            (jnp.float8_e4m3fn, 37, 4096): RpaBlockSizes(256, 2048, 128, 1024),
+            (jnp.bfloat16, 37, 4096): RpaBlockSizes(128, 2048, 128, 1024),
+        }
+        for (kv_dt, pps, max_tok), want_blocks in pinned_qwen3_tp2.items():
+            for vlim in (None, tpu7x_vmem_bytes):
+                got_pinned = get_rpa_block_sizes(
+                    jnp.bfloat16,
+                    kv_dt,
+                    actual_num_q_heads=32,
+                    actual_num_kv_heads=4,
+                    head_dim=128,
+                    page_size=256,
+                    max_num_tokens=max_tok,
+                    max_num_seqs=320,
+                    pages_per_seq=pps,
+                    case=RpaCase.MIXED,
+                    tpu_version=7,
+                    vmem_limit_bytes=vlim,
+                )
+                assert got_pinned == want_blocks
+                assert (
+                    get_vmem_estimate_bytes(
+                        4,
+                        8,
+                        128,
+                        got_pinned.bq_sz,
+                        got_pinned.bkv_sz,
+                        jnp.bfloat16,
+                        kv_dt,
+                    )
+                    <= vmem_cap
+                )
+
+        # Unswept shapes (tp=1, head_dim=256, page_size=128) must fall back to get_default_block_sizes.
+        for unswept_q, unswept_kv, unswept_hd, unswept_ps, unswept_pps in (
+            (64, 8, 128, 256, 9),
+            (64, 8, 128, 256, 37),
+            (16, 4, 256, 256, 37),
+            (32, 8, 256, 256, 37),
+            (32, 4, 128, 128, 9),
+        ):
+            got_unswept = get_rpa_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                actual_num_q_heads=unswept_q,
+                actual_num_kv_heads=unswept_kv,
+                head_dim=unswept_hd,
+                page_size=unswept_ps,
+                max_num_tokens=4096,
+                max_num_seqs=320,
+                pages_per_seq=unswept_pps,
+                case=RpaCase.MIXED,
+                tpu_version=7,
+                vmem_limit_bytes=tpu7x_vmem_bytes,
+            )
+            want_default = RpaBlockSizes(
+                **get_default_block_sizes(
+                    jnp.bfloat16,
+                    jnp.float8_e4m3fn,
+                    actual_num_q_heads=unswept_q,
+                    actual_num_kv_heads=unswept_kv,
+                    head_dim=unswept_hd,
+                    page_size=unswept_ps,
+                    max_num_tokens=4096,
+                    max_num_seqs=320,
+                    pages_per_seq=unswept_pps,
+                    case=RpaCase.MIXED,
+                    tpu_version=7,
+                    vmem_limit_bytes=tpu7x_vmem_bytes,
+                )
+            )
+            assert got_unswept == want_default
+
         for pps in (1, 6, 9, 37):
             for ps in (128, 256):
                 got = get_rpa_block_sizes(
@@ -1823,6 +1918,7 @@ class TestPrefillKernels:
                     pages_per_seq=pps,
                     case=RpaCase.MIXED,
                     tpu_version=7,
+                    vmem_limit_bytes=tpu7x_vmem_bytes,
                 )
                 assert got.bkv_sz <= pps * ps
                 assert got.bkv_sz % got.bkv_csz == 0
