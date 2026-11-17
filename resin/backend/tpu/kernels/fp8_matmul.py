@@ -60,60 +60,6 @@ class Fp8MatmulTileSizes(NamedTuple):
 
 def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]:
     table: dict[tuple[int, int, int], Fp8MatmulTileSizes] = {
-        (8, 4096, 5120): Fp8MatmulTileSizes(8, 1024, 5120),
-        (8, 512, 5120): Fp8MatmulTileSizes(8, 512, 2560),
-        (8, 5120, 4096): Fp8MatmulTileSizes(8, 2560, 4096),
-        (8, 5120, 5120): Fp8MatmulTileSizes(8, 1024, 5120),
-        (8, 5120, 8192): Fp8MatmulTileSizes(8, 1280, 8192),
-        (8, 5120, 12800): Fp8MatmulTileSizes(8, 5120, 512),
-        (8, 5120, 25600): Fp8MatmulTileSizes(8, 640, 25600),
-        (8, 12800, 5120): Fp8MatmulTileSizes(8, 1280, 5120),
-        (8, 25600, 5120): Fp8MatmulTileSizes(8, 1024, 5120),
-        (16, 4096, 5120): Fp8MatmulTileSizes(16, 1024, 5120),
-        (16, 512, 5120): Fp8MatmulTileSizes(16, 512, 2560),
-        (16, 5120, 4096): Fp8MatmulTileSizes(16, 2560, 4096),
-        (16, 5120, 5120): Fp8MatmulTileSizes(16, 1024, 5120),
-        (16, 5120, 8192): Fp8MatmulTileSizes(16, 1280, 8192),
-        (16, 5120, 12800): Fp8MatmulTileSizes(16, 5120, 512),
-        (16, 5120, 25600): Fp8MatmulTileSizes(16, 640, 25600),
-        (16, 12800, 5120): Fp8MatmulTileSizes(16, 1280, 5120),
-        (16, 25600, 5120): Fp8MatmulTileSizes(16, 1024, 5120),
-        (32, 4096, 5120): Fp8MatmulTileSizes(32, 2048, 2560),
-        (32, 512, 5120): Fp8MatmulTileSizes(32, 512, 2560),
-        (32, 5120, 4096): Fp8MatmulTileSizes(32, 5120, 2048),
-        (32, 5120, 5120): Fp8MatmulTileSizes(32, 2560, 2560),
-        (32, 5120, 8192): Fp8MatmulTileSizes(32, 2560, 4096),
-        (32, 5120, 12800): Fp8MatmulTileSizes(32, 2560, 2560),
-        (32, 5120, 25600): Fp8MatmulTileSizes(32, 640, 25600),
-        (32, 12800, 5120): Fp8MatmulTileSizes(32, 3200, 2560),
-        (32, 25600, 5120): Fp8MatmulTileSizes(32, 25600, 512),
-        (64, 4096, 5120): Fp8MatmulTileSizes(64, 2048, 2560),
-        (64, 512, 5120): Fp8MatmulTileSizes(64, 512, 2560),
-        (64, 5120, 4096): Fp8MatmulTileSizes(64, 5120, 2048),
-        (64, 5120, 5120): Fp8MatmulTileSizes(64, 5120, 1024),
-        (64, 5120, 8192): Fp8MatmulTileSizes(64, 1280, 8192),
-        (64, 5120, 12800): Fp8MatmulTileSizes(64, 5120, 2560),
-        (64, 5120, 25600): Fp8MatmulTileSizes(64, 640, 25600),
-        (64, 12800, 5120): Fp8MatmulTileSizes(64, 3200, 1280),
-        (64, 25600, 5120): Fp8MatmulTileSizes(64, 5120, 1024),
-        (128, 4096, 5120): Fp8MatmulTileSizes(128, 2048, 2560),
-        (128, 512, 5120): Fp8MatmulTileSizes(128, 512, 2560),
-        (128, 5120, 4096): Fp8MatmulTileSizes(128, 5120, 1024),
-        (128, 5120, 5120): Fp8MatmulTileSizes(128, 5120, 2560),
-        (128, 5120, 8192): Fp8MatmulTileSizes(128, 5120, 2048),
-        (128, 5120, 12800): Fp8MatmulTileSizes(128, 1024, 2560),
-        (128, 5120, 25600): Fp8MatmulTileSizes(128, 512, 25600),
-        (128, 12800, 5120): Fp8MatmulTileSizes(128, 2560, 2560),
-        (128, 25600, 5120): Fp8MatmulTileSizes(128, 1024, 2560),
-        (256, 4096, 5120): Fp8MatmulTileSizes(256, 2048, 2560),
-        (256, 512, 5120): Fp8MatmulTileSizes(256, 512, 2560),
-        (256, 5120, 4096): Fp8MatmulTileSizes(128, 5120, 4096),
-        (256, 5120, 5120): Fp8MatmulTileSizes(256, 2560, 2560),
-        (256, 5120, 8192): Fp8MatmulTileSizes(256, 1280, 8192),
-        (256, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 512),
-        (256, 5120, 25600): Fp8MatmulTileSizes(256, 5120, 2560),
-        (256, 12800, 5120): Fp8MatmulTileSizes(256, 2560, 2560),
-        (256, 25600, 5120): Fp8MatmulTileSizes(256, 2560, 2560),
         (512, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
         (512, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
         (512, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
@@ -136,7 +82,9 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         (2048, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
         (2048, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
         (2048, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (2048, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
         (2048, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (2048, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
         (2048, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (2048, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (4096, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
@@ -156,21 +104,43 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         (8192, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (8192, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
     }
-    # Qwen3-32B decode compilation buckets [96, 160, 192, 224, 288, 320]:
-    # batch_block == bs keeps n_batch == 1 so x_abs_max [1, bs] needs no 128-lane pad.
+    # Qwen3-32B tp=2 decode buckets (bs <= 320):
+    # batch_block == bs keeps n_batch == 1 (zero 128-lane scale pad), out_block % 256 == 0
+    # fills all 256 MXU columns, and in_block == K_local keeps n_in == 1 (zero acc_scratch).
+    for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
+        table[(bs, 4096, 5120)] = Fp8MatmulTileSizes(bs, 1024, 5120)
+        table[(bs, 512, 5120)] = Fp8MatmulTileSizes(bs, 512, 5120)
+        table[(bs, 2560, 4096)] = Fp8MatmulTileSizes(bs, 2560, 4096)
+        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(bs, 2560, 4096)
+        table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(
+            bs, 2560 if bs <= 192 else 1280, 5120
+        )
+        table[(bs, 2560, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800)
+        table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(
+            bs, 1024 if bs <= 128 else 512, 12800
+        )
+        table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
+        table[(bs, 25600, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
+    # Qwen3-32B tp=1 shapes stay at their base entries (not re-tuned on chip in RT-32):
+    table.update(
+        {
+            (8, 5120, 8192): Fp8MatmulTileSizes(8, 1280, 8192),
+            (8, 5120, 25600): Fp8MatmulTileSizes(8, 640, 25600),
+            (16, 5120, 8192): Fp8MatmulTileSizes(16, 1280, 8192),
+            (16, 5120, 25600): Fp8MatmulTileSizes(16, 640, 25600),
+            (32, 5120, 8192): Fp8MatmulTileSizes(32, 2560, 4096),
+            (32, 5120, 25600): Fp8MatmulTileSizes(32, 640, 25600),
+            (64, 5120, 8192): Fp8MatmulTileSizes(64, 1280, 8192),
+            (64, 5120, 25600): Fp8MatmulTileSizes(64, 640, 25600),
+            (128, 5120, 8192): Fp8MatmulTileSizes(128, 5120, 2048),
+            (128, 5120, 25600): Fp8MatmulTileSizes(128, 512, 25600),
+            (256, 5120, 8192): Fp8MatmulTileSizes(256, 1280, 8192),
+            (256, 5120, 25600): Fp8MatmulTileSizes(256, 5120, 2560),
+        }
+    )
     for bs in (96, 160, 192, 224, 288, 320):
-        table[(bs, 4096, 5120)] = Fp8MatmulTileSizes(bs, 2048, 2560)
-        table[(bs, 512, 5120)] = Fp8MatmulTileSizes(bs, 512, 2560)
-        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(bs, 2560, 2048)
-        table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(bs, 2560, 2560)
         table[(bs, 5120, 8192)] = Fp8MatmulTileSizes(bs, 2560, 4096)
-        table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(bs, 2560, 1280)
         table[(bs, 5120, 25600)] = Fp8MatmulTileSizes(bs, 2560, 2560)
-        table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 2560, 2560)
-        table[(bs, 25600, 5120)] = Fp8MatmulTileSizes(bs, 2560, 2560)
-    # Qwen3-32B tp=1 fused QKV (10240, 5120), fused gate_up (51200, 5120), and 2048 row shapes:
-    table[(2048, 5120, 8192)] = Fp8MatmulTileSizes(1024, 2560, 2048)
-    table[(2048, 5120, 25600)] = Fp8MatmulTileSizes(1024, 2560, 2560)
     for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
         table[(bs, 10240, 5120)] = Fp8MatmulTileSizes(
             bs, 2048 if bs <= 16 else 2560, 5120 if bs <= 16 else 2560
@@ -233,9 +203,12 @@ def quantize_fp8_act(
     *,
     dtype: Any = jnp.float8_e4m3fn,
     tp_axis: str | None = None,
+    sync_tp_scale: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Dynamically quantize activations per token along the trailing ``K`` axis."""
-    return _quantize_symmetric_fp8(x, axis=-1, dtype=dtype, tp_axis=tp_axis)
+    return _quantize_symmetric_fp8(
+        x, axis=-1, dtype=dtype, tp_axis=tp_axis if sync_tp_scale else None
+    )
 
 
 def _validate_matmul_shapes(x_k: int, w: jax.Array, w_scale: jax.Array) -> None:
@@ -271,7 +244,7 @@ def get_tuned_block_sizes(
     return Fp8MatmulTileSizes(batch_block, out_block, in_block)
 
 
-def _estimate_vmem_limit_bytes(
+def _raw_vmem_estimate_bytes(
     *,
     n_batch: int,
     n_out: int,
@@ -285,9 +258,7 @@ def _estimate_vmem_limit_bytes(
     out_dtype: Any,
     save_acc: bool,
     save_x_q: bool,
-    tpu_version: int,
 ) -> int:
-    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
     x_bytes = batch_block_size * in_block_size * jnp.dtype(x_dtype).itemsize
     absmax_bytes = batch_block_size * 4
     w_bytes = out_block_size * in_block_size * jnp.dtype(w_q_dtype).itemsize
@@ -313,7 +284,41 @@ def _estimate_vmem_limit_bytes(
         scratch += (
             n_in * batch_block_size * in_block_size * jnp.dtype(x_q_dtype).itemsize
         )
-    return min(max(in_out + 2 * scratch, 4 * 1024 * 1024), upper)
+    return in_out + 2 * scratch
+
+
+def _estimate_vmem_limit_bytes(
+    *,
+    n_batch: int,
+    n_out: int,
+    n_in: int,
+    batch_block_size: int,
+    out_block_size: int,
+    in_block_size: int,
+    x_dtype: Any,
+    x_q_dtype: Any,
+    w_q_dtype: Any,
+    out_dtype: Any,
+    save_acc: bool,
+    save_x_q: bool,
+    tpu_version: int,
+) -> int:
+    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
+    raw = _raw_vmem_estimate_bytes(
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block_size,
+        out_block_size=out_block_size,
+        in_block_size=in_block_size,
+        x_dtype=x_dtype,
+        x_q_dtype=x_q_dtype,
+        w_q_dtype=w_q_dtype,
+        out_dtype=out_dtype,
+        save_acc=save_acc,
+        save_x_q=save_x_q,
+    )
+    return min(max(raw, 4 * 1024 * 1024), upper)
 
 
 def _unfold_bools(
@@ -424,15 +429,9 @@ def fp8_matmul_prequantized(
         preferred_element_type=jnp.float32,
     )
     eff_reduce = jnp.dtype(out_dtype if reduce_dtype is None else reduce_dtype)
-    if eff_reduce == jnp.float32 and scatter_axis is None:
-        if tp_axis is not None:
-            dot = jax.lax.psum(dot, axis_name=tp_axis)
-        scaled = dot * x_scale_2d * w_scale.astype(jnp.float32)[None, :]
-        return scaled.astype(out_dtype).reshape(*leading, w.shape[0])
-
-    scaled = (dot * x_scale_2d * w_scale.astype(jnp.float32)[None, :]).astype(
-        eff_reduce
-    )
+    scaled = dot * x_scale_2d * w_scale.astype(jnp.float32)[None, :]
+    if eff_reduce != jnp.float32:
+        scaled = scaled.astype(eff_reduce)
     if scatter_axis is not None:
         scaled = jax.lax.psum_scatter(
             scaled, axis_name=scatter_axis, scatter_dimension=0, tiled=True
@@ -454,6 +453,7 @@ def xla_fp8_matmul(
     reduce_dtype: Any | None = None,
     tp_axis: str | None = None,
     scatter_axis: str | None = None,
+    sync_tp_scale: bool = True,
 ) -> jax.Array:
     """Pure-JAX Qwix-equivalent FP8 W8A8 matmul using XLA native MXU ``dot_general``."""
     if x.dtype == w.dtype:
@@ -470,7 +470,9 @@ def xla_fp8_matmul(
             w.dtype
         )
     else:
-        x_q, eff_x_scale = quantize_fp8_act(x, dtype=w.dtype, tp_axis=tp_axis)
+        x_q, eff_x_scale = quantize_fp8_act(
+            x, dtype=w.dtype, tp_axis=tp_axis, sync_tp_scale=sync_tp_scale
+        )
     return fp8_matmul_prequantized(
         x_q,
         eff_x_scale,
@@ -494,6 +496,7 @@ def pallas_fp8_matmul(
     reduce_dtype: Any | None = None,
     tp_axis: str | None = None,
     scatter_axis: str | None = None,
+    sync_tp_scale: bool = True,
     tile_sizes: Fp8MatmulTileSizes | None = None,
     interpret: bool = False,
 ) -> jax.Array:
@@ -503,22 +506,28 @@ def pallas_fp8_matmul(
     leading = x.shape[:-1]
     orig_k = x.shape[-1]
     orig_n = w.shape[0]
-    x_2d = x.reshape(-1, orig_k)
+    x_2d = x if x.ndim == 2 else x.reshape(-1, orig_k)
     orig_batch = x_2d.shape[0]
     x_q_dtype = jnp.dtype(w.dtype)
     quantize_activation = x_q_dtype != x_2d.dtype
 
     if quantize_activation:
         if x_abs_max is not None:
-            absmax_1d = x_abs_max.reshape(orig_batch).astype(jnp.float32)
+            if x_abs_max.shape == (1, orig_batch) and x_abs_max.dtype == jnp.float32:
+                x_scale_or_absmax = x_abs_max
+            else:
+                x_scale_or_absmax = x_abs_max.reshape(1, orig_batch).astype(jnp.float32)
         else:
             absmax_1d = jnp.max(jnp.abs(x_2d.astype(jnp.float32)), axis=-1)
-            if tp_axis is not None:
+            if tp_axis is not None and sync_tp_scale:
                 absmax_1d = jax.lax.pmax(absmax_1d, axis_name=tp_axis)
-        x_scale_or_absmax = jnp.expand_dims(absmax_1d, axis=0)
+            x_scale_or_absmax = jnp.expand_dims(absmax_1d, axis=0)
         has_x_scale = True
     elif x_scale is not None:
-        x_scale_or_absmax = x_scale.reshape(1, orig_batch).astype(jnp.float32)
+        if x_scale.shape == (1, orig_batch) and x_scale.dtype == jnp.float32:
+            x_scale_or_absmax = x_scale
+        else:
+            x_scale_or_absmax = x_scale.reshape(1, orig_batch).astype(jnp.float32)
         has_x_scale = True
     else:
         x_scale_or_absmax = jnp.ones((1, orig_batch), dtype=jnp.float32)
@@ -723,14 +732,17 @@ def pallas_fp8_gate_up_swiglu(
     leading = x_q.shape[:-1]
     orig_k = x_q.shape[-1]
     orig_ffn = w_gate_up.shape[0] // 2
-    x_2d = x_q.reshape(-1, orig_k)
+    x_2d = x_q if x_q.ndim == 2 else x_q.reshape(-1, orig_k)
     orig_batch = x_2d.shape[0]
-    x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
+    if x_scale.shape == (1, orig_batch) and x_scale.dtype == jnp.float32:
+        x_scale_row = x_scale
+    else:
+        x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
 
     if tile_sizes is None:
         batch_block = (
             align_to(max(8, orig_batch), 8)
-            if orig_batch < 128
+            if orig_batch <= 320
             else min(align_to(orig_batch, 128), 512)
         )
         out_block = (
@@ -754,26 +766,25 @@ def pallas_fp8_gate_up_swiglu(
     padded_ffn = align_to(orig_ffn, out_block)
     padded_k = align_to(orig_k, in_block)
 
-    w_gate = w_gate_up[:orig_ffn]
-    w_up = w_gate_up[orig_ffn:]
-    ws_gate = w_scale[:orig_ffn].astype(jnp.float32)
-    ws_up = w_scale[orig_ffn:].astype(jnp.float32)
-
     if orig_batch < padded_batch:
         pad_b = padded_batch - orig_batch
         x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
         x_scale_row = jnp.pad(x_scale_row, ((0, 0), (0, pad_b)))
-    if orig_ffn < padded_ffn:
-        pad_n = padded_ffn - orig_ffn
-        w_gate = jnp.pad(w_gate, ((0, pad_n), (0, 0)))
-        w_up = jnp.pad(w_up, ((0, pad_n), (0, 0)))
-        ws_gate = jnp.pad(ws_gate, (0, pad_n))
-        ws_up = jnp.pad(ws_up, (0, pad_n))
     if orig_k < padded_k:
+        x_2d = jnp.pad(x_2d, ((0, 0), (0, padded_k - orig_k)))
+
+    if orig_ffn == padded_ffn and orig_k == padded_k:
+        w_in = w_gate_up
+        ws_2d = jnp.expand_dims(w_scale.astype(jnp.float32), axis=0)
+    else:
+        pad_n = padded_ffn - orig_ffn
         pad_k = padded_k - orig_k
-        x_2d = jnp.pad(x_2d, ((0, 0), (0, pad_k)))
-        w_gate = jnp.pad(w_gate, ((0, 0), (0, pad_k)))
-        w_up = jnp.pad(w_up, ((0, 0), (0, pad_k)))
+        w_gate = jnp.pad(w_gate_up[:orig_ffn], ((0, pad_n), (0, pad_k)))
+        w_up = jnp.pad(w_gate_up[orig_ffn:], ((0, pad_n), (0, pad_k)))
+        w_in = jnp.concatenate([w_gate, w_up], axis=0)
+        ws_gate = jnp.pad(w_scale[:orig_ffn].astype(jnp.float32), (0, pad_n))
+        ws_up = jnp.pad(w_scale[orig_ffn:].astype(jnp.float32), (0, pad_n))
+        ws_2d = jnp.expand_dims(jnp.concatenate([ws_gate, ws_up], axis=0), axis=0)
 
     n_batch = padded_batch // batch_block
     n_out = padded_ffn // out_block
@@ -803,10 +814,10 @@ def pallas_fp8_gate_up_swiglu(
                     (out_block, in_block), lambda _b, o, i: (o_idx(o), i_idx(i))
                 ),
                 pl.BlockSpec(
-                    (out_block, in_block), lambda _b, o, i: (o_idx(o), i_idx(i))
+                    (out_block, in_block), lambda _b, o, i: (n_out + o_idx(o), i_idx(i))
                 ),
                 pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, o_idx(o))),
-                pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, o_idx(o))),
+                pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, n_out + o_idx(o))),
                 pl.BlockSpec((1, batch_block), lambda b, _o, _i: (0, b_idx(b))),
             ],
             out_specs=[
@@ -837,10 +848,10 @@ def pallas_fp8_gate_up_swiglu(
 
     gated_padded, absmax_3d = kernel(
         x_2d,
-        w_gate,
-        w_up,
-        jnp.expand_dims(ws_gate, axis=0),
-        jnp.expand_dims(ws_up, axis=0),
+        w_in,
+        w_in,
+        ws_2d,
+        ws_2d,
         x_scale_row,
     )
     gated = gated_padded[:orig_batch, :orig_ffn].reshape(*leading, orig_ffn)
@@ -875,6 +886,7 @@ def fp8_matmul(
     reduce_dtype: Any | None = None,
     tp_axis: str | None = None,
     scatter_axis: str | None = None,
+    sync_tp_scale: bool = True,
     backend: MatmulBackend = "auto",
     tile_sizes: Fp8MatmulTileSizes | None = None,
     interpret: bool = False,
@@ -897,6 +909,7 @@ def fp8_matmul(
             reduce_dtype=reduce_dtype,
             tp_axis=tp_axis,
             scatter_axis=scatter_axis,
+            sync_tp_scale=sync_tp_scale,
             tile_sizes=tile_sizes,
             interpret=interpret,
         )
@@ -910,7 +923,27 @@ def fp8_matmul(
         reduce_dtype=reduce_dtype,
         tp_axis=tp_axis,
         scatter_axis=scatter_axis,
+        sync_tp_scale=sync_tp_scale,
     )
+
+
+def _scale_shard_spec(
+    scale: jax.Array,
+    *,
+    mesh: Mesh,
+    in_axis: str | None,
+    sync_tp_scale: bool,
+    n_rows: int,
+) -> P:
+    if in_axis is not None:
+        tp = int(mesh.shape[in_axis])
+        if not sync_tp_scale and scale.shape == (tp, n_rows):
+            return P(in_axis, None)
+        if sync_tp_scale and tp > 1 and scale.shape == (tp, n_rows):
+            raise ValueError(
+                f"Per-die scale shape {scale.shape} requires sync_tp_scale=False"
+            )
+    return P(*((None,) * scale.ndim))
 
 
 def sharded_fp8_matmul(
@@ -924,10 +957,17 @@ def sharded_fp8_matmul(
     x_abs_max: jax.Array | None = None,
     out_dtype: Any = jnp.bfloat16,
     reduce_dtype: Any | None = None,
+    sync_tp_scale: bool = True,
+    n_split: int = 1,
+    tile_sizes: Fp8MatmulTileSizes | None = None,
     backend: MatmulBackend = "auto",
     interpret: bool = False,
 ) -> jax.Array:
     """Run column-parallel (``P("tp", None)``) or row-parallel (``P(None, "tp")``) ``fp8_matmul``."""
+    if n_split not in (1, 2):
+        raise ValueError(f"Expected n_split in (1, 2), got {n_split}")
+    if n_split == 2 and w.shape[0] % 2 != 0:
+        raise ValueError(f"n_split=2 requires even weight rows, got w.shape={w.shape}")
     spec = (
         weight_sharding.spec
         if isinstance(weight_sharding, NamedSharding)
@@ -935,13 +975,175 @@ def sharded_fp8_matmul(
     )
     out_axis = spec[0] if len(spec) > 0 else None
     in_axis = spec[1] if len(spec) > 1 else None
+    leading = x.shape[:-1]
+    n_rows = x.reshape(-1, x.shape[-1]).shape[0]
     prefix_none = (None,) * (x.ndim - 1)
     x_spec = P(*prefix_none, in_axis)
     scale_spec = P(out_axis)
     out_spec = P(*prefix_none, out_axis)
 
+    if backend == "gspmd_xla":
+        if n_split != 1:
+            raise ValueError("backend='gspmd_xla' requires n_split=1")
+        if in_axis is None and out_axis is not None:
+            if x.dtype == w.dtype:
+                xq_2d = x.reshape(-1, x.shape[-1])
+                xs_2d = (
+                    jnp.ones((n_rows, 1), dtype=jnp.float32)
+                    if x_scale is None
+                    else x_scale.reshape(n_rows, 1).astype(jnp.float32)
+                )
+            else:
+                xq, xs = quantize_fp8_act(x.reshape(n_rows, -1), dtype=w.dtype)
+                xq_2d, xs_2d = xq, xs.astype(jnp.float32)
+            dot = jax.lax.dot_general(
+                xq_2d,
+                w,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            dot = jax.lax.with_sharding_constraint(
+                dot, NamedSharding(mesh, P(None, out_axis))
+            )
+            scaled = (dot * xs_2d * w_scale.astype(jnp.float32)[None, :]).astype(
+                out_dtype
+            )
+            return scaled.reshape(*leading, w.shape[0])
+
+        if in_axis is not None and out_axis is None:
+            if not sync_tp_scale:
+                raise ValueError(
+                    "Row-parallel backend='gspmd_xla' requires sync_tp_scale=True"
+                )
+            bound = _fp8_bound(w.dtype)
+            if x.dtype == w.dtype:
+                xq_sh = x.reshape(n_rows, -1)
+                raw_xs = (
+                    jnp.ones((n_rows, 1), dtype=jnp.float32)
+                    if x_scale is None
+                    else x_scale.reshape(n_rows, 1).astype(jnp.float32)
+                )
+                xs_2d = jax.lax.with_sharding_constraint(
+                    raw_xs, NamedSharding(mesh, P(None, None))
+                )
+            elif x_abs_max is not None:
+                xs_2d = safe_fp8_scale(x_abs_max.reshape(n_rows, 1), bound)
+                xq_sh = jax.shard_map(
+                    lambda xl, sf: jnp.clip(
+                        xl.astype(jnp.float32) / sf, -bound, bound
+                    ).astype(w.dtype),
+                    mesh=mesh,
+                    in_specs=(P(None, in_axis), P(None, None)),
+                    out_specs=P(None, in_axis),
+                    check_vma=False,
+                )(x.reshape(n_rows, -1), xs_2d)
+            else:
+                xq_sh, xs_2d = jax.shard_map(
+                    lambda xl: quantize_fp8_act(xl, dtype=w.dtype, tp_axis=in_axis),
+                    mesh=mesh,
+                    in_specs=P(None, in_axis),
+                    out_specs=(P(None, in_axis), P(None, None)),
+                    check_vma=False,
+                )(x.reshape(n_rows, -1))
+            dot = jax.lax.dot_general(
+                xq_sh,
+                w,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            dot = jax.lax.with_sharding_constraint(
+                dot, NamedSharding(mesh, P(None, None))
+            )
+            scaled = (
+                dot * xs_2d.astype(jnp.float32) * w_scale.astype(jnp.float32)[None, :]
+            ).astype(out_dtype)
+            return jax.lax.with_sharding_constraint(
+                scaled.reshape(*leading, w.shape[0]),
+                NamedSharding(mesh, out_spec),
+            )
+
+    def _run_local(
+        x_shard: jax.Array,
+        w_shard: jax.Array,
+        s_shard: jax.Array,
+        *,
+        xs_shard: jax.Array | None = None,
+        xa_shard: jax.Array | None = None,
+    ) -> jax.Array:
+        if n_split == 2 and in_axis is not None and out_axis is None:
+            half_n = w_shard.shape[0] // 2
+            eff_reduce = jnp.dtype(out_dtype if reduce_dtype is None else reduce_dtype)
+            if x_shard.dtype != w_shard.dtype:
+                bound = _fp8_bound(w_shard.dtype)
+                x_2d = x_shard.reshape(n_rows, -1)
+                if xa_shard is not None:
+                    abs_col = xa_shard.reshape(n_rows, 1).astype(jnp.float32)
+                else:
+                    abs_col = jnp.max(
+                        jnp.abs(x_2d.astype(jnp.float32)), axis=-1, keepdims=True
+                    )
+                    if sync_tp_scale:
+                        abs_col = jax.lax.pmax(abs_col, axis_name=in_axis)
+                s_col = safe_fp8_scale(abs_col, bound)
+                xq_in = jnp.clip(
+                    x_2d.astype(jnp.float32) / s_col, -bound, bound
+                ).astype(w_shard.dtype)
+                xs_in = jnp.transpose(s_col)
+            else:
+                xq_in = x_shard.reshape(n_rows, -1)
+                xs_in = xs_shard
+
+            lo_part = fp8_matmul(
+                xq_in,
+                w_shard[:half_n],
+                s_shard[:half_n],
+                x_scale=xs_in,
+                out_dtype=eff_reduce,
+                tp_axis=None,
+                backend=backend,
+                tile_sizes=tile_sizes,
+                interpret=interpret,
+            )
+            lo = jax.lax.psum(lo_part, axis_name=in_axis).astype(out_dtype)
+            hi_part = fp8_matmul(
+                xq_in,
+                w_shard[half_n:],
+                s_shard[half_n:],
+                x_scale=xs_in,
+                out_dtype=eff_reduce,
+                tp_axis=None,
+                backend=backend,
+                tile_sizes=tile_sizes,
+                interpret=interpret,
+            )
+            hi = jax.lax.psum(hi_part, axis_name=in_axis).astype(out_dtype)
+            return jnp.concatenate([lo, hi], axis=-1).reshape(
+                *leading, w_shard.shape[0]
+            )
+
+        return fp8_matmul(
+            x_shard,
+            w_shard,
+            s_shard,
+            x_scale=xs_shard,
+            x_abs_max=xa_shard,
+            out_dtype=out_dtype,
+            reduce_dtype=reduce_dtype,
+            tp_axis=in_axis,
+            sync_tp_scale=sync_tp_scale,
+            backend=backend,
+            tile_sizes=tile_sizes,
+            interpret=interpret,
+        )
+
     if x_scale is not None:
-        xs_spec = P(*((None,) * x_scale.ndim))
+        xs_spec = _scale_shard_spec(
+            x_scale,
+            mesh=mesh,
+            in_axis=in_axis,
+            sync_tp_scale=sync_tp_scale,
+            n_rows=n_rows,
+        )
 
         def _local_with_scale(
             x_shard: jax.Array,
@@ -949,17 +1151,7 @@ def sharded_fp8_matmul(
             w_shard: jax.Array,
             s_shard: jax.Array,
         ) -> jax.Array:
-            return fp8_matmul(
-                x_shard,
-                w_shard,
-                s_shard,
-                x_scale=xs_shard,
-                out_dtype=out_dtype,
-                reduce_dtype=reduce_dtype,
-                tp_axis=in_axis,
-                backend=backend,
-                interpret=interpret,
-            )
+            return _run_local(x_shard, w_shard, s_shard, xs_shard=xs_shard)
 
         return jax.shard_map(
             _local_with_scale,
@@ -970,7 +1162,13 @@ def sharded_fp8_matmul(
         )(x, x_scale, w, w_scale)
 
     if x_abs_max is not None:
-        xa_spec = P(*((None,) * x_abs_max.ndim))
+        xa_spec = _scale_shard_spec(
+            x_abs_max,
+            mesh=mesh,
+            in_axis=in_axis,
+            sync_tp_scale=sync_tp_scale,
+            n_rows=n_rows,
+        )
 
         def _local_with_absmax(
             x_shard: jax.Array,
@@ -978,17 +1176,7 @@ def sharded_fp8_matmul(
             w_shard: jax.Array,
             s_shard: jax.Array,
         ) -> jax.Array:
-            return fp8_matmul(
-                x_shard,
-                w_shard,
-                s_shard,
-                x_abs_max=xa_shard,
-                out_dtype=out_dtype,
-                reduce_dtype=reduce_dtype,
-                tp_axis=in_axis,
-                backend=backend,
-                interpret=interpret,
-            )
+            return _run_local(x_shard, w_shard, s_shard, xa_shard=xa_shard)
 
         return jax.shard_map(
             _local_with_absmax,
@@ -999,16 +1187,7 @@ def sharded_fp8_matmul(
         )(x, x_abs_max, w, w_scale)
 
     def _local(x_shard: jax.Array, w_shard: jax.Array, s_shard: jax.Array) -> jax.Array:
-        return fp8_matmul(
-            x_shard,
-            w_shard,
-            s_shard,
-            out_dtype=out_dtype,
-            reduce_dtype=reduce_dtype,
-            tp_axis=in_axis,
-            backend=backend,
-            interpret=interpret,
-        )
+        return _run_local(x_shard, w_shard, s_shard)
 
     return jax.shard_map(
         _local,
@@ -1090,11 +1269,12 @@ def sharded_fp8_gate_up_swiglu(
     *,
     mesh: Mesh,
     sequence_parallel: bool = True,
+    sync_tp_scale: bool = True,
     out_dtype: Any = jnp.bfloat16,
     backend: MatmulBackend = "auto",
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Run column-parallel ``gate_up`` + SwiGLU, returning ``(gated, synced_absmax)``."""
+    """Run column-parallel ``gate_up`` + SwiGLU, returning ``(gated, absmax)``."""
     use_pallas = backend == "pallas" or (
         backend == "auto"
         and (interpret or get_tpu_version() >= 7)
@@ -1152,6 +1332,7 @@ def sharded_fp8_gate_up_swiglu(
     x_spec = P(TP_AXIS, None) if sequence_parallel else P(None, None)
 
     if use_pallas:
+        abs_out_spec = P() if sync_tp_scale else P(TP_AXIS, None)
 
         def _pallas_local(
             xq_local: jax.Array,
@@ -1176,16 +1357,19 @@ def sharded_fp8_gate_up_swiglu(
                 out_dtype=out_dtype,
                 interpret=interpret,
             )
-            synced_abs_max = jax.lax.pmax(
-                jnp.max(local_abs_max, axis=0), axis_name=TP_AXIS
-            )
-            return gated_local, synced_abs_max
+            if sync_tp_scale:
+                reduced_abs_max = jax.lax.pmax(
+                    jnp.max(local_abs_max, axis=0), axis_name=TP_AXIS
+                )
+            else:
+                reduced_abs_max = jnp.max(local_abs_max, axis=0, keepdims=True)
+            return gated_local, reduced_abs_max
 
         return jax.shard_map(
             _pallas_local,
             mesh=mesh,
             in_specs=(x_spec, x_spec, P(TP_AXIS, None), P(TP_AXIS)),
-            out_specs=(P(None, TP_AXIS), P()),
+            out_specs=(P(None, TP_AXIS), abs_out_spec),
             check_vma=False,
         )(x_q, x_scale, w_gate_up, w_scale)
 
@@ -1224,19 +1408,47 @@ def sharded_fp8_matmul_reduce_scatter(
     w_scale: jax.Array,
     *,
     mesh: Mesh,
+    x_scale: jax.Array | None = None,
     x_abs_max: jax.Array | None = None,
     out_dtype: Any = jnp.bfloat16,
     reduce_dtype: Any | None = None,
+    sync_tp_scale: bool = True,
     backend: MatmulBackend = "auto",
     interpret: bool = False,
 ) -> jax.Array:
     """Run row-parallel (``P(None, "tp")``) ``fp8_matmul`` and ``psum_scatter`` to ``P("tp", None)``."""
+    n_rows = x.reshape(-1, x.shape[-1]).shape[0]
     if backend == "gspmd_xla":
         # GSPMD native dot_general reduces partial sums in preferred_element_type (float32)
         # with is_spmd_generated="true" so post_spmd_conservative can overlap the collective.
         del reduce_dtype
+        if not sync_tp_scale:
+            raise ValueError(
+                "sharded_fp8_matmul_reduce_scatter backend='gspmd_xla' requires sync_tp_scale=True"
+            )
         bound = _fp8_bound(w.dtype)
-        if x_abs_max is not None:
+        if x.dtype == w.dtype:
+            x_q = x.reshape(n_rows, -1)
+            x_scale_full = (
+                jnp.ones((n_rows, 1), dtype=jnp.float32)
+                if x_scale is None
+                else x_scale.reshape(n_rows, 1).astype(jnp.float32)
+            )
+
+            def _slice_scale(s_full: jax.Array) -> jax.Array:
+                tp = jax.lax.psum(1, axis_name=TP_AXIS)
+                idx = jax.lax.axis_index(TP_AXIS)
+                chunk = s_full.shape[0] // tp
+                return jax.lax.dynamic_slice_in_dim(s_full, idx * chunk, chunk, axis=0)
+
+            x_scale_shard = jax.shard_map(
+                _slice_scale,
+                mesh=mesh,
+                in_specs=P(),
+                out_specs=P(TP_AXIS, None),
+                check_vma=False,
+            )(x_scale_full)
+        elif x_abs_max is not None:
             x_scale_full = safe_fp8_scale(x_abs_max.reshape(-1, 1), bound)
 
             def _quant_from_scale(
@@ -1301,11 +1513,18 @@ def sharded_fp8_matmul_reduce_scatter(
             NamedSharding(mesh, P(TP_AXIS, None)),
         )
 
-    if x_abs_max is not None:
+    if x_scale is not None:
+        xs_spec = _scale_shard_spec(
+            x_scale,
+            mesh=mesh,
+            in_axis=TP_AXIS,
+            sync_tp_scale=sync_tp_scale,
+            n_rows=n_rows,
+        )
 
-        def _local_pre_absmax(
+        def _local_pre_scale(
             x_shard: jax.Array,
-            xa_rep: jax.Array,
+            xs_shard: jax.Array,
             w_shard: jax.Array,
             s_rep: jax.Array,
         ) -> jax.Array:
@@ -1313,11 +1532,49 @@ def sharded_fp8_matmul_reduce_scatter(
                 x_shard,
                 w_shard,
                 s_rep,
-                x_abs_max=xa_rep,
+                x_scale=xs_shard,
                 out_dtype=out_dtype,
                 reduce_dtype=reduce_dtype,
                 tp_axis=None,
                 scatter_axis=TP_AXIS,
+                sync_tp_scale=sync_tp_scale,
+                backend=backend,
+                interpret=interpret,
+            )
+
+        return jax.shard_map(
+            _local_pre_scale,
+            mesh=mesh,
+            in_specs=(P(None, TP_AXIS), xs_spec, P(None, TP_AXIS), P()),
+            out_specs=P(TP_AXIS, None),
+            check_vma=False,
+        )(x, x_scale, w, w_scale)
+
+    if x_abs_max is not None:
+        xa_spec = _scale_shard_spec(
+            x_abs_max,
+            mesh=mesh,
+            in_axis=TP_AXIS,
+            sync_tp_scale=sync_tp_scale,
+            n_rows=n_rows,
+        )
+
+        def _local_pre_absmax(
+            x_shard: jax.Array,
+            xa_shard: jax.Array,
+            w_shard: jax.Array,
+            s_rep: jax.Array,
+        ) -> jax.Array:
+            return fp8_matmul(
+                x_shard,
+                w_shard,
+                s_rep,
+                x_abs_max=xa_shard,
+                out_dtype=out_dtype,
+                reduce_dtype=reduce_dtype,
+                tp_axis=None,
+                scatter_axis=TP_AXIS,
+                sync_tp_scale=sync_tp_scale,
                 backend=backend,
                 interpret=interpret,
             )
@@ -1325,7 +1582,7 @@ def sharded_fp8_matmul_reduce_scatter(
         return jax.shard_map(
             _local_pre_absmax,
             mesh=mesh,
-            in_specs=(P(None, TP_AXIS), P(), P(None, TP_AXIS), P()),
+            in_specs=(P(None, TP_AXIS), xa_spec, P(None, TP_AXIS), P()),
             out_specs=P(TP_AXIS, None),
             check_vma=False,
         )(x, x_abs_max, w, w_scale)
@@ -1343,6 +1600,7 @@ def sharded_fp8_matmul_reduce_scatter(
             reduce_dtype=reduce_dtype,
             tp_axis=TP_AXIS,
             scatter_axis=TP_AXIS,
+            sync_tp_scale=sync_tp_scale,
             backend=backend,
             interpret=interpret,
         )
