@@ -104,7 +104,15 @@ impl Trace {
                     .sum();
                 let tail_start = self.raw.len() - tail;
                 let emit = tail_start + utf8_emit_len(&self.raw[tail_start..], flush).0;
-                (emit, std::str::from_utf8(&self.raw[..emit]).is_ok())
+                // An empty piece ends a `<0xNN>` run, so bytes on either side never fuse.
+                let fused = self
+                    .pending
+                    .iter()
+                    .any(|piece| piece.token.bytes.is_empty());
+                (
+                    emit,
+                    !fused && std::str::from_utf8(&self.raw[..emit]).is_ok(),
+                )
             }
         };
         if emit_len == 0 {
@@ -300,27 +308,29 @@ fn decode(
     fallback: bool,
     result: &mut AttributedText,
 ) -> Result<(), Error> {
-    let invalid_fallback = fallback && std::str::from_utf8(bytes).is_err();
     let (mut source, mut piece_index, mut piece_offset) = (0, 0, 0);
     while source < bytes.len() {
-        let (valid_len, invalid_len) = if invalid_fallback {
-            (0, 1)
+        let (valid_len, invalid_len) = match std::str::from_utf8(&bytes[source..]) {
+            Ok(_) => (bytes.len() - source, 0),
+            Err(error) => (
+                error.valid_up_to(),
+                error
+                    .error_len()
+                    .unwrap_or(bytes.len() - source - error.valid_up_to()),
+            ),
+        };
+        // Each ill-formed subpart is fixed by its own bytes, so replacing it alone
+        // keeps the output independent of how pushes split the token stream.
+        let (replacements, replacement_len) = if fallback {
+            (invalid_len, 1)
         } else {
-            match std::str::from_utf8(&bytes[source..]) {
-                Ok(_) => (bytes.len() - source, 0),
-                Err(error) => (
-                    error.valid_up_to(),
-                    error
-                        .error_len()
-                        .unwrap_or(bytes.len() - source - error.valid_up_to()),
-                ),
-            }
+            (usize::from(invalid_len > 0), invalid_len)
         };
         let valid = std::str::from_utf8(&bytes[source..source + valid_len]).unwrap();
         for (character, source_len) in valid
             .chars()
             .map(|character| (character, character.len_utf8()))
-            .chain((invalid_len > 0).then_some(('�', invalid_len)))
+            .chain(std::iter::repeat_n(('�', replacement_len), replacements))
         {
             let event_start = u32::try_from(result.text.len())
                 .map_err(|_| Error::new("decoded text length exceeds u32"))?;

@@ -451,7 +451,7 @@ fn invalid_byte_groups_preserve_the_exact_native_replacement_policy() {
         let mut decoder = TokenizerDecoder::new(tokenizer(fallback, &[])).unwrap();
         let mut text = decoder.push(&[b'a' as u32, 0xF0, 0x9F], 0).unwrap();
         text.push(decoder.finish().unwrap());
-        assert_eq!(text.text, if fallback { "���" } else { "a�" });
+        assert_eq!(text.text, if fallback { "a��" } else { "a�" });
         assert_eq!(
             text.spans.iter().map(|s| s.token).collect::<Vec<_>>(),
             [0, 1, 2]
@@ -570,14 +570,8 @@ fn long_invalid_utf8_runs_emit_replacements_without_unbounded_holdback() {
             assert!(decoder.finish().unwrap().is_empty());
         }
 
-        // ByteLevel replaces per maximal ill-formed subpart; ByteFallback replaces
-        // every byte of a failed `<0xNN>` run, spaces included.
         let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
-        let expected = if fallback {
-            "\u{fffd}\u{fffd}"
-        } else {
-            " \u{fffd}"
-        };
+        let expected = " \u{fffd}";
         for index in 0..1024 {
             let text = decoder.push(&[0x20, 0xFF], index * 2).unwrap();
             assert_eq!(text.text, expected);
@@ -654,4 +648,98 @@ fn final_flush_and_control_boundaries_drain_incomplete_tails() {
             assert_eq!(format!("{reasoning}{content}"), expected, "{control}");
         }
     }
+}
+
+fn decode_in_chunks(tokenizer: &Arc<Tokenizer>, ids: &[u32], split: &[usize]) -> String {
+    let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+    let (mut text, mut offset) = (String::new(), 0);
+    for &length in split {
+        offset += length;
+        text.push_str(&decoder.push(&ids[offset - length..offset], 0).unwrap().text);
+    }
+    text.push_str(&decoder.finish().unwrap().text);
+    text
+}
+
+#[test]
+fn decoded_text_does_not_depend_on_push_boundaries_or_fuse_across_empty_tokens() {
+    for fallback in [false, true] {
+        let tokenizer = tokenizer(fallback, &[""]);
+        let empty = id(&tokenizer, "");
+        let cases: [(&[u32], &str, &str); 7] = [
+            (&[0xC3, empty, 0xA9], "é", "\u{fffd}\u{fffd}"),
+            (&[0xFF, 0xF0, 0x9F, 0xA6, 0x80], "\u{fffd}🦀", "\u{fffd}🦀"),
+            (&[0x20, 0xFF], " \u{fffd}", " \u{fffd}"),
+            (&[0x61, 0xF0, 0x9F], "a\u{fffd}", "a\u{fffd}\u{fffd}"),
+            (
+                &[0xF0, 0x9F, empty, 0xA6, 0x80],
+                "🦀",
+                "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            ),
+            (
+                &[0xE2, 0x82, 0xFF, 0xAC],
+                "\u{fffd}\u{fffd}\u{fffd}",
+                "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            ),
+            (&[empty, 0xC3, 0xA9, empty, 0xC3], "é\u{fffd}", "é\u{fffd}"),
+        ];
+        for (ids, byte_level, byte_fallback) in cases {
+            let expected = if fallback { byte_fallback } else { byte_level };
+            for split in compositions(ids.len()) {
+                assert_eq!(
+                    decode_in_chunks(&tokenizer, ids, &split),
+                    expected,
+                    "fallback={fallback} {ids:x?} {split:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn holdback_stops_at_three_bytes_and_valid_text_after_invalid_bytes_emits() {
+    for fallback in [false, true] {
+        let tokenizer = tokenizer(fallback, &[]);
+        let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+        let texts = push_chunks(&mut decoder, &[&[0x61, 0xF0], &[0x9F, 0xA6], &[0x80]]);
+        let texts: Vec<_> = texts.iter().map(|text| text.text.as_str()).collect();
+        assert_eq!(texts, ["", "a", "\u{1f980}"]);
+
+        let mut decoder = TokenizerDecoder::new(tokenizer).unwrap();
+        assert_eq!(
+            decoder.push(&[0xFF, 0x61, 0x62], 0).unwrap().text,
+            "\u{fffd}ab"
+        );
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn flushed_tail_of_a_partly_emitted_token_keeps_its_source_offset() {
+    let lead = format!("hello{}", byte_character(0xF0));
+    let tokenizer = tokenizer(false, &[&lead]);
+    let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+    assert_eq!(
+        decoder.push(&[id(&tokenizer, &lead)], 0).unwrap().text,
+        "hello"
+    );
+    let tail = decoder.finish().unwrap();
+    assert_eq!(tail.text, REPLACEMENT);
+    assert_eq!(tail.spans.len(), 1);
+    assert_eq!(
+        (tail.spans[0].token, tail.spans[0].source.clone()),
+        (0, 5..6)
+    );
+}
+
+#[test]
+fn byte_fallback_short_tokens_do_not_wait_and_empty_tokens_end_runs() {
+    let tokenizer = tokenizer(true, &["a", ""]);
+    let (short, empty) = (id(&tokenizer, "a"), id(&tokenizer, ""));
+    let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+    assert_eq!(decoder.push(&[short, 0xF0], 0).unwrap().text, "a");
+    assert_eq!(decoder.push(&[empty], 2).unwrap().text, REPLACEMENT);
+    assert_eq!(decoder.push(&[0xC3], 3).unwrap().text, "");
+    assert_eq!(decoder.push(&[empty], 4).unwrap().text, REPLACEMENT);
+    assert!(decoder.finish().unwrap().is_empty());
 }
