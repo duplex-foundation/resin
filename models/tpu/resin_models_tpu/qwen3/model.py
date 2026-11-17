@@ -379,7 +379,11 @@ class Qwen3Model:
         tokens = inputs.input_ids.shape[0]
         q_width = config.num_attention_heads * config.head_dim
         layers = params.layers
-        backend = self.prefill_matmul_backend
+        backend: MatmulBackend = (
+            ("xla" if tokens <= 1024 else "pallas")
+            if self.prefill_matmul_backend == "auto" and get_tpu_version() >= 7
+            else self.prefill_matmul_backend
+        )
 
         x = jax.shard_map(
             lambda ids, emb: emb[ids],

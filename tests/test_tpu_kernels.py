@@ -2986,38 +2986,62 @@ class TestTpuHardwareMosaic:
         w_d_q = jax.device_put(w_down.qvalue, NamedSharding(mesh, P(None, "tp")))
         w_d_s = jax.device_put(w_down.scale, NamedSharding(mesh, P()))
 
-        def _mlp_pallas(xq_i, xs_i):
-            g_out, g_abs = sharded_fp8_gate_up_swiglu(
+        def _gu_pallas(xq_i, xs_i):
+            return sharded_fp8_gate_up_swiglu(
                 xq_i, xs_i, w_gu_q, w_gu_s, mesh=mesh, backend="pallas"
             )
-            return sharded_fp8_matmul_reduce_scatter(
-                g_out,
-                w_d_q,
-                w_d_s,
-                mesh=mesh,
-                x_abs_max=g_abs,
-                backend="pallas",
-            )
 
-        out_pallas = jax.jit(_mlp_pallas)(xq_sh, xs_sh)
-        out_xla = jax.jit(
-            lambda xq_i, xs_i: sharded_fp8_matmul_reduce_scatter(
-                sharded_fp8_gate_up_swiglu(
-                    xq_i, xs_i, w_gu_q, w_gu_s, mesh=mesh, backend="xla"
-                )[0],
-                w_d_q,
-                w_d_s,
-                mesh=mesh,
-                backend="xla",
-            )
+        g_pallas, g_abs = jax.jit(_gu_pallas)(xq_sh, xs_sh)
+        g_xla = jax.jit(
+            lambda xq_i, xs_i: sharded_fp8_gate_up_swiglu(
+                xq_i, xs_i, w_gu_q, w_gu_s, mesh=mesh, backend="xla"
+            )[0]
         )(xq_sh, xs_sh)
-        assert not np.any(np.isnan(np.asarray(out_pallas, np.float32)))
+        assert not np.any(np.isnan(np.asarray(g_pallas, np.float32)))
         np.testing.assert_allclose(
-            np.asarray(out_pallas, np.float32),
-            np.asarray(out_xla, np.float32),
-            rtol=3e-2,
+            np.asarray(g_pallas, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=2e-2,
             atol=5e-2,
         )
+        assert g_abs is not None
+        np.testing.assert_allclose(
+            np.asarray(g_abs, np.float32),
+            np.max(np.abs(np.asarray(g_pallas, np.float32)), axis=-1),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        # Compare down_proj reduce_scatter on the same input g_pallas, plus chained cosine similarity.
+        down_pallas = jax.jit(
+            lambda g_i, a_i: sharded_fp8_matmul_reduce_scatter(
+                g_i, w_d_q, w_d_s, mesh=mesh, x_abs_max=a_i, backend="pallas"
+            )
+        )(g_pallas, g_abs)
+        down_xla_same_in = jax.jit(
+            lambda g_i: sharded_fp8_matmul_reduce_scatter(
+                g_i, w_d_q, w_d_s, mesh=mesh, backend="xla"
+            )
+        )(g_pallas)
+        assert not np.any(np.isnan(np.asarray(down_pallas, np.float32)))
+        np.testing.assert_allclose(
+            np.asarray(down_pallas, np.float32),
+            np.asarray(down_xla_same_in, np.float32),
+            rtol=2e-2,
+            atol=5e-2,
+        )
+
+        down_xla_chained = jax.jit(
+            lambda g_i: sharded_fp8_matmul_reduce_scatter(
+                g_i, w_d_q, w_d_s, mesh=mesh, backend="xla"
+            )
+        )(g_xla)
+        p_flat = np.asarray(down_pallas, np.float32).reshape(-1)
+        x_flat = np.asarray(down_xla_chained, np.float32).reshape(-1)
+        cosine = float(
+            np.dot(p_flat, x_flat) / (np.linalg.norm(p_flat) * np.linalg.norm(x_flat))
+        )
+        assert cosine > 0.999
 
     def test_qwen3_tp2_mosaic_decode_fused_kernels_parity(self) -> None:
         from resin.backend.tpu.attention import (
@@ -3046,7 +3070,7 @@ class TestTpuHardwareMosaic:
         res = jax.device_put(jnp.asarray(res_np, jnp.bfloat16), rep_2d)
         nw = jax.device_put(jnp.ones((5120,), jnp.bfloat16), rep)
 
-        xq, xs_t, next_res = jax.jit(
+        xq, xs_t, _ = jax.jit(
             jax.shard_map(
                 lambda xl, rl, w: fused_add_rms_norm_fp8_quant(
                     xl, rl, w, 1e-6, transposed_scale=True
@@ -3207,8 +3231,8 @@ class TestTpuHardwareMosaic:
         w_d_q = jax.device_put(w_down.qvalue, NamedSharding(mesh, P(None, "tp")))
         w_d_s = jax.device_put(w_down.scale, rep)
 
-        def _dec_mlp_pallas(xqi, xsi):
-            g_out, g_abs = sharded_fp8_gate_up_swiglu(
+        g_dec_pallas, g_dec_abs = jax.jit(
+            lambda xqi, xsi: sharded_fp8_gate_up_swiglu(
                 xqi,
                 xsi,
                 w_gu_q,
@@ -3218,30 +3242,46 @@ class TestTpuHardwareMosaic:
                 sync_tp_scale=False,
                 backend="pallas",
             )
-            return sharded_fp8_matmul(
-                g_out,
+        )(xq, xs_t)
+        g_dec_xla = jax.jit(
+            lambda xqi, xsi: sharded_fp8_gate_up_swiglu(
+                xqi,
+                xsi,
+                w_gu_q,
+                w_gu_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                backend="xla",
+            )[0]
+        )(xq, xs_t)
+        assert not np.any(np.isnan(np.asarray(g_dec_pallas, np.float32)))
+        np.testing.assert_allclose(
+            np.asarray(g_dec_pallas, np.float32)[live:], 0.0, atol=0.0
+        )
+        np.testing.assert_allclose(
+            np.asarray(g_dec_pallas, np.float32),
+            np.asarray(g_dec_xla, np.float32),
+            rtol=2e-2,
+            atol=5e-2,
+        )
+        assert g_dec_abs is not None
+
+        down_dec_pallas = jax.jit(
+            lambda g_i, a_i: sharded_fp8_matmul(
+                g_i,
                 w_d_q,
                 w_d_s,
                 P(None, "tp"),
                 mesh=mesh,
-                x_abs_max=g_abs,
+                x_abs_max=a_i,
                 sync_tp_scale=False,
                 backend="pallas",
             )
-
-        mlp_mosaic = jax.jit(_dec_mlp_pallas)(xq, xs_t)
-        mlp_ref = jax.jit(
-            lambda xqi, xsi: sharded_fp8_matmul(
-                sharded_fp8_gate_up_swiglu(
-                    xqi,
-                    xsi,
-                    w_gu_q,
-                    w_gu_s,
-                    mesh=mesh,
-                    sequence_parallel=False,
-                    sync_tp_scale=False,
-                    backend="xla",
-                )[0],
+        )(g_dec_pallas, g_dec_abs)
+        down_dec_xla_same = jax.jit(
+            lambda g_i: sharded_fp8_matmul(
+                g_i,
                 w_d_q,
                 w_d_s,
                 P(None, "tp"),
@@ -3249,14 +3289,33 @@ class TestTpuHardwareMosaic:
                 sync_tp_scale=False,
                 backend="xla",
             )
-        )(xq, xs_t)
-        assert not np.any(np.isnan(np.asarray(mlp_mosaic, np.float32)))
+        )(g_dec_pallas)
+        assert not np.any(np.isnan(np.asarray(down_dec_pallas, np.float32)))
         np.testing.assert_allclose(
-            np.asarray(mlp_mosaic, np.float32)[live:], 0.0, atol=0.0
+            np.asarray(down_dec_pallas, np.float32)[live:], 0.0, atol=0.0
         )
         np.testing.assert_allclose(
-            np.asarray(mlp_mosaic, np.float32),
-            np.asarray(mlp_ref, np.float32),
-            rtol=3e-2,
+            np.asarray(down_dec_pallas, np.float32),
+            np.asarray(down_dec_xla_same, np.float32),
+            rtol=2e-2,
             atol=5e-2,
         )
+
+        down_dec_xla_chained = jax.jit(
+            lambda g_i: sharded_fp8_matmul(
+                g_i,
+                w_d_q,
+                w_d_s,
+                P(None, "tp"),
+                mesh=mesh,
+                sync_tp_scale=False,
+                backend="xla",
+            )
+        )(g_dec_xla)
+        p_dec_flat = np.asarray(down_dec_pallas, np.float32)[:live].reshape(-1)
+        x_dec_flat = np.asarray(down_dec_xla_chained, np.float32)[:live].reshape(-1)
+        dec_cos = float(
+            np.dot(p_dec_flat, x_dec_flat)
+            / (np.linalg.norm(p_dec_flat) * np.linalg.norm(x_dec_flat))
+        )
+        assert dec_cos > 0.999

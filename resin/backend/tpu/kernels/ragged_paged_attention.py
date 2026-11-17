@@ -51,7 +51,7 @@ _DEVICE_VMEM_BYTES = {
     8: 128 * 1024 * 1024,
 }
 _DECODE_VMEM_SCRATCH_FRACTION = 0.375
-_MIXED_VMEM_SCRATCH_FRACTION = 0.625
+_MIXED_VMEM_SCRATCH_FRACTION = 0.45
 _TUNED_VMEM_CAP_FRACTION = 0.75
 
 
@@ -695,20 +695,29 @@ def _build_tpu7x_rpa_mixed_tuned_table() -> dict[_MixedTableKey, RpaBlockSizes]:
                     for kv_bucket in (256, 512, 1024, 2048, 4096, 8192):
                         if kv_bucket < page_size:
                             continue
+                        cur_bq = bq
+                        cur_bq_c = bq_c
                         if kv_bucket <= 2048:
-                            # Short/medium horizons (~1k prompts): bkv_sz=512 skips
-                            # upper-triangular causal blocks and shrinks softmax tiles.
-                            bkv = min(512, kv_bucket)
-                            bkv_c = min(512 if page_size == 128 else 256, bkv)
+                            if page_size == 256 and q_bucket <= 1024:
+                                cur_bq = min(128, cur_bq)
+                                cur_bq_c = min(64, cur_bq)
+                                bkv = min(1024, kv_bucket)
+                                bkv_c = min(256, bkv)
+                            else:
+                                cur_bq_c = min(64 if page_size == 256 else 128, cur_bq)
+                                bkv = min(512, kv_bucket)
+                                bkv_c = min(512 if page_size == 128 else 256, bkv)
                         else:
-                            bkv = min(1024, kv_bucket)
-                            bkv_c = min(512, bkv)
+                            bkv = min(2048, kv_bucket)
+                            bkv_c = min(1024, bkv)
+                        while cur_bq % cur_bq_c != 0:
+                            cur_bq_c -= 1
                         bkv = max(page_size, (bkv // page_size) * page_size)
                         bkv_c = max(page_size, (bkv_c // page_size) * page_size)
                         while bkv % bkv_c != 0:
                             bkv_c -= page_size
                         cand = _clamp_mixed_vmem(
-                            RpaBlockSizes(bq, bkv, bq_c, bkv_c),
+                            RpaBlockSizes(cur_bq, bkv, cur_bq_c, bkv_c),
                             actual_num_kv_heads=kv_heads,
                             actual_num_q_heads_per_kv_head=q_heads // kv_heads,
                             actual_head_dim=aligned_hd,
