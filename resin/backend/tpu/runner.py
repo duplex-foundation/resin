@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 
-from resin import BatchPhase, RunnerConfig
+from resin import BatchPhase, RunnerConfig, RunnerMetrics
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import format_output, prompt_scores, token_output
 from resin.backend.topology import ParallelismCapabilities
@@ -251,6 +251,11 @@ class TpuRunner:
         """XLA compilations or cache loads inside steps since warmup."""
 
         return self._step_compilations
+
+    def metrics_snapshot(self) -> RunnerMetrics:
+        """Publish compilations after warmup. The read does not sync the device."""
+
+        return RunnerMetrics(compilations=self.compilations_after_warmup)
 
     def bind_resources(self, resources: ResourceBinding) -> None:
         self._arena.bind_resources(resources)

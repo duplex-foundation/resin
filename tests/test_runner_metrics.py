@@ -99,6 +99,10 @@ def test_histogram_snapshot_merge_and_weighted_observations():
     assert left["count"] == 5 and right["count"] == 1
     assert first.snapshot() == left
     assert runner == RunnerMetrics(**runner.as_dict())
+    assert runner.compilations is None
+    published = RunnerMetrics(compilations=3)
+    assert published.compilations == 3
+    assert RunnerMetrics(**published.as_dict()) == published
 
 
 def test_eager_phases_are_exclusive_and_recycle_completed_events(metrics, monkeypatch):

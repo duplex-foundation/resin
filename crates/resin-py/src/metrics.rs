@@ -110,7 +110,8 @@ impl RunnerMetrics {
     #[new]
     #[pyo3(signature = (*, forward_execution_seconds = None, cuda_graph_passes = None,
         spec_draft_tokens = 0, spec_accepted_tokens = 0, spec_verify_rows = 0,
-        dp_attention_sync_wait_seconds: "dict[str, Any] | None" = None))]
+        dp_attention_sync_wait_seconds: "dict[str, Any] | None" = None,
+        compilations: "int | None" = None))]
     fn new(
         forward_execution_seconds: Option<BTreeMap<String, f64>>,
         cuda_graph_passes: Option<BTreeMap<String, u64>>,
@@ -118,6 +119,7 @@ impl RunnerMetrics {
         spec_accepted_tokens: u64,
         spec_verify_rows: u64,
         dp_attention_sync_wait_seconds: Option<&Bound<'_, PyAny>>,
+        compilations: Option<u64>,
     ) -> PyResult<Self> {
         Ok(Self(RunnerMetricsSnapshot {
             forward_execution_seconds: forward_execution_seconds.unwrap_or_default(),
@@ -128,6 +130,7 @@ impl RunnerMetrics {
             dp_attention_sync_wait_seconds: dp_attention_sync_wait_seconds
                 .map(histogram)
                 .transpose()?,
+            compilations,
         }))
     }
 
@@ -154,6 +157,11 @@ impl RunnerMetrics {
     #[getter]
     fn spec_verify_rows(&self) -> u64 {
         self.0.spec_verify_rows
+    }
+
+    #[getter]
+    fn compilations(&self) -> Option<u64> {
+        self.0.compilations
     }
 
     #[getter]
