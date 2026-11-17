@@ -15,6 +15,10 @@ pub struct RunnerMetricsSnapshot {
     pub spec_accepted_tokens: u64,
     pub spec_verify_rows: u64,
     pub dp_attention_sync_wait_seconds: Option<Histogram>,
+    /// XLA compilations and persistent-cache loads inside steps after warmup.
+    /// `None` means this runner does not publish the counter. A published zero
+    /// is a real observation, so runners that have no compiler leave it unset.
+    pub compilations: Option<u64>,
 }
 
 /// Logical request metrics, counted once by the engine owning each request.

@@ -87,6 +87,7 @@ known-first-party = [
   "resin_models_cuda",
   "resin_models_mlx",
   "resin_models_torch",
+  "resin_models_tpu",
 ]
 
 [tool.pytest.ini_options]

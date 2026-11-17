@@ -370,6 +370,14 @@ impl MetricsEncoder {
                 &[("mode", mode)],
             );
         }
+        if let Some(compilations) = r.compilations {
+            self.counter(
+                "compilations_total",
+                "XLA compilations and persistent-cache loads inside steps after warmup.",
+                compilations as f64,
+                &[],
+            );
+        }
         let drafts = r.spec_draft_tokens;
         let accepted = r.spec_accepted_tokens;
         let rows = r.spec_verify_rows;
@@ -453,5 +461,23 @@ mod tests {
             })
             .collect();
         assert_eq!(counts, expected.counts);
+    }
+
+    #[test]
+    fn compilations_are_omitted_until_a_runner_publishes_them() {
+        let mut hidden = MetricsEncoder::new("test", 0, 0);
+        hidden.runner(&RunnerMetricsSnapshot::default()).unwrap();
+        assert!(!hidden.families.contains_key("compilations_total"));
+
+        let mut published = MetricsEncoder::new("test", 0, 0);
+        published
+            .runner(&RunnerMetricsSnapshot {
+                compilations: Some(0),
+                ..RunnerMetricsSnapshot::default()
+            })
+            .unwrap();
+        let family = published.families.get("compilations_total").unwrap();
+        assert_eq!(family.name, "resin:compilations_total");
+        assert_eq!(family.metric[0].counter.as_ref().unwrap().value, 0.0);
     }
 }
