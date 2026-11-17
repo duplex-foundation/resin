@@ -126,7 +126,7 @@ const DEFAULT_PREFILL_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
 const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
 const MIN_NEW_TOKEN_RATIO_FACTOR: f64 = 0.14;
 const NEW_TOKEN_RATIO_DECAY_STEPS: f64 = 600.0;
-const RETRACTION_NEW_TOKEN_RATIO_STEP: f64 = 0.5;
+const RETRACTION_DECODE_HEADROOM: usize = 20;
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -1363,7 +1363,7 @@ impl<P: Clone> EngineCore<P> {
                 let reserve_continuation = overlap
                     && self.runner_config.cache_layout.is_some()
                     && scheduled_rows.len() == self.scheduler.len()
-                    && !self.storage_pending()
+                    && self.storage_waiting.is_empty()
                     && scheduled_rows
                         .iter()
                         .zip(&selected_requests)
@@ -1591,6 +1591,9 @@ impl<P: Clone> EngineCore<P> {
                             if self.retract_one_matching(runner, false)? {
                                 continue;
                             }
+                            // Unreachable for single-group layouts while `AdmissionEstimate`
+                            // floors at owned pages: once idle holders are retracted the
+                            // estimate equals the real need. Kept for estimate/allocator divergence.
                             self.update_new_token_ratio_after_retraction();
                             running_only = true;
                             continue;
@@ -2141,10 +2144,26 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn update_new_token_ratio_after_retraction(&mut self) {
-        let floor = self
-            .new_token_ratio
-            .max(self.scheduler_config.initial_new_token_ratio());
-        self.new_token_ratio = (floor + RETRACTION_NEW_TOKEN_RATIO_STEP).min(1.0);
+        let running = self.scheduler.iter().filter(|request| request.is_running());
+        let (count, generated, limits) = running.fold(
+            (0usize, 0usize, 0usize),
+            |(count, generated, limits), request| {
+                (
+                    count + 1,
+                    generated.saturating_add(request.generated.len()),
+                    limits.saturating_add(request.max_output_tokens),
+                )
+            },
+        );
+        let observed = if count == 0 {
+            self.scheduler_config.initial_new_token_ratio()
+        } else {
+            ((generated.saturating_add(RETRACTION_DECODE_HEADROOM * count)) as f64
+                / limits.saturating_add(1) as f64)
+                .min(1.0)
+        };
+        // A retraction only ever makes admission more conservative.
+        self.new_token_ratio = self.new_token_ratio.max(observed);
     }
 
     fn retract_one_matching(

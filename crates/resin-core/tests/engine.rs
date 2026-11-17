@@ -2684,22 +2684,74 @@ fn running_retraction_keeps_waiting_rows_out_of_the_retry_and_raises_the_ratio()
     assert_eq!(plan.sequence_ids, [second.id()]);
     assert!(!first.done());
     assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 1);
-    assert_eq!((before, after), (0.0, 0.5));
+    assert_eq!((before, after), (0.0, 1.0));
 }
 
 #[test]
-fn running_retraction_never_lowers_the_ratio_below_its_initial_value() {
-    let mut engine = pressure_engine(10, 2, 0.5, false);
+fn successive_running_retractions_never_lower_the_ratio() {
+    // Staggered requests with varied output limits (a fixed LCG keeps the
+    // workload deterministic). The second retraction's survivors have a
+    // lower generated/limit ratio than the first's, so recomputing the ratio
+    // from them would drop it from 0.240 to 0.225.
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    12,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        4,
+        512,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
     engine.enable_metrics().unwrap();
     let mut model = Model::default();
-    engine.submit(input(vec![1; 8], 20)).unwrap();
-    engine.submit(input(vec![50; 8], 20)).unwrap();
-    let (before, after, _) = first_running_retraction(&mut engine, &mut model, None);
-    let initial = 0.7 * 0.5;
-    assert!(before < initial, "ratio should have decayed");
-    // The old rule recomputed the ratio from decode progress, which here
-    // lands near 1.0 and elsewhere falls below the initial value.
-    assert!((after - (initial + 0.5)).abs() < 1e-9, "{after}");
+    let mut state = 8u64;
+    let mut random = |bound: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % bound
+    };
+    let mut retractions = Vec::new();
+    let mut retracted = 0;
+    for step in 0..600 {
+        if step % 7 == 0 && step < 70 {
+            let prompt = 4 + random(8) as usize;
+            let limit = 10 + random(190) as usize;
+            engine
+                .submit(input(vec![1 + step as u32; prompt], limit))
+                .unwrap();
+        }
+        if !engine.has_work() {
+            break;
+        }
+        let before = engine.new_token_ratio();
+        // Late requests can outgrow the tiny pool, which ends the workload.
+        let Ok(Some(plan)) = engine.prepare_step(&mut model, None) else {
+            break;
+        };
+        let total = engine.metrics_snapshot().unwrap().retracted_requests;
+        if total > retracted {
+            retractions.push((before, engine.new_token_ratio()));
+            retracted = total;
+        }
+        complete_with_next_tokens(&mut engine, &mut model, &plan);
+    }
+    assert!(retractions.len() >= 2, "{retractions:?}");
+    for (before, after) in retractions {
+        assert!(after >= before, "ratio fell from {before} to {after}");
+    }
 }
 
 #[test]
