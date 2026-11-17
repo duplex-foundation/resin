@@ -602,3 +602,50 @@ class TestEngine:
         assert runner.plans[-1].sequence_ids.tolist() == [first]
         assert not second.done
         engine.close()
+
+    def test_oversubscribed_chunked_long_prompts_complete_without_retraction_thrash(
+        self,
+    ) -> None:
+        requests = 40
+        output_tokens = 700
+        layout = CacheLayout(parent_capacity=150, groups=[CacheGroupLayout(16)])
+
+        class ChunkedCachedRunner(RecordingRunner):
+            runner_config = RunnerConfig(
+                cache_layout=layout,
+                continuation_prefill=True,
+                max_accepted_per_step=2,
+                max_batch_tokens=64,
+                prefill_chunk_size=64,
+            )
+
+            @staticmethod
+            def bind_resources(binding: ResourceBinding) -> None:
+                del binding
+
+        engine = Engine(
+            ChunkedCachedRunner(),
+            max_running_requests=requests,
+            context_length=130 + 2 * requests + output_tokens + 64,
+            scheduler_config=SchedulerConfig(
+                max_batch_tokens=64, prefill_chunk_size=64
+            ),
+        )
+        handles = [
+            engine.submit(
+                [1 + index] * (130 + 2 * index),
+                sampling_params=SamplingParams(max_output_tokens=output_tokens),
+            )
+            for index in range(requests)
+        ]
+
+        steps = 0
+        while engine.has_work():
+            steps += 1
+            assert steps < 30_000, "engine livelocked with work still queued"
+            engine.step()
+
+        for index, handle in enumerate(handles):
+            assert handle.take_result() == list(range(2 + index, 2 + index + 700))
+        assert engine.metrics_snapshot().requests["retracted_requests"] <= 16
+        assert engine.cache_occupied_block_count == 0
