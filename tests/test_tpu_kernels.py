@@ -652,6 +652,448 @@ class TestRaggedPagedAttention:
             assert blocks["bkv_csz"] % page_size == 0
 
 
+class TestRpaDecodeBlockSizes:
+    def test_rpa_block_sizes_and_vmem_estimate_match_scratch_buffers(self) -> None:
+        from resin.backend.tpu.kernels import (
+            RpaBlockSizes,
+            get_vmem_estimate_bytes,
+        )
+
+        blocks = RpaBlockSizes(1, 2048, 1, 2048)
+        assert tuple(blocks) == (1, 2048, 1, 2048)
+        assert blocks.as_dict() == {
+            "bq_sz": 1,
+            "bkv_sz": 2048,
+            "bq_csz": 1,
+            "bkv_csz": 2048,
+        }
+
+        # Qwen3-32B TP2 FP8 KV: stride 2 -> 3 (bank conflict), 6 MiB bkv + 80 KiB q/l/m/acc.
+        assert (
+            get_vmem_estimate_bytes(
+                actual_num_kv_heads=4,
+                actual_num_q_heads_per_kv_head=8,
+                actual_head_dim=128,
+                bq_sz=1,
+                bkv_sz=2048,
+                q_dtype=jnp.bfloat16,
+                kv_dtype=jnp.float8_e4m3fn,
+            )
+            == 6_373_376
+        )
+        # Qwen3-32B DP2 BF16 KV: stride 8 -> 9 (bank conflict), 18 MiB bkv + 160 KiB q/l/m/acc.
+        assert (
+            get_vmem_estimate_bytes(
+                actual_num_kv_heads=8,
+                actual_num_q_heads_per_kv_head=8,
+                actual_head_dim=128,
+                bq_sz=1,
+                bkv_sz=2048,
+                q_dtype=jnp.bfloat16,
+                kv_dtype=jnp.bfloat16,
+            )
+            == 19_038_208
+        )
+        # Unaligned q_per_kv=3 -> 4, hd=64 -> 128, kv_heads=2 fp8 -> stride 1 (no bank conflict).
+        assert (
+            get_vmem_estimate_bytes(
+                actual_num_kv_heads=2,
+                actual_num_q_heads_per_kv_head=3,
+                actual_head_dim=64,
+                bq_sz=1,
+                bkv_sz=256,
+                q_dtype=jnp.bfloat16,
+                kv_dtype=jnp.float8_e4m3fn,
+            )
+            == 282_624
+        )
+
+    def test_decode_block_sizes_divisibility_vmem_spare_page_and_mixed_invariance(
+        self,
+    ) -> None:
+        from resin.backend.tpu.kernels import (
+            RpaBlockSizes,
+            get_rpa_block_sizes,
+            get_vmem_estimate_bytes,
+        )
+        from resin.backend.tpu.kernels.ragged_paged_attention import (
+            static_validate_inputs,
+        )
+
+        vmem_cap = int(0.75 * 64 * 1024 * 1024)
+        dtypes = (jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.bfloat16, jnp.float32)
+        head_dims = (8, 16, 64, 80, 128, 240, 256)
+        head_pairs = ((32, 4), (64, 8), (16, 2), (16, 4), (32, 8), (8, 2), (12, 4))
+
+        for page_size in (16, 64, 128, 256):
+            for pages_per_seq in (1, 6, 9, 37):
+                table_kv = pages_per_seq * page_size
+                for kv_dtype in dtypes:
+                    for head_dim in head_dims:
+                        for q_heads, kv_heads in head_pairs:
+                            q = jax.ShapeDtypeStruct(
+                                (8, q_heads, head_dim), jnp.bfloat16
+                            )
+                            k = jax.ShapeDtypeStruct((8, kv_heads, head_dim), kv_dtype)
+                            cache = jax.ShapeDtypeStruct(
+                                get_kv_cache_shape(
+                                    max(pages_per_seq, 8),
+                                    page_size,
+                                    kv_heads,
+                                    head_dim,
+                                    kv_dtype,
+                                ),
+                                kv_dtype,
+                            )
+                            kv_lens = jax.ShapeDtypeStruct((4,), jnp.int32)
+                            page_indices = jax.ShapeDtypeStruct(
+                                (4 * pages_per_seq,), jnp.int32
+                            )
+                            cu_q_lens = jax.ShapeDtypeStruct((5,), jnp.int32)
+                            dist = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+                            for sliding_window in (None, 128, 1024):
+                                blocks = get_rpa_block_sizes(
+                                    jnp.bfloat16,
+                                    kv_dtype,
+                                    actual_num_q_heads=q_heads,
+                                    actual_num_kv_heads=kv_heads,
+                                    head_dim=head_dim,
+                                    page_size=page_size,
+                                    max_num_tokens=320,
+                                    max_num_seqs=320,
+                                    pages_per_seq=pages_per_seq,
+                                    case=RpaCase.DECODE,
+                                    tpu_version=7,
+                                    sliding_window=sliding_window,
+                                )
+                                assert isinstance(blocks, RpaBlockSizes)
+                                assert (blocks.bq_sz, blocks.bq_csz) == (1, 1)
+                                assert blocks.bkv_sz <= table_kv
+                                assert blocks.bkv_sz % blocks.bkv_csz == 0
+                                assert blocks.bkv_sz % page_size == 0
+                                assert blocks.bkv_csz % page_size == 0
+                                static_validate_inputs(
+                                    q,
+                                    k,
+                                    k,
+                                    cache,
+                                    kv_lens,
+                                    page_indices,
+                                    cu_q_lens,
+                                    dist,
+                                    sliding_window=sliding_window,
+                                    d_block_sizes=tuple(blocks),
+                                )
+                                vmem = get_vmem_estimate_bytes(
+                                    actual_num_kv_heads=kv_heads,
+                                    actual_num_q_heads_per_kv_head=q_heads // kv_heads,
+                                    actual_head_dim=head_dim,
+                                    bq_sz=blocks.bq_sz,
+                                    bkv_sz=blocks.bkv_sz,
+                                    q_dtype=jnp.bfloat16,
+                                    kv_dtype=kv_dtype,
+                                )
+                                assert vmem <= vmem_cap
+
+        # Check non-v7 TPU versions and CPU interpret (-1) via VMEM heuristic.
+        vmem_by_ver = {4: 16, 5: 64, 6: 128, 8: 128, -1: 64}
+        for ver, vmem_mib in vmem_by_ver.items():
+            ver_blocks = get_rpa_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                actual_num_q_heads=32,
+                actual_num_kv_heads=4,
+                head_dim=128,
+                page_size=256,
+                max_num_tokens=320,
+                max_num_seqs=320,
+                pages_per_seq=37,
+                case=RpaCase.DECODE,
+                tpu_version=ver,
+            )
+            assert ver_blocks.bkv_sz <= (512 if ver == 4 else 4096)
+            assert get_vmem_estimate_bytes(
+                4, 8, 128, 1, ver_blocks.bkv_sz, jnp.bfloat16, jnp.float8_e4m3fn
+            ) <= int(0.375 * vmem_mib * 1024 * 1024)
+
+        decode_v7 = functools.partial(
+            get_rpa_block_sizes,
+            jnp.bfloat16,
+            max_num_tokens=320,
+            max_num_seqs=320,
+            case=RpaCase.DECODE,
+            tpu_version=7,
+        )
+        # Spare-page regression checks on Qwen3-32B TP2 (1k/1k -> 9 pages, 9,216 -> 37 pages).
+        short_srv = decode_v7(
+            jnp.float8_e4m3fn,
+            actual_num_q_heads=32,
+            actual_num_kv_heads=4,
+            head_dim=128,
+            page_size=256,
+            pages_per_seq=9,
+        )
+        assert short_srv.bkv_sz != 2304 and short_srv.bkv_sz <= 2048
+        assert short_srv.bkv_csz > 512
+
+        long_srv = decode_v7(
+            jnp.float8_e4m3fn,
+            actual_num_q_heads=32,
+            actual_num_kv_heads=4,
+            head_dim=128,
+            page_size=256,
+            pages_per_seq=37,
+        )
+        assert long_srv.bkv_sz != 9472 and long_srv.bkv_sz <= 4096
+
+        # Sliding-window layers shrink bkv_sz to the window horizon; wide BF16 shapes step down.
+        assert (
+            decode_v7(
+                jnp.bfloat16,
+                actual_num_q_heads=32,
+                actual_num_kv_heads=4,
+                head_dim=64,
+                page_size=128,
+                pages_per_seq=37,
+                sliding_window=128,
+            ).bkv_sz
+            == 256
+        )
+        assert (
+            decode_v7(
+                jnp.bfloat16,
+                actual_num_q_heads=64,
+                actual_num_kv_heads=8,
+                head_dim=128,
+                page_size=256,
+                pages_per_seq=37,
+            ).bkv_sz
+            == 2048
+        )
+        assert (
+            decode_v7(
+                jnp.bfloat16,
+                actual_num_q_heads=32,
+                actual_num_kv_heads=8,
+                head_dim=256,
+                page_size=256,
+                pages_per_seq=37,
+            ).bkv_sz
+            == 1024
+        )
+
+        # RpaCase.MIXED and RpaCase.PREFILL remain byte-for-byte identical to baseline.
+        expected_mixed = {
+            (9, 256): RpaBlockSizes(256, 1024, 128, 512),
+            (37, 256): RpaBlockSizes(256, 2048, 128, 512),
+            (9, 128): RpaBlockSizes(256, 512, 128, 512),
+        }
+        for (pps, ps), want in expected_mixed.items():
+            for case in (RpaCase.MIXED, RpaCase.PREFILL):
+                for sw, vmem_lim in ((None, None), (128, 8 * 1024 * 1024)):
+                    got = get_rpa_block_sizes(
+                        jnp.bfloat16,
+                        jnp.float8_e4m3fn,
+                        actual_num_q_heads=32,
+                        actual_num_kv_heads=4,
+                        head_dim=128,
+                        page_size=ps,
+                        max_num_tokens=4096,
+                        max_num_seqs=320,
+                        pages_per_seq=pps,
+                        case=case,
+                        tpu_version=7,
+                        sliding_window=sw,
+                        vmem_limit_bytes=vmem_lim,
+                    )
+                    assert got == want
+                    assert (
+                        get_default_block_sizes(
+                            jnp.bfloat16,
+                            jnp.float8_e4m3fn,
+                            actual_num_q_heads=32,
+                            actual_num_kv_heads=4,
+                            head_dim=128,
+                            page_size=ps,
+                            max_num_tokens=4096,
+                            max_num_seqs=320,
+                            pages_per_seq=pps,
+                            case=case,
+                            tpu_version=7,
+                            sliding_window=sw,
+                            vmem_limit_bytes=vmem_lim,
+                        )
+                        == want.as_dict()
+                    )
+
+    @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+    @pytest.mark.parametrize("sliding_window", [None, 12])
+    def test_pallas_interpret_elided_loop_matches_split_loop_and_reference(
+        self, kv_dtype: jnp.dtype, sliding_window: int | None
+    ) -> None:
+        rng = np.random.default_rng(1234)
+        page_size = 8
+        total_pages = 20
+        max_seqs = 4
+        q_heads, kv_heads, head_dim = 8, 2, 64
+        sm_scale = head_dim**-0.5
+        k_scale = 0.5 if kv_dtype == jnp.float8_e4m3fn else None
+        v_scale = 0.25 if kv_dtype == jnp.float8_e4m3fn else None
+
+        cache_shape = get_kv_cache_shape(
+            total_pages, page_size, kv_heads, head_dim, kv_dtype
+        )
+        # Poison the entire arena with NaNs outside null page 0, then populate
+        # only the active prefix tokens [6, 15, 16, 28] before decode [7, 16, 17, 29].
+        dirty = np.full(cache_shape, np.nan, dtype=np.float32)
+        dirty[0] = 0.0
+        kv_lens_arr = np.array([7, 16, 17, 29], dtype=np.int32)
+        page_table = np.array(
+            [
+                [1, 0, 0, 0, 0],
+                [2, 3, 0, 0, 0],
+                [4, 5, 6, 0, 0],
+                [7, 8, 9, 10, 0],
+            ],
+            dtype=np.int32,
+        )
+        rows = cache_shape[2]
+        packing = cache_shape[3]
+        padded_dim = cache_shape[4]
+        for seq_idx, kv_len in enumerate(kv_lens_arr):
+            prefix = int(kv_len) - 1
+            for pos in range(prefix):
+                p = int(page_table[seq_idx, pos // page_size])
+                off = pos % page_size
+                slot = np.zeros((rows * packing, padded_dim), dtype=np.float32)
+                for h in range(kv_heads):
+                    slot[2 * h, :head_dim] = rng.standard_normal(head_dim) * 0.5
+                    slot[2 * h + 1, :head_dim] = rng.standard_normal(head_dim) * 0.5
+                dirty[p, off] = slot.reshape(rows, packing, padded_dim)
+
+        init_cache = quantize_kv(jnp.asarray(dirty, jnp.float32), kv_dtype)
+        # Re-poison unused pages and unused tail slots of owned pages with NaN in kv_dtype.
+        nan_tile = np.asarray(
+            jnp.full((rows, packing, padded_dim), jnp.nan, dtype=kv_dtype)
+        )
+        init_cache_np = np.array(init_cache, copy=True)
+        used_pages = {0}
+        for seq_idx, kv_len in enumerate(kv_lens_arr):
+            used_slots = int(kv_len)
+            for p_col in range((used_slots + page_size - 1) // page_size):
+                p_id = int(page_table[seq_idx, p_col])
+                used_pages.add(p_id)
+                valid_in_page = min(page_size, used_slots - p_col * page_size)
+                if valid_in_page < page_size:
+                    init_cache_np[p_id, valid_in_page:] = nan_tile
+        for p_id in range(total_pages):
+            if p_id not in used_pages:
+                init_cache_np[p_id, :] = nan_tile
+
+        q_f32 = jnp.asarray(
+            rng.standard_normal((max_seqs, q_heads, head_dim)), jnp.float32
+        )
+        q_bf16 = q_f32.astype(jnp.bfloat16)
+        k_bf16 = jnp.asarray(
+            rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        v_bf16 = jnp.asarray(
+            rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        flat_pages = jnp.asarray(page_table.reshape(-1))
+        kv_lens = jnp.asarray(kv_lens_arr)
+        cu_q_lens = jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32)
+        dist = jnp.array([4, 4, 4], dtype=jnp.int32)
+
+        init_cache_jax = jnp.asarray(init_cache_np)
+        run_interp = functools.partial(
+            ragged_paged_attention,
+            keys=k_bf16,
+            values=v_bf16,
+            kv_cache=init_cache_jax,
+            kv_lens=kv_lens,
+            page_indices=flat_pages,
+            cu_q_lens=cu_q_lens,
+            distribution=dist,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            m_block_sizes=(4, 16, 4, 8),
+            interpret=True,
+        )
+
+        # Verify HLO elides the inner while loop when bkv_csz == bkv_sz vs bkv_csz < bkv_sz.
+        if sliding_window is None and kv_dtype == jnp.bfloat16:
+            lower_for = lambda d_blocks: ragged_paged_attention.lower(  # noqa: E731
+                q_bf16,
+                k_bf16,
+                v_bf16,
+                init_cache_jax,
+                kv_lens,
+                flat_pages,
+                cu_q_lens,
+                dist,
+                sm_scale=sm_scale,
+                d_block_sizes=d_blocks,
+                m_block_sizes=(4, 16, 4, 8),
+                interpret=True,
+            ).as_text()
+            assert lower_for((1, 16, 1, 16)).count("stablehlo.while") < lower_for(
+                (1, 16, 1, 8)
+            ).count("stablehlo.while")
+
+        # Verify _blocks_for forwards sliding_window and vmem_limit_bytes when d_block_sizes=None.
+        if sliding_window == 12 and kv_dtype == jnp.bfloat16:
+            jaxpr_default = str(
+                jax.make_jaxpr(
+                    lambda q_in: run_interp(q_in, vmem_limit_bytes=64 * 1024)
+                )(q_bf16)
+            )
+            # 0.375 * 64 KiB = 24,576 B caps bkv_sz from 16 down to page_size=8.
+            assert "name=RPAd-p_8-bq_1_1-bkv_8_8-sw_12" in jaxpr_default
+
+        # Float32 pre-cast check: (1, 16, 1, 16) and (1, 16, 1, 8) agree within 1e-5.
+        out_f32_elided, _ = run_interp(q_f32, d_block_sizes=(1, 16, 1, 16))
+        out_f32_split, _ = run_interp(q_f32, d_block_sizes=(1, 16, 1, 8))
+        assert not np.any(np.isnan(np.asarray(out_f32_elided)))
+        assert not np.any(np.isnan(np.asarray(out_f32_split)))
+        np.testing.assert_allclose(
+            np.asarray(out_f32_elided),
+            np.asarray(out_f32_split),
+            rtol=0.0,
+            atol=1e-5,
+        )
+
+        # BF16 queries parity against _reference_rpa.
+        out_elided, _ = run_interp(q_bf16, d_block_sizes=(1, 16, 1, 16))
+        out_split, _ = run_interp(q_bf16, d_block_sizes=(1, 16, 1, 8))
+        ref_out, _ = _reference_rpa(
+            np.asarray(q_bf16),
+            np.asarray(k_bf16),
+            np.asarray(v_bf16),
+            init_cache_np,
+            kv_lens_arr,
+            page_table.reshape(-1),
+            np.asarray(cu_q_lens),
+            np.asarray(dist),
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        for cand in (out_elided, out_split):
+            arr = np.asarray(cand, dtype=np.float32)
+            assert not np.any(np.isnan(arr))
+            np.testing.assert_allclose(
+                arr,
+                np.asarray(ref_out, dtype=np.float32),
+                rtol=2e-2,
+                atol=3e-2,
+            )
+
+
 def _qwix_reference_fp8_w8a8(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     """Independent Qwix symmetric absmax FP8 W8A8 reference (x: [T, K], w: [N, K])."""
     tiny = float(np.sqrt(np.finfo(np.float32).tiny))
@@ -1005,6 +1447,150 @@ class TestTpuHardwareMosaic:
             )
         finally:
             counter.close()
+
+    @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
+    def test_qwen3_tp2_mosaic_rpa_v3_tuned_decode_blocks_and_zero_recompile(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        mesh = make_mesh(min(len(jax.devices()), 2))
+        tp = int(mesh.shape["tp"])
+        spec = KvCacheSpec(
+            layers=1,
+            kv_heads=8,
+            head_dim=128,
+            page_tokens=256,
+            dtype=kv_dtype,
+        )
+        cache_sharding = NamedSharding(mesh, KV_PARTITION)
+        head_sharding = NamedSharding(mesh, P(None, "tp", None))
+        rep_sharding = NamedSharding(mesh, P())
+        is_fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale = 0.5 if is_fp8 else None
+        v_scale = 0.25 if is_fp8 else None
+        rtol = 3e-2 if is_fp8 else 1e-2
+        atol = 5e-2 if is_fp8 else 2e-2
+
+        rng = np.random.default_rng(2026)
+
+        @functools.partial(
+            jax.jit,
+            donate_argnums=(3,),
+            out_shardings=(head_sharding, cache_sharding),
+        )
+        def mosaic_decode(q, k, v, kv_cache, meta):
+            return paged_attention(
+                q,
+                k,
+                v,
+                kv_cache,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
+        def ref_decode(q, k, v, kv_cache, meta):
+            return paged_attention(
+                q,
+                k,
+                v,
+                kv_cache,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                impl=reference.ragged_paged_attention,
+            )
+
+        for pages_per_seq, total_pages, step_kv_lens in (
+            (9, 24, ([255, 1024], [256, 1536], [257, 1537], [2048, 0])),
+            (37, 48, ([4096, 1024], [4097, 0])),
+        ):
+            global_cache_shape = (total_pages, *spec.page_shape(tp))
+            init_np = rng.standard_normal(global_cache_shape).astype(np.float32) * 0.25
+            init_cache = quantize_kv(jnp.asarray(init_np, jnp.float32), kv_dtype)
+            nan_page = np.asarray(
+                jnp.full(global_cache_shape[1:], jnp.nan, dtype=kv_dtype)
+            )
+            init_cache_np = np.array(init_cache, copy=True)
+            init_cache_np[0] = 0
+            # Point unused table entries and inactive rows at NaN-filled unowned pages.
+            pages = np.full((4, pages_per_seq), total_pages - 1, dtype=np.int32)
+            if pages_per_seq == 9:
+                pages[0, :8] = np.arange(1, 9)
+                pages[1, :8] = np.arange(9, 17)
+                # Page 15 (seq 1's 7th page) has NaNs in slots 1..255 during kv_len=1537.
+                init_cache_np[15, 1:] = nan_page[1:]
+                init_cache_np[17:] = nan_page
+            else:
+                pages[0, :17] = np.arange(1, 18)
+                pages[1, :5] = np.arange(18, 23)
+                init_cache_np[17, 1:] = nan_page[1:]
+                init_cache_np[22:] = nan_page
+
+            cache = jax.device_put(jnp.asarray(init_cache_np), cache_sharding)
+            ref_cache = jax.device_put(jnp.asarray(init_cache_np), cache_sharding)
+
+            step_inputs = []
+            for kv_pair in step_kv_lens:
+                active = sum(1 for x in kv_pair if x > 0)
+                q_d = jax.device_put(
+                    jnp.asarray(rng.standard_normal((8, 64, 128)), jnp.bfloat16),
+                    head_sharding,
+                )
+                k_d = jax.device_put(
+                    jnp.asarray(rng.standard_normal((8, 8, 128)), jnp.bfloat16),
+                    head_sharding,
+                )
+                v_d = jax.device_put(
+                    jnp.asarray(rng.standard_normal((8, 8, 128)), jnp.bfloat16),
+                    head_sharding,
+                )
+                cu = np.array(
+                    [0] + [min(i, active) for i in range(1, 5)], dtype=np.int32
+                )
+                meta = AttentionMetadata(
+                    jax.device_put(
+                        np.array([kv_pair[0], kv_pair[1], 0, 0], dtype=np.int32),
+                        rep_sharding,
+                    ),
+                    (jax.device_put(pages.reshape(-1), rep_sharding),),
+                    jax.device_put(cu, rep_sharding),
+                    jax.device_put(
+                        np.array([active, active, active], dtype=np.int32),
+                        rep_sharding,
+                    ),
+                )
+                step_inputs.append((active, q_d, k_d, v_d, meta))
+
+            mosaic_outs = []
+            counter = CompilationCounter()
+            try:
+                warm = None
+                for active, q_d, k_d, v_d, meta in step_inputs:
+                    out_d, cache = mosaic_decode(q_d, k_d, v_d, cache, meta)
+                    out_d.block_until_ready()
+                    if warm is None:
+                        warm = counter.count
+                    else:
+                        assert counter.count == warm
+                    mosaic_outs.append((active, np.asarray(out_d[:active], np.float32)))
+            finally:
+                counter.close()
+
+            for (active, out_arr), (_, q_d, k_d, v_d, meta) in zip(
+                mosaic_outs, step_inputs, strict=True
+            ):
+                ref_d, ref_cache = ref_decode(q_d, k_d, v_d, ref_cache, meta)
+                assert not np.any(np.isnan(out_arr))
+                np.testing.assert_allclose(
+                    out_arr,
+                    np.asarray(ref_d[:active], np.float32),
+                    rtol=rtol,
+                    atol=atol,
+                )
 
     def test_qwen3_tp2_mosaic_fp8_w8a8_matmul_parity(self) -> None:
         mesh = make_mesh(min(len(jax.devices()), 2))

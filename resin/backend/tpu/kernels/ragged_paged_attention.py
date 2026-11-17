@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +42,55 @@ from resin.backend.tpu.kernels._rpa_v3_pallas import (
 )
 
 DEFAULT_INTERPRET_VMEM_BYTES = 64 * 1024 * 1024
+_TPU7X_VMEM_BYTES = 64 * 1024 * 1024
+_DEVICE_VMEM_BYTES = {
+    4: 16 * 1024 * 1024,
+    5: 64 * 1024 * 1024,
+    6: 128 * 1024 * 1024,
+    7: _TPU7X_VMEM_BYTES,
+    8: 128 * 1024 * 1024,
+}
+_DECODE_VMEM_SCRATCH_FRACTION = 0.375
+_TUNED_VMEM_CAP_FRACTION = 0.75
+
+
+class RpaBlockSizes(NamedTuple):
+    """Fetch and compute block sizes ``(bq_sz, bkv_sz, bq_csz, bkv_csz)`` for RPA v3."""
+
+    bq_sz: int
+    bkv_sz: int
+    bq_csz: int
+    bkv_csz: int
+
+    def as_dict(self) -> dict[str, int]:
+        return self._asdict()
+
+
+def get_vmem_estimate_bytes(
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    bq_sz: int,
+    bkv_sz: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+) -> int:
+    """Estimate VMEM scratch bytes allocated by ``run_rpa_case`` for a given block shape."""
+    q_packing = get_dtype_packing(q_dtype)
+    kv_packing = get_dtype_packing(kv_dtype)
+    num_q_per_kv = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    bkv_stride = int(cdiv(actual_num_kv_heads * 2, kv_packing))
+    if has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
+    head_dim = align_to(actual_head_dim, 128)
+    q_itemsize = jnp.dtype(q_dtype).itemsize
+    kv_itemsize = jnp.dtype(kv_dtype).itemsize
+
+    bkv_bytes = 2 * bkv_sz * bkv_stride * kv_packing * head_dim * kv_itemsize
+    bq_bo_bytes = 4 * actual_num_kv_heads * bq_sz * num_q_per_kv * head_dim * q_itemsize
+    lm_bytes = 2 * actual_num_kv_heads * bq_sz * num_q_per_kv * 128 * 4
+    acc_bytes = actual_num_kv_heads * bq_sz * num_q_per_kv * head_dim * 4
+    return bkv_bytes + bq_bo_bytes + lm_bytes + acc_bytes
 
 
 def get_kv_cache_shape(
@@ -270,9 +319,11 @@ def get_default_block_sizes(
     *,
     case: RpaCase = RpaCase.MIXED,
     tpu_version: int | None = None,
+    sliding_window: int | None = None,
+    vmem_limit_bytes: int | None = None,
 ) -> dict[str, int]:
     """Select divisible, page-aligned ``(bq_sz, bkv_sz, bq_csz, bkv_csz)``."""
-    del q_dtype, kv_dtype, head_dim, max_num_seqs
+    del max_num_seqs
     version = get_tpu_version() if tpu_version is None else tpu_version
     group_pow2 = next_power_of_2(actual_num_q_heads // actual_num_kv_heads)
     max_q = next_power_of_2(max_num_tokens)
@@ -280,16 +331,30 @@ def get_default_block_sizes(
     max_units = max(1, int(cdiv(pages_per_seq * page_size, kv_unit)))
 
     if case == RpaCase.DECODE:
-        bkv_units = max(1, min(int(cdiv(2048, kv_unit)), max_units))
-        bkv_c_units = max(1, min(int(cdiv(512, kv_unit)), bkv_units))
-        while bkv_units % bkv_c_units != 0:
-            bkv_c_units -= 1
-        return {
-            "bq_sz": 1,
-            "bkv_sz": bkv_units * kv_unit,
-            "bq_csz": 1,
-            "bkv_csz": bkv_c_units * kv_unit,
-        }
+        kv_packing = get_dtype_packing(kv_dtype)
+        aligned_hd = align_to(head_dim, 128)
+        num_kv_heads_x2 = next_power_of_2(align_to(actual_num_kv_heads * 2, kv_packing))
+        min_bkv_sz_to_peak = (
+            (16 * 1024 * 1024 * kv_packing) // 4 // aligned_hd // num_kv_heads_x2
+        )
+        horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+        version_cap = 512 if version == 4 else (2048 if version < 7 else 4096)
+        target_bkv = min(min_bkv_sz_to_peak, version_cap, horizon_kv)
+        table_kv = pages_per_seq * page_size
+        bkv_sz = min(_largest_pow2_multiple(target_bkv, page_size), table_kv)
+        return _clamp_decode_vmem(
+            RpaBlockSizes(1, bkv_sz, 1, bkv_sz),
+            actual_num_kv_heads=actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head=actual_num_q_heads // actual_num_kv_heads,
+            actual_head_dim=head_dim,
+            min_unit=page_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            max_scratch=int(
+                _DECODE_VMEM_SCRATCH_FRACTION
+                * _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+            ),
+        ).as_dict()
 
     is_v7_plus = version >= 7
     target_bq = 2048 if is_v7_plus else 1024
@@ -312,6 +377,176 @@ def get_default_block_sizes(
         "bq_csz": bq_csz,
         "bkv_csz": bkv_c_units * kv_unit,
     }
+
+
+_DecodeTableKey = tuple[int, str, int, int, int, int]
+
+
+def _largest_pow2_multiple(limit: int, unit: int) -> int:
+    mult = max(1, limit // unit)
+    return unit * (1 << (mult.bit_length() - 1))
+
+
+def _decode_horizon_kv(
+    page_size: int, pages_per_seq: int, sliding_window: int | None
+) -> int:
+    horizon_kv = (pages_per_seq - 1) * page_size if pages_per_seq > 1 else page_size
+    if sliding_window is not None:
+        horizon_kv = min(horizon_kv, align_to(sliding_window + page_size, page_size))
+    return horizon_kv
+
+
+def _effective_vmem_limit(
+    version: int, tpu_version: int | None, vmem_limit_bytes: int | None
+) -> int:
+    if vmem_limit_bytes is not None:
+        return vmem_limit_bytes
+    if tpu_version is None and version >= 4:
+        return pltpu.get_tpu_info().vmem_capacity_bytes
+    return _DEVICE_VMEM_BYTES.get(version, DEFAULT_INTERPRET_VMEM_BYTES)
+
+
+def _clamp_decode_vmem(
+    blocks: RpaBlockSizes,
+    *,
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    min_unit: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+    max_scratch: int,
+) -> RpaBlockSizes:
+    bkv_sz = blocks.bkv_sz
+    bkv_csz = blocks.bkv_csz
+    while (
+        bkv_sz >= 2 * min_unit
+        and get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+            blocks.bq_sz,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > max_scratch
+    ):
+        bkv_sz //= 2
+    return RpaBlockSizes(blocks.bq_sz, bkv_sz, blocks.bq_csz, min(bkv_csz, bkv_sz))
+
+
+def _build_tpu7x_rpa_decode_tuned_table() -> dict[_DecodeTableKey, RpaBlockSizes]:
+    # Seeded from vllm-project/tpu-inference TUNED_BLOCK_SIZES['TPU v7'] with
+    # decode invariants (bq_sz=1, bq_csz=1, bkv_csz=bkv_sz). Entries whose
+    # double-buffered KV tensor exceeds 24 MiB step down to 2048 or 1024.
+    max_bkv_fp8 = {
+        (32, 4, 128): 4096,
+        (64, 8, 128): 4096,
+        (16, 2, 128): 4096,
+        (16, 2, 256): 4096,
+        (16, 4, 256): 4096,
+        (32, 4, 256): 4096,
+        (32, 8, 256): 2048,
+        (8, 2, 256): 4096,
+    }
+    max_bkv_bf16 = {
+        (32, 4, 128): 4096,
+        (64, 8, 128): 2048,
+        (16, 2, 128): 4096,
+        (16, 2, 256): 4096,
+        (16, 4, 256): 2048,
+        (32, 4, 256): 2048,
+        (32, 8, 256): 1024,
+        (8, 2, 256): 4096,
+    }
+    table: dict[_DecodeTableKey, RpaBlockSizes] = {}
+    for page_size in (128, 256):
+        for kv_name, shape_caps in (
+            ("float8_e4m3fn", max_bkv_fp8),
+            ("float8_e5m2", max_bkv_fp8),
+            ("bfloat16", max_bkv_bf16),
+        ):
+            for (q_heads, kv_heads, aligned_hd), cap in shape_caps.items():
+                for kv_bucket in (256, 512, 1024, 2048, 4096):
+                    bkv = min(kv_bucket, cap)
+                    table[
+                        (page_size, kv_name, q_heads, kv_heads, aligned_hd, kv_bucket)
+                    ] = RpaBlockSizes(1, bkv, 1, bkv)
+    return table
+
+
+_TPU7X_RPA_DECODE_TUNED_BLOCKS = _build_tpu7x_rpa_decode_tuned_table()
+
+
+def get_rpa_block_sizes(
+    q_dtype: Any,
+    kv_dtype: Any,
+    actual_num_q_heads: int,
+    actual_num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_num_tokens: int,
+    max_num_seqs: int,
+    pages_per_seq: int,
+    *,
+    case: RpaCase = RpaCase.MIXED,
+    tpu_version: int | None = None,
+    sliding_window: int | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> RpaBlockSizes:
+    """Return tuned TPU7x decode block sizes, falling back to ``get_default_block_sizes``."""
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    if case == RpaCase.DECODE and version == 7:
+        table_kv = pages_per_seq * page_size
+        horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+        kv_bucket = _largest_pow2_multiple(min(horizon_kv, 4096), page_size)
+        key = (
+            page_size,
+            jnp.dtype(kv_dtype).name,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            align_to(head_dim, 128),
+            kv_bucket,
+        )
+        if (tuned := _TPU7X_RPA_DECODE_TUNED_BLOCKS.get(key)) is not None:
+            clamped_bkv = min(tuned.bkv_sz, _largest_pow2_multiple(table_kv, page_size))
+            bounded = RpaBlockSizes(1, clamped_bkv, 1, min(tuned.bkv_csz, clamped_bkv))
+            eff_limit = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+            cap_frac = (
+                _DECODE_VMEM_SCRATCH_FRACTION
+                if vmem_limit_bytes is not None
+                else _TUNED_VMEM_CAP_FRACTION
+            )
+            return _clamp_decode_vmem(
+                bounded,
+                actual_num_kv_heads=actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head=actual_num_q_heads
+                // actual_num_kv_heads,
+                actual_head_dim=head_dim,
+                min_unit=page_size,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                max_scratch=int(cap_frac * eff_limit),
+            )
+
+    return RpaBlockSizes(
+        **get_default_block_sizes(
+            q_dtype,
+            kv_dtype,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+            page_size,
+            max_num_tokens,
+            max_num_seqs,
+            pages_per_seq,
+            case=case,
+            tpu_version=tpu_version,
+            sliding_window=sliding_window,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+    )
 
 
 def _cpu_ragged_paged_attention(
@@ -418,11 +653,7 @@ def ragged_paged_attention(
     use_pallas = tpu_version >= 4 or interpret
 
     if use_pallas and vmem_limit_bytes is None:
-        vmem_limit_bytes = (
-            pltpu.get_tpu_info().vmem_capacity_bytes
-            if tpu_version >= 4
-            else DEFAULT_INTERPRET_VMEM_BYTES
-        )
+        vmem_limit_bytes = _effective_vmem_limit(tpu_version, None, None)
 
     static_validate_inputs(
         queries,
@@ -609,25 +840,22 @@ def ragged_paged_attention(
         override: tuple[int, int, int, int] | None, case: RpaCase
     ) -> dict[str, int]:
         if override is not None:
-            return {
-                "bq_sz": override[0],
-                "bkv_sz": override[1],
-                "bq_csz": override[2],
-                "bkv_csz": override[3],
-            }
-        return get_default_block_sizes(
+            return RpaBlockSizes(*override).as_dict()
+        return get_rpa_block_sizes(
             q.dtype,
             kv_cache.dtype,
             actual_num_q_heads,
             actual_num_kv_heads,
-            head_dim,
+            actual_head_dim,
             page_size,
             max_num_tokens,
             max_num_seqs,
             pages_per_seq,
             case=case,
             tpu_version=tpu_version,
-        )
+            sliding_window=sliding_window,
+            vmem_limit_bytes=vmem_limit_bytes,
+        ).as_dict()
 
     q, kv_cache = run_rpa_case(
         q,
@@ -650,9 +878,12 @@ def ragged_paged_attention(
 
 
 __all__ = [
+    "RpaBlockSizes",
     "RpaCase",
     "get_default_block_sizes",
     "get_kv_cache_shape",
+    "get_rpa_block_sizes",
+    "get_vmem_estimate_bytes",
     "quantize_kv",
     "ragged_paged_attention",
     "static_validate_inputs",

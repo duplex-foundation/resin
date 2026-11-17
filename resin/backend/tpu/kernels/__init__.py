@@ -21,9 +21,12 @@ from resin.backend.tpu.kernels.norm_rope import (
     rms_norm_fp8_quant,
 )
 from resin.backend.tpu.kernels.ragged_paged_attention import (
+    RpaBlockSizes,
     RpaCase,
     get_default_block_sizes,
     get_kv_cache_shape,
+    get_rpa_block_sizes,
+    get_vmem_estimate_bytes,
     quantize_kv,
     ragged_paged_attention,
 )
@@ -31,6 +34,7 @@ from resin.backend.tpu.kernels.ragged_paged_attention import (
 __all__ = [
     "Fp8MatmulTileSizes",
     "Fp8Weight",
+    "RpaBlockSizes",
     "RpaCase",
     "apply_rope",
     "build_rope_cache",
@@ -39,7 +43,9 @@ __all__ = [
     "fused_add_rms_norm",
     "get_default_block_sizes",
     "get_kv_cache_shape",
+    "get_rpa_block_sizes",
     "get_tuned_block_sizes",
+    "get_vmem_estimate_bytes",
     "pallas_fp8_matmul",
     "pallas_rms_norm_fp8_quant",
     "quantize_fp8_act",
