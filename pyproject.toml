@@ -87,11 +87,12 @@ known-first-party = [
   "resin_models_cuda",
   "resin_models_mlx",
   "resin_models_torch",
+  "resin_models_tpu",
 ]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "models/cuda", "models/mlx", "models/torch"]
-testpaths = ["tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests"]
+pythonpath = [".", "models/cuda", "models/mlx", "models/torch", "models/tpu"]
+testpaths = ["tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests", "models/tpu/tests"]
 
 [tool.uv]
 default-groups = ["dev"]
