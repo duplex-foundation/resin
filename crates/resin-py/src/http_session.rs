@@ -299,7 +299,11 @@ impl Session {
                         .map_err(|_| {
                             PyValueError::new_err("max_output_tokens must fit in a uint32")
                         })?,
-                    self.stop_token_ids.to_vec(),
+                    if job.request.ignore_eos {
+                        Vec::new()
+                    } else {
+                        self.stop_token_ids.to_vec()
+                    },
                     job.request.temperature,
                     job.request.top_p,
                     job.request.top_k,
@@ -643,6 +647,16 @@ fn render_custom<'py>(
 /// Render prompt/media and create its parser off the engine thread.
 pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob {
     Python::attach(|py| {
+        if let Some(prompt) = &job.request.prompt {
+            let native = recipe
+                .bind(py)
+                .cast::<NativeRecipe>()
+                .map_err(|_| PyValueError::new_err("raw prompts require a native recipe"))?;
+            let native = native.borrow();
+            let rendered = native.render_raw(py, prompt)?;
+            let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
+            return Ok((rendered.token_ids, None, parser));
+        }
         let input = render_input(py, recipe, &job.request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();

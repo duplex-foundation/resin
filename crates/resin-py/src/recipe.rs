@@ -16,9 +16,10 @@ use pyo3::{
     types::{PyBool, PyDict},
 };
 use pythonize::{depythonize, pythonize};
+use resin_http::RawPrompt;
 use resin_recipe::{
     AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, MediaConfig,
-    ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder, ToolScope,
+    PlainParser, ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder, ToolScope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -379,6 +380,8 @@ pub(crate) struct RenderedPrompt {
 struct ParserSeed {
     recipe_id: u64,
     request: Value,
+    /// Raw prompts bypass the recipe's response grammar.
+    plain: bool,
 }
 #[pymethods]
 impl RenderedPrompt {
@@ -551,11 +554,50 @@ impl NativeRecipe {
         let seed = ParserSeed {
             recipe_id: self.id,
             request: json!({"tools":request["tools"],"extra":request["extra"]}),
+            plain: false,
         };
         Ok(RenderedPrompt {
             token_ids,
             media,
             seed: Some(seed),
+        })
+    }
+    /// Tokenize a raw prompt as given: no chat template, no added special tokens.
+    pub(crate) fn render_raw(
+        &self,
+        py: Python<'_>,
+        prompt: &RawPrompt,
+    ) -> PyResult<RenderedPrompt> {
+        let token_ids = match prompt {
+            RawPrompt::Text(text) => py
+                .detach(|| self.encoder.encode_text(text))
+                .map_err(recipe_error)?,
+            RawPrompt::TokenIds(ids) => {
+                let unknown = py.detach(|| {
+                    let tokenizer = self.tokenizer.native()?;
+                    ids.iter()
+                        .copied()
+                        .find(|&id| tokenizer.id_to_token(id).is_none())
+                });
+                if let Some(id) = unknown {
+                    return Err(PyValueError::new_err(format!(
+                        "prompt token id {id} is outside the tokenizer vocabulary"
+                    )));
+                }
+                ids.clone()
+            }
+        };
+        if token_ids.is_empty() {
+            return Err(PyValueError::new_err("prompt tokenized to no tokens"));
+        }
+        Ok(RenderedPrompt {
+            token_ids,
+            media: None,
+            seed: Some(ParserSeed {
+                recipe_id: self.id,
+                request: Value::Null,
+                plain: true,
+            }),
         })
     }
 }
@@ -620,10 +662,15 @@ impl NativeRecipe {
                 PyValueError::new_err("prompt must have been rendered by this recipe instance")
             })?;
         let parser = py.detach(|| {
+            let decoder = self.tokenizer.decoder().map_err(recipe_error)?;
+            if seed.plain {
+                let stops = self.resolved_stop_token_ids()?.to_vec();
+                return Ok(Box::new(PlainParser::new(decoder, stops)) as Box<dyn ResponseParser>);
+            }
             self.recipe
                 .create_parser(
                     self.encoder.as_ref(),
-                    self.tokenizer.decoder().map_err(recipe_error)?,
+                    decoder,
                     &seed.request,
                     &prompt.token_ids,
                 )
