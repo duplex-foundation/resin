@@ -154,9 +154,10 @@ class Qwen3Model:
         )
 
     def _resolve_decode_matmul_mode(self, tokens: int) -> DecodeMatmulMode:
-        del tokens
         if self.decode_matmul_mode != "auto":
             return self.decode_matmul_mode
+        if get_tpu_version() >= 7 and tokens <= 256:
+            return "xla"
         return "pallas"
 
     def _can_use_fused_qkv_pack(

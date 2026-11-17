@@ -3127,15 +3127,16 @@ class TestTpuHardwareMosaic:
             layers=1, kv_heads=8, head_dim=128, page_tokens=256, dtype=jnp.float8_e4m3fn
         )
         cache_sh = NamedSharding(mesh, KV_PARTITION)
+        total_pages = 2 * tokens + 2
         cache = jax.device_put(
-            jnp.zeros((16, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sh
+            jnp.zeros((total_pages, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sh
         )
         ref_cache = jax.device_put(
-            jnp.zeros((16, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sh
+            jnp.zeros((total_pages, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sh
         )
         pages = np.zeros((tokens, 4), dtype=np.int32)
         for i in range(live):
-            pages[i, :2] = [(i % 7) + 1, ((i + 3) % 7) + 8]
+            pages[i, :2] = [2 * i + 1, 2 * i + 2]
         kv_lens_np = np.zeros((tokens,), dtype=np.int32)
         kv_lens_np[:live] = 260
         cu_np = np.array([min(i, live) for i in range(tokens + 1)], dtype=np.int32)

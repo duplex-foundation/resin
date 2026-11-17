@@ -112,10 +112,14 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         table[(bs, 512, 5120)] = Fp8MatmulTileSizes(bs, 512, 5120)
         table[(bs, 2560, 4096)] = Fp8MatmulTileSizes(bs, 2560, 4096)
         table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(bs, 2560, 4096)
-        table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
+        table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(
+            bs, 2560 if bs <= 192 else 1280, 5120
+        )
         table[(bs, 5120, 8192)] = Fp8MatmulTileSizes(bs, 1024, 8192)
         table[(bs, 2560, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800)
-        table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800)
+        table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(
+            bs, 1024 if bs <= 128 else 512, 12800
+        )
         table[(bs, 5120, 25600)] = Fp8MatmulTileSizes(bs, 512, 12800)
         table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
         table[(bs, 25600, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
@@ -739,26 +743,25 @@ def pallas_fp8_gate_up_swiglu(
     padded_ffn = align_to(orig_ffn, out_block)
     padded_k = align_to(orig_k, in_block)
 
-    w_gate = w_gate_up[:orig_ffn]
-    w_up = w_gate_up[orig_ffn:]
-    ws_gate = w_scale[:orig_ffn].astype(jnp.float32)
-    ws_up = w_scale[orig_ffn:].astype(jnp.float32)
-
     if orig_batch < padded_batch:
         pad_b = padded_batch - orig_batch
         x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
         x_scale_row = jnp.pad(x_scale_row, ((0, 0), (0, pad_b)))
-    if orig_ffn < padded_ffn:
-        pad_n = padded_ffn - orig_ffn
-        w_gate = jnp.pad(w_gate, ((0, pad_n), (0, 0)))
-        w_up = jnp.pad(w_up, ((0, pad_n), (0, 0)))
-        ws_gate = jnp.pad(ws_gate, (0, pad_n))
-        ws_up = jnp.pad(ws_up, (0, pad_n))
     if orig_k < padded_k:
+        x_2d = jnp.pad(x_2d, ((0, 0), (0, padded_k - orig_k)))
+
+    if orig_ffn == padded_ffn and orig_k == padded_k:
+        w_in = w_gate_up
+        ws_2d = jnp.expand_dims(w_scale.astype(jnp.float32), axis=0)
+    else:
+        pad_n = padded_ffn - orig_ffn
         pad_k = padded_k - orig_k
-        x_2d = jnp.pad(x_2d, ((0, 0), (0, pad_k)))
-        w_gate = jnp.pad(w_gate, ((0, 0), (0, pad_k)))
-        w_up = jnp.pad(w_up, ((0, 0), (0, pad_k)))
+        w_gate = jnp.pad(w_gate_up[:orig_ffn], ((0, pad_n), (0, pad_k)))
+        w_up = jnp.pad(w_gate_up[orig_ffn:], ((0, pad_n), (0, pad_k)))
+        w_in = jnp.concatenate([w_gate, w_up], axis=0)
+        ws_gate = jnp.pad(w_scale[:orig_ffn].astype(jnp.float32), (0, pad_n))
+        ws_up = jnp.pad(w_scale[orig_ffn:].astype(jnp.float32), (0, pad_n))
+        ws_2d = jnp.expand_dims(jnp.concatenate([ws_gate, ws_up], axis=0), axis=0)
 
     n_batch = padded_batch // batch_block
     n_out = padded_ffn // out_block
@@ -788,10 +791,10 @@ def pallas_fp8_gate_up_swiglu(
                     (out_block, in_block), lambda _b, o, i: (o_idx(o), i_idx(i))
                 ),
                 pl.BlockSpec(
-                    (out_block, in_block), lambda _b, o, i: (o_idx(o), i_idx(i))
+                    (out_block, in_block), lambda _b, o, i: (n_out + o_idx(o), i_idx(i))
                 ),
                 pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, o_idx(o))),
-                pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, o_idx(o))),
+                pl.BlockSpec((1, out_block), lambda _b, o, _i: (0, n_out + o_idx(o))),
                 pl.BlockSpec((1, batch_block), lambda b, _o, _i: (0, b_idx(b))),
             ],
             out_specs=[
@@ -822,10 +825,10 @@ def pallas_fp8_gate_up_swiglu(
 
     gated_padded, absmax_3d = kernel(
         x_2d,
-        w_gate,
-        w_up,
-        jnp.expand_dims(ws_gate, axis=0),
-        jnp.expand_dims(ws_up, axis=0),
+        w_in,
+        w_in,
+        ws_2d,
+        ws_2d,
         x_scale_row,
     )
     gated = gated_padded[:orig_batch, :orig_ffn].reshape(*leading, orig_ffn)
