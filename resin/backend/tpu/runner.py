@@ -10,7 +10,6 @@ continuation feeds the previous step's device tokens straight into the next.
 from __future__ import annotations
 
 import functools
-import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -49,7 +48,6 @@ if TYPE_CHECKING:
 
 # Prompt scoring projects hidden rows in fixed chunks of this many rows.
 _SCORE_ROWS = 128
-DEFAULT_COMPILE_CACHE = os.path.expanduser("~/.cache/resin/jax-compile")
 
 
 class TpuModel(Protocol):
@@ -116,12 +114,13 @@ class TpuRunner:
     """Run a :class:`TpuModel` on a ``tp`` mesh with Engine-owned KV pages.
 
     ``cache_slab_capacity`` caps the slab pool; it is required on platforms
-    that report no device memory, such as the JAX CPU backend.
-    ``strict_compilation`` turns any compilation after warmup into a step
-    failure, which is how the backend enforces its shape-stability rule.
-    ``compile_cache_dir`` enables JAX's process-global persistent compile
-    cache; pass None to leave JAX's configuration alone. The Engine's
-    ``max_running_requests`` must not exceed ``max_num_seqs``.
+    that report no device memory, such as the JAX CPU backend. Construction
+    compiles every step shape, and any compilation after that fails the step,
+    which is how the backend enforces its shape-stability rule. Configure
+    JAX's persistent compile cache through its ``JAX_COMPILATION_CACHE_DIR``
+    environment variables. The Engine's ``max_running_requests`` must not
+    exceed ``max_num_seqs``, and its ``context_length`` must not exceed
+    ``max_seq_len``.
     """
 
     parallelism_capabilities = ParallelismCapabilities()
@@ -140,23 +139,15 @@ class TpuRunner:
         memory_utilization: float = 0.9,
         workspace_bytes: int = 8 * 1024**3,
         cache_slab_capacity: int | None = None,
-        compile_cache_dir: str | None = DEFAULT_COMPILE_CACHE,
-        warmup: bool = True,
-        strict_compilation: bool = True,
     ) -> None:
         if min(max_seq_len, max_num_seqs, max_batch_tokens) <= 0:
             raise ValueError("runner limits must be positive")
-        if compile_cache_dir is not None:
-            jax.config.update("jax_compilation_cache_dir", compile_cache_dir)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
-            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
         self.compilations = CompilationCounter()
         self.model = model
         self.params = params
         self.mesh = mesh
         self.vocab_size = model.vocab_size
         self.max_seq_len = max_seq_len
-        self.strict_compilation = strict_compilation
         self.buckets = buckets or ShapeBuckets.powers_of_two(
             max_num_seqs=max_num_seqs, max_batch_tokens=max_batch_tokens
         )
@@ -181,12 +172,13 @@ class TpuRunner:
             raise ValueError(
                 "pass cache_slab_capacity on a platform without memory stats"
             )
-        self.cache_layout = cache_layout(specs, capacity)
+        chunk_tokens = prefill_chunk_size or max_batch_tokens
+        self.cache_layout = cache_layout(specs, capacity, chunk_tokens=chunk_tokens)
         self._arena = CacheArena(specs, self.cache_layout, mesh)
         self.pages_per_seq = tuple(spec.pages_per_seq(max_seq_len) for spec in specs)
         self.runner_config = RunnerConfig(
             max_batch_tokens=max_batch_tokens,
-            prefill_chunk_size=prefill_chunk_size or max_batch_tokens,
+            prefill_chunk_size=chunk_tokens,
             continuation_prefill=True,
             cache_layout=self.cache_layout,
         )
@@ -197,18 +189,19 @@ class TpuRunner:
             "buckets": {
                 "decode_seqs": list(self.buckets.decode_seqs),
                 "prefill_tokens": list(self.buckets.prefill_tokens),
-                "prefill_seqs": list(self.buckets.prefill_seqs),
             },
         }
 
         self._replicated = replicated(mesh)
-        # Pinned output shardings keep the donated caches' input signature
-        # stable from step to step, so no step recompiles for layout.
+        # Pinned cache output shardings keep the donated caches' input
+        # signature stable from step to step, so no step recompiles for
+        # layout. Logits and hidden keep the model's sharding: replicating a
+        # vocab-sharded head's logits would all-gather [seqs, vocab] per step.
         cache_shardings = jax.tree.map(lambda array: array.sharding, self._arena.caches)
         self._forward = jax.jit(
             self._forward_step,
             donate_argnums=(1,),
-            out_shardings=(self._replicated, self._replicated, cache_shardings),
+            out_shardings=(None, None, cache_shardings),
         )
         self._samplers = {
             stochastic: jax.jit(
@@ -221,10 +214,8 @@ class TpuRunner:
             lambda params, hidden: model.logits(params, hidden).astype(jnp.float32),
             out_shardings=self._replicated,
         )
-        self.warmup_compilations: int | None = None
         self._step_compilations = 0
-        if warmup:
-            self.warmup()
+        self.warmup()
 
     def _forward_step(
         self, params: Any, caches: Caches, inputs: ModelInputs
@@ -306,11 +297,9 @@ class TpuRunner:
         return _Step(plan, tokens, logits, hidden)
 
     def _check_compilations(self, before: int, label: str) -> None:
-        if self.warmup_compilations is None:
-            return
         compiled = self.compilations.count - before
         self._step_compilations += compiled
-        if compiled and self.strict_compilation:
+        if compiled:
             raise PostAcceptTpuError(
                 f"TPU {label} compiled after warmup: "
                 f"{self.compilations.by_function(before)}"
@@ -376,4 +365,4 @@ class TpuRunner:
         return _Completion(self, step, continues)
 
 
-__all__ = ["DEFAULT_COMPILE_CACHE", "PostAcceptTpuError", "TpuModel", "TpuRunner"]
+__all__ = ["PostAcceptTpuError", "TpuModel", "TpuRunner"]

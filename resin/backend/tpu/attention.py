@@ -33,6 +33,9 @@ def quantize_kv(x: jax.Array, dtype, scale: float | None) -> jax.Array:
     return jnp.clip(scaled, -bound, bound).astype(dtype)
 
 
+_KERNEL_MODULE = "resin.backend.tpu.kernels.ragged_paged_attention"
+
+
 @functools.cache
 def default_impl() -> AttentionImpl:
     """The Pallas kernel on TPU, otherwise the pure-JAX reference."""
@@ -42,7 +45,11 @@ def default_impl() -> AttentionImpl:
             from resin.backend.tpu.kernels.ragged_paged_attention import (
                 ragged_paged_attention,
             )
-        except ImportError:
+        except ModuleNotFoundError as error:
+            # Only an absent kernel module falls back; a broken import inside
+            # it must fail rather than serve the reference at serving shapes.
+            if not f"{_KERNEL_MODULE}.".startswith(f"{error.name}."):
+                raise
             logger.warning(
                 "ragged paged attention kernel is unavailable; using the slow "
                 "pure-JAX reference on TPU"
@@ -72,9 +79,14 @@ def paged_attention(
 
     ``queries`` is ``[tokens, q_heads, head_dim]`` and ``keys``/``values`` are
     ``[tokens, kv_heads, head_dim]``, all sharded on heads over ``tp``. The
-    kernel runs once per die on local shapes.
+    kernel runs once per die on local shapes. Pass the ``group`` whose cache
+    ``kv_cache`` is and that group's ``KvCacheSpec.sliding_window``, so the
+    page table and the Engine's retention match this layer. K/V scales apply
+    only to 8-bit caches.
     """
 
+    if jnp.dtype(kv_cache.dtype).itemsize != 1:
+        k_scale = v_scale = None
     kernel = functools.partial(
         impl or default_impl(),
         sm_scale=sm_scale,

@@ -1,7 +1,8 @@
 """Engine-addressed KV pages in the ragged paged attention v3 layout.
 
 Each cache group owns one array per layer, shaped
-``[(parent_capacity + 1) * blocks_per_slab, page_tokens, rows, packing, head_dim]``.
+``[(parent_capacity + 1) * blocks_per_slab, page_tokens, rows, packing,
+round_up(head_dim, 128)]``.
 K and V heads interleave on the combined head axis (``2 * head + {0: K, 1: V}``),
 packed ``packing = 32 // bits`` per 32-bit word. Row ``slab * blocks_per_slab +
 slot`` is the Engine block ``(slab, slot)``; slab zero is the never-written null
@@ -24,7 +25,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from resin import CacheGroupLayout, CacheLayout
+from resin import CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.resources import CachePoolBinding
 from resin.backend.tpu.mesh import TP_AXIS, tp_size
@@ -44,17 +45,24 @@ def _align(value: int, multiple: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class KvCacheSpec:
-    """One full-attention cache group: its layers and per-token K/V geometry."""
+    """One attention cache group: its layers and per-token K/V geometry.
+
+    ``sliding_window`` is the read window in tokens, including the current
+    token; the Engine then keeps only the pages that window can still read.
+    """
 
     layers: int
     kv_heads: int
     head_dim: int
     page_tokens: int = 256
     dtype: Any = jnp.float8_e4m3fn
+    sliding_window: int | None = None
 
     def __post_init__(self) -> None:
         if min(self.layers, self.kv_heads, self.head_dim, self.page_tokens) <= 0:
             raise ValueError("cache geometry must be positive")
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive")
         if self.page_tokens % self.packing:
             raise ValueError(
                 f"page_tokens must be a multiple of packing {self.packing}"
@@ -73,7 +81,8 @@ class KvCacheSpec:
         return _align(2 * self.kv_heads // tp, self.packing) // self.packing
 
     def page_shape(self, tp: int) -> tuple[int, int, int, int]:
-        """Global ``[page_tokens, rows, packing, head_dim]`` of one layer's page."""
+        """Global ``[page_tokens, rows, packing, round_up(head_dim, 128)]`` of
+        one layer's page."""
 
         return (
             self.page_tokens,
@@ -95,12 +104,30 @@ class KvCacheSpec:
         return math.ceil(max_seq_len / self.page_tokens) + 1
 
 
-def cache_layout(specs: Sequence[KvCacheSpec], parent_capacity: int) -> CacheLayout:
+def _group_layout(spec: KvCacheSpec, chunk_tokens: int) -> CacheGroupLayout:
+    if spec.sliding_window is None:
+        return CacheGroupLayout(spec.page_tokens)
+    # A chunk's earliest query reads back sliding_window - 1 tokens, and the
+    # chunk's own writes must stay resident while it runs.
+    return CacheGroupLayout(
+        spec.page_tokens,
+        retention=CacheRetention.WINDOW,
+        window_tokens=spec.sliding_window + chunk_tokens - 1,
+        read_window_tokens=spec.sliding_window,
+    )
+
+
+def cache_layout(
+    specs: Sequence[KvCacheSpec], parent_capacity: int, *, chunk_tokens: int
+) -> CacheLayout:
+    """One Engine cache group per spec; ``chunk_tokens`` is the largest
+    number of tokens one step writes per sequence."""
+
     if not specs:
         raise ValueError("a TPU model must declare at least one cache group")
     return CacheLayout(
         parent_capacity=parent_capacity,
-        groups=[CacheGroupLayout(spec.page_tokens) for spec in specs],
+        groups=[_group_layout(spec, chunk_tokens) for spec in specs],
     )
 
 

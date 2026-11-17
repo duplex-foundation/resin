@@ -42,16 +42,17 @@ def _smallest(values: tuple[int, ...], needed: int, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class ShapeBuckets:
-    """Decode steps pad rows; prefill steps pad tokens and rows independently.
+    """Decode steps pad rows; prefill steps pad tokens.
 
     Decode has one token per row, so a decode bucket's token count equals its
-    row count. Bucket boundaries are engine-internal tuning, not workload
-    settings.
+    row count. A prefill bucket holds ``min(tokens, decode_seqs[-1])`` rows:
+    ragged attention loops over live rows only, so padded rows cost little,
+    while every extra row count would compile the whole model again. Bucket
+    boundaries are engine-internal tuning, not workload settings.
     """
 
     decode_seqs: tuple[int, ...]
     prefill_tokens: tuple[int, ...]
-    prefill_seqs: tuple[int, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -59,9 +60,6 @@ class ShapeBuckets:
         )
         object.__setattr__(
             self, "prefill_tokens", _sorted_unique(self.prefill_tokens, "prefill token")
-        )
-        object.__setattr__(
-            self, "prefill_seqs", _sorted_unique(self.prefill_seqs, "prefill row")
         )
 
     @classmethod
@@ -80,8 +78,10 @@ class ShapeBuckets:
             prefill_tokens=_powers_of_two(
                 min(min_prefill_tokens, max_batch_tokens), max_batch_tokens
             ),
-            prefill_seqs=_powers_of_two(1, max_num_seqs),
         )
+
+    def _prefill(self, tokens: int) -> Bucket:
+        return Bucket(tokens, min(tokens, self.decode_seqs[-1]))
 
     def select(self, phase: BatchPhase, tokens: int, seqs: int) -> Bucket:
         if phase == BatchPhase.DECODE:
@@ -89,14 +89,9 @@ class ShapeBuckets:
                 raise ValueError("decode steps schedule exactly one token per row")
             rows = _smallest(self.decode_seqs, seqs, "decode rows")
             return Bucket(rows, rows)
-        bucket = Bucket(
-            _smallest(self.prefill_tokens, tokens, "prefill tokens"),
-            _smallest(self.prefill_seqs, seqs, "prefill rows"),
-        )
-        if bucket.seqs > bucket.tokens:
-            raise ValueError(
-                f"no compiled prefill bucket holds {seqs} rows in {bucket}"
-            )
+        bucket = self._prefill(_smallest(self.prefill_tokens, tokens, "prefill tokens"))
+        if seqs > bucket.seqs:
+            raise ValueError(f"{seqs} prefill rows exceed {bucket}")
         return bucket
 
     def shapes(self) -> Iterator[Bucket]:
@@ -105,9 +100,7 @@ class ShapeBuckets:
         for rows in self.decode_seqs:
             yield Bucket(rows, rows)
         for tokens in self.prefill_tokens:
-            for rows in self.prefill_seqs:
-                if rows <= tokens:
-                    yield Bucket(tokens, rows)
+            yield self._prefill(tokens)
 
 
 __all__ = ["Bucket", "ShapeBuckets"]

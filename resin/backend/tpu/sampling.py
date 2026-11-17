@@ -3,8 +3,9 @@
 Two regimes are compiled per row bucket: greedy, and stochastic with exact
 temperature, top-k and top-p filtering. Temperature, top-k, top-p, seeds and
 offsets never become compilation keys. Randomness is stateless per row: the
-request seed and the absolute sampling offset select a Threefry key, as in
-:func:`resin.backend.sampling.batch_sampling_inputs`.
+seed and absolute offset from
+:func:`resin.backend.sampling.batch_sampling_inputs` select a Threefry key, so
+draws differ from CUDA's.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 from resin.backend.sampling import batch_sampling_inputs
 from resin.backend.tpu.metadata import StepArray
@@ -64,30 +66,62 @@ def is_stochastic(inputs: SamplingInputs) -> bool:
     return bool(np.any(np.asarray(inputs.temperature) > 0.0))
 
 
-def sample(logits: jax.Array, inputs: SamplingInputs, *, stochastic: bool) -> jax.Array:
-    """Select one token per row from ``logits[seqs, vocab]``."""
+def _draw(
+    scaled: jax.Array, lse: jax.Array, inputs: SamplingInputs, keys, k: int
+) -> tuple[jax.Array, jax.Array]:
+    """Draw from the ``k`` highest tempered logits; also return their mass."""
+
+    ranked, order = lax.top_k(scaled, k)
+    # The nucleus comes from the full tempered distribution before top-k;
+    # the highest-ranked token always survives.
+    probabilities = jnp.exp(ranked - lse[:, None])
+    exclusive = jnp.cumsum(probabilities, axis=-1) - probabilities
+    rank = jnp.arange(k)[None, :]
+    keep = (rank < inputs.top_k[:, None]) & (exclusive < inputs.top_p[:, None])
+    keep |= rank == 0
+    noise = jax.vmap(lambda key: jax.random.gumbel(key, (k,)))(keys)
+    choice = jnp.argmax(jnp.where(keep, ranked + noise, -jnp.inf), axis=-1)
+    sampled = jnp.take_along_axis(order, choice[:, None], axis=-1)[:, 0]
+    return sampled.astype(jnp.int32), probabilities.sum(-1)
+
+
+def sample(
+    logits: jax.Array,
+    inputs: SamplingInputs,
+    *,
+    stochastic: bool,
+    candidates: int = 128,
+) -> jax.Array:
+    """Select one token per row from ``logits[seqs, vocab]``.
+
+    Stochastic rows draw from their ``candidates`` highest logits. A row whose
+    top-k and nucleus can reach past them draws from the full sorted
+    vocabulary instead; each row's draw depends only on its own logits and
+    policy, never on the rest of the batch.
+    """
 
     greedy = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     if not stochastic:
         return greedy
+    vocab = logits.shape[-1]
     temperature = inputs.temperature[:, None]
     scaled = logits.astype(jnp.float32) / jnp.where(temperature > 0, temperature, 1.0)
-    order = jnp.argsort(scaled, axis=-1, descending=True)
-    ranked = jnp.take_along_axis(scaled, order, axis=-1)
-    probabilities = jax.nn.softmax(ranked, axis=-1)
-    exclusive = jnp.cumsum(probabilities, axis=-1) - probabilities
-    rank = jnp.arange(logits.shape[-1])[None, :]
-    # The nucleus comes from the full tempered distribution before top-k;
-    # the highest-ranked token always survives.
-    keep = (rank < inputs.top_k[:, None]) & (exclusive < inputs.top_p[:, None])
-    keep |= rank == 0
+    lse = jax.nn.logsumexp(scaled, axis=-1)
     keys = jax.vmap(
-        lambda data, offset: jax.random.fold_in(jax.random.wrap_key_data(data), offset)
+        lambda data, offset: jax.random.fold_in(
+            jax.random.wrap_key_data(data, impl="threefry2x32"), offset
+        )
     )(inputs.seeds, inputs.offsets)
-    noise = jax.vmap(lambda key: jax.random.gumbel(key, ranked.shape[-1:]))(keys)
-    choice = jnp.argmax(jnp.where(keep, ranked + noise, -jnp.inf), axis=-1)
-    sampled = jnp.take_along_axis(order, choice[:, None], axis=-1)[:, 0]
-    return jnp.where(inputs.temperature > 0, sampled.astype(jnp.int32), greedy)
+    sampled, mass = _draw(scaled, lse, inputs, keys, min(candidates, vocab))
+    covered = (
+        (inputs.top_k <= candidates) | (mass >= inputs.top_p) | (temperature[:, 0] <= 0)
+    )
+    sampled = lax.cond(
+        jnp.all(covered),
+        lambda: sampled,
+        lambda: jnp.where(covered, sampled, _draw(scaled, lse, inputs, keys, vocab)[0]),
+    )
+    return jnp.where(inputs.temperature > 0, sampled, greedy)
 
 
 __all__ = [
