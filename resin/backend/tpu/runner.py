@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from jax.sharding import Mesh
 
-from resin import BatchPhase, RunnerConfig
+from resin import BatchPhase, RunnerConfig, RunnerMetrics
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import format_output, prompt_scores, token_output
 from resin.backend.topology import ParallelismCapabilities
@@ -198,11 +198,17 @@ class TpuRunner:
         # layout. Logits and hidden keep the model's sharding: replicating a
         # vocab-sharded head's logits would all-gather [seqs, vocab] per step.
         cache_shardings = jax.tree.map(lambda array: array.sharding, self._arena.caches)
-        self._forward = jax.jit(
-            self._forward_step,
-            donate_argnums=(1,),
-            out_shardings=(None, None, cache_shardings),
-        )
+        forward_kwargs: dict[str, Any] = {
+            "donate_argnums": (1,),
+            "out_shardings": (None, None, cache_shardings),
+        }
+        if jax.default_backend() == "tpu":
+            forward_kwargs["compiler_options"] = {
+                "xla_tpu_all_gather_collective_matmul_mode": "post_spmd_conservative",
+                "xla_tpu_reduce_scatter_collective_matmul_mode": "post_spmd_conservative",
+                "xla_tpu_use_minor_sharding_for_major_trivial_input": "true",
+            }
+        self._forward = jax.jit(self._forward_step, **forward_kwargs)
         self._samplers = {
             stochastic: jax.jit(
                 functools.partial(sample, stochastic=stochastic),
@@ -251,6 +257,11 @@ class TpuRunner:
         """XLA compilations or cache loads inside steps since warmup."""
 
         return self._step_compilations
+
+    def metrics_snapshot(self) -> RunnerMetrics:
+        """Publish compilations after warmup. The read does not sync the device."""
+
+        return RunnerMetrics(compilations=self.compilations_after_warmup)
 
     def bind_resources(self, resources: ResourceBinding) -> None:
         self._arena.bind_resources(resources)
