@@ -459,3 +459,199 @@ fn invalid_byte_groups_preserve_the_exact_native_replacement_policy() {
         assert!(text.spans.iter().all(|s| s.source == (0..1)));
     }
 }
+
+const REPLACEMENT: &str = "\u{fffd}";
+
+fn push_chunks(
+    decoder: &mut TokenizerDecoder,
+    chunks: &[&[u32]],
+) -> Vec<resin_recipe::AttributedText> {
+    let mut start = 0;
+    chunks
+        .iter()
+        .map(|chunk| {
+            let text = decoder.push(chunk, start).unwrap();
+            start += chunk.len() as u32;
+            text
+        })
+        .collect()
+}
+
+fn compositions(length: usize) -> Vec<Vec<usize>> {
+    if length == 0 {
+        return vec![vec![]];
+    }
+    (1..=length)
+        .flat_map(|first| {
+            compositions(length - first)
+                .into_iter()
+                .map(move |mut rest| {
+                    rest.insert(0, first);
+                    rest
+                })
+        })
+        .collect()
+}
+
+#[test]
+fn split_multibyte_characters_across_tokens_and_after_invalid_bytes() {
+    for fallback in [false, true] {
+        let tokenizer = tokenizer(fallback, &[]);
+        for scalar in ["é", "€", "\u{1f980}"] {
+            let ids = bytes(scalar);
+            for split in compositions(ids.len()) {
+                let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+                let mut offset = 0;
+                let chunks: Vec<&[u32]> = split
+                    .iter()
+                    .map(|&length| {
+                        offset += length;
+                        &ids[offset - length..offset]
+                    })
+                    .collect();
+                let mut emitted = push_chunks(&mut decoder, &chunks);
+                let last = emitted.pop().unwrap();
+                assert!(
+                    emitted.iter().all(|text| text.is_empty()),
+                    "{scalar} {split:?}"
+                );
+                assert_eq!(last.text, scalar);
+                let spans: Vec<_> = last
+                    .spans
+                    .iter()
+                    .map(|span| (span.token, span.source.clone(), span.text.clone()))
+                    .collect();
+                let expected: Vec<_> = (0..ids.len() as u32)
+                    .map(|token| (token, 0..1, 0..scalar.len() as u32))
+                    .collect();
+                assert_eq!(spans, expected);
+                assert!(decoder.finish().unwrap().is_empty());
+            }
+        }
+
+        let lead = format!("hello{}", byte_character(0xF0));
+        let tokenizer = crate::tokenizer(fallback, &[&lead]);
+        let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+        let head: Vec<u32> = if fallback {
+            bytes("hello").into_iter().chain([0xF0]).collect()
+        } else {
+            vec![id(&tokenizer, &lead)]
+        };
+        let first = decoder.push(&head, 0).unwrap();
+        assert_eq!(first.text, "hello");
+        let second = decoder
+            .push(&[0x9F, 0xA6, 0x80], head.len() as u32)
+            .unwrap();
+        assert_eq!(second.text, "\u{1f980}");
+        assert_eq!(second.spans.len(), 4);
+        assert_eq!(second.spans[0].source, if fallback { 0..1 } else { 5..6 });
+        assert!(second.spans.iter().all(|span| span.text == (0..4)));
+
+        let mut decoder = TokenizerDecoder::new(tokenizer).unwrap();
+        let texts = push_chunks(&mut decoder, &[&[0xFF, 0xFF, 0xF0, 0x9F], &[0xA6, 0x80]]);
+        assert_eq!(texts[0].text, "\u{fffd}\u{fffd}");
+        assert_eq!(texts[1].text, "\u{1f980}");
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn long_invalid_utf8_runs_emit_replacements_without_unbounded_holdback() {
+    for fallback in [false, true] {
+        let tokenizer = tokenizer(fallback, &[]);
+        for byte in [0xFF_u32, 0x80] {
+            let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+            for index in 0..1024 {
+                let text = decoder.push(&[byte], index).unwrap();
+                assert_eq!(text.text, REPLACEMENT);
+                assert_eq!(text.spans.len(), 1);
+                assert_eq!(text.spans[0].token, index);
+            }
+            assert!(decoder.finish().unwrap().is_empty());
+        }
+
+        // ByteLevel replaces per maximal ill-formed subpart; ByteFallback replaces
+        // every byte of a failed `<0xNN>` run, spaces included.
+        let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+        let expected = if fallback {
+            "\u{fffd}\u{fffd}"
+        } else {
+            " \u{fffd}"
+        };
+        for index in 0..1024 {
+            let text = decoder.push(&[0x20, 0xFF], index * 2).unwrap();
+            assert_eq!(text.text, expected);
+        }
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    let tokenizer = tokenizer(false, &[]);
+    let mut decoder = TokenizerDecoder::new(tokenizer).unwrap();
+    let mut actual = String::new();
+    for index in 0..1024 {
+        let text = decoder.push(&[0x20, 0xF0], index * 2).unwrap();
+        actual.push_str(&text.text);
+        match index {
+            0 => assert_eq!(text.text, ""),
+            1 => assert_eq!(text.text, " \u{fffd} "),
+            _ => assert_eq!(text.text, "\u{fffd} "),
+        }
+    }
+    let tail = decoder.finish().unwrap();
+    assert_eq!(tail.text, REPLACEMENT);
+    actual.push_str(&tail.text);
+    let raw: Vec<u8> = (0..1024).flat_map(|_| [0x20, 0xF0]).collect();
+    assert_eq!(actual, String::from_utf8_lossy(&raw));
+}
+
+#[test]
+fn worst_case_holdback_is_three_bytes() {
+    for fallback in [false, true] {
+        let mut decoder = TokenizerDecoder::new(tokenizer(fallback, &[])).unwrap();
+        let steps = push_chunks(&mut decoder, &[&[0xF0], &[0x9F], &[0xA6], &[0xF0]]);
+        assert!(steps[..3].iter().all(|text| text.is_empty()));
+        assert_eq!(
+            steps[3].text,
+            if fallback {
+                "\u{fffd}\u{fffd}\u{fffd}"
+            } else {
+                REPLACEMENT
+            }
+        );
+        assert_eq!(decoder.finish().unwrap().text, REPLACEMENT);
+    }
+}
+
+#[test]
+fn final_flush_and_control_boundaries_drain_incomplete_tails() {
+    for fallback in [false, true] {
+        let tokenizer = tokenizer(fallback, &[]);
+        let mut decoder = TokenizerDecoder::new(tokenizer.clone()).unwrap();
+        for tail in [&[0xC2_u8][..], &[0xE2, 0x82], &[0xF0, 0x9F, 0xA6]] {
+            let ids: Vec<u32> = tail.iter().map(|&byte| u32::from(byte)).collect();
+            assert!(decoder.push(&ids, 0).unwrap().is_empty());
+            let flushed = decoder.finish().unwrap();
+            let expected = if fallback { tail.len() } else { 1 };
+            assert_eq!(flushed.text, REPLACEMENT.repeat(expected));
+            assert!(decoder.finish().unwrap().is_empty());
+            assert!(decoder.push(&[b'a' as u32], 0).unwrap().text == "a");
+            decoder.reset();
+        }
+
+        for (control, prompt) in [("</think>", Some("<think>")), ("<|im_end|>", None)] {
+            let prompt: Vec<u32> = prompt
+                .map(|text| id(&tokenizer, text))
+                .into_iter()
+                .collect();
+            let mut parser = parser(
+                recipe::<Qwen38Recipe>().as_ref(),
+                tokenizer.clone(),
+                &prompt,
+            );
+            let events = parser.feed(&[0xF0, 0x9F, id(&tokenizer, control)]).unwrap();
+            let (content, reasoning, _) = normalize(events);
+            let expected = REPLACEMENT.repeat(if fallback { 2 } else { 1 });
+            assert_eq!(format!("{reasoning}{content}"), expected, "{control}");
+        }
+    }
+}
