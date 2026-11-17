@@ -447,7 +447,13 @@ class TestFp8Weights:
                 page_tokens=256,
                 impl=ragged_paged_attention,
             )
-            for tokens, seqs in ((8, 8), (320, 320), (4096, 320)):
+            assert model._resolve_prefill_matmul_backend(512) == "xla"
+            assert model._resolve_prefill_matmul_backend(1024) == "xla"
+            assert model._resolve_prefill_matmul_backend(2048) == "pallas"
+            assert model._resolve_prefill_matmul_backend(4096) == "pallas"
+            assert model._resolve_prefill_matmul_backend(8192) == "pallas"
+
+            for tokens, seqs in ((8, 8), (320, 320), (1024, 320), (4096, 320)):
                 inp = ModelInputs(
                     input_ids=jax.ShapeDtypeStruct((tokens,), jnp.int32, sharding=rep),
                     positions=jax.ShapeDtypeStruct((tokens,), jnp.int32, sharding=rep),
@@ -465,7 +471,14 @@ class TestFp8Weights:
                     jax.jit(model.hidden_states, donate_argnums=(1,)),
                     platforms=["tpu"],
                 )(params, caches, inp)
-                assert "tpu_custom_call" in exported.mlir_module()
+                mlir_txt = exported.mlir_module()
+                assert "tpu_custom_call" in mlir_txt
+                if tokens == 1024:
+                    assert "fp8_gate_up_swiglu_512_" not in mlir_txt
+                    assert "fp8_w8a8_matmul_" not in mlir_txt
+                elif tokens == 4096:
+                    assert "fp8_gate_up_swiglu_512_1280_5120" in mlir_txt
+                    assert "fp8_w8a8_matmul_256_5120_5120" in mlir_txt
 
     def test_logits_track_the_reference(self, checkpoint) -> None:
         directory, reference = checkpoint

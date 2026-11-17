@@ -335,6 +335,11 @@ class Qwen3Model:
             impl=self.impl,
         )
 
+    def _resolve_prefill_matmul_backend(self, tokens: int) -> MatmulBackend:
+        if self.prefill_matmul_backend == "auto" and get_tpu_version() >= 7:
+            return "xla" if tokens <= 1024 else "pallas"
+        return self.prefill_matmul_backend
+
     def _hidden_states_fp8_sequence_parallel(
         self, params: Qwen3Params, caches: Caches, inputs: ModelInputs
     ) -> tuple[jax.Array, Caches]:
@@ -343,11 +348,7 @@ class Qwen3Model:
         tokens = inputs.input_ids.shape[0]
         q_width = config.num_attention_heads * config.head_dim
         layers = params.layers
-        backend: MatmulBackend = (
-            ("xla" if tokens <= 1024 else "pallas")
-            if self.prefill_matmul_backend == "auto" and get_tpu_version() >= 7
-            else self.prefill_matmul_backend
-        )
+        backend = self._resolve_prefill_matmul_backend(tokens)
 
         x = jax.shard_map(
             lambda ids, emb: emb[ids],
@@ -462,7 +463,7 @@ class Qwen3Model:
         q_width = config.num_attention_heads * config.head_dim
         layers = params.layers
         is_prefill = tokens >= _PREFILL_MATMUL_MIN_TOKENS
-        backend = self.prefill_matmul_backend if is_prefill else "auto"
+        backend = self._resolve_prefill_matmul_backend(tokens) if is_prefill else "auto"
         rep_2d = P(None, None)
 
         def _rep_norm_quant(
