@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{
         Html, IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
     },
 };
 use serde::Deserialize;
@@ -341,7 +341,7 @@ fn chat_stream(
         }
         yield Ok(Event::default().data("[DONE]"));
     };
-    Sse::new(output).keep_alive(KeepAlive::default())
+    Sse::new(output)
 }
 
 fn chat_chunk(
@@ -681,7 +681,7 @@ fn responses_stream(
             yield Ok(Event::default().data(event_json("error", sequence, json_error("the inference stream ended before completion", "server_error")).to_string()));
         }
     };
-    Sse::new(output).keep_alive(KeepAlive::default())
+    Sse::new(output)
 }
 
 fn event_json(event_type: &str, sequence_number: u64, fields: Value) -> Value {
