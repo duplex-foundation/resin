@@ -36,6 +36,7 @@ from resin.backend.tpu.buckets import ShapeBuckets
 from resin.backend.tpu.compilation import CompilationCounter
 from resin.backend.tpu.mesh import replicated, tp_size
 from resin.backend.tpu.metadata import ModelInputs, build_inputs, empty_inputs
+from resin.backend.tpu.profiling import step_log_from_env, trace_window_from_env
 from resin.backend.tpu.sampling import (
     empty_sampling_inputs,
     is_stochastic,
@@ -81,6 +82,7 @@ class _Step:
     tokens: jax.Array
     logits: jax.Array
     hidden: jax.Array
+    timing: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -215,7 +217,21 @@ class TpuRunner:
             out_shardings=self._replicated,
         )
         self._step_compilations = 0
+        self._step_log = step_log_from_env()
+        self._trace = trace_window_from_env()
+        self._step_index = 0
         self.warmup()
+        if self._step_log is not None:
+            plan = self.cache_capacity_plan
+            self._step_log.write(
+                {
+                    "kind": "config",
+                    "parent_capacity": capacity,
+                    "capacity_plan": None if plan is None else repr(plan),
+                    **self.benchmark_metadata,
+                }
+            )
+            self._step_log.flush()
 
     def _forward_step(
         self, params: Any, caches: Caches, inputs: ModelInputs
@@ -270,6 +286,9 @@ class TpuRunner:
     def _launch(self, plan: BatchPlan, feedback: jax.Array | None = None) -> _Step:
         # Nothing before dispatch may touch device state: these failures must
         # stay retryable.
+        if self._trace is not None:
+            self._trace.before_step(self._arena.caches)
+        started = time.perf_counter()
         cache_plan = self._cache_plan(plan)
         batch = cache_plan.batch
         bucket = self.buckets.select(plan.phase, batch.num_tokens, batch.num_sequences)
@@ -282,7 +301,9 @@ class TpuRunner:
                     "decode feedback does not match the continuation bucket"
                 )
             host = host._replace(input_ids=feedback)
+        planned = time.perf_counter()
         inputs, policy = self._put((host, policy))
+        transferred = time.perf_counter()
         before = self.compilations.count
         try:
             logits, hidden, self._arena.caches = self._forward(
@@ -294,7 +315,27 @@ class TpuRunner:
                 f"TPU step for {bucket} failed after dispatch"
             ) from error
         self._check_compilations(before, f"step for {bucket}")
-        return _Step(plan, tokens, logits, hidden)
+        timing = None
+        if self._step_log is not None:
+            dispatched = time.perf_counter()
+            timing = {
+                "step": self._step_index,
+                "phase": "decode" if plan.phase == BatchPhase.DECODE else "prefill",
+                "bucket_tokens": bucket.tokens,
+                "bucket_seqs": bucket.seqs,
+                "rows": batch.num_sequences,
+                "tokens": batch.num_tokens,
+                "kv_tokens": int(np.sum(batch.post_lengths)),
+                "feedback": feedback is not None,
+                "traced": self._trace is not None and self._trace.active,
+                "t_start": started,
+                "t_dispatched": dispatched,
+                "plan_ms": (planned - started) * 1e3,
+                "put_ms": (transferred - planned) * 1e3,
+                "dispatch_ms": (dispatched - transferred) * 1e3,
+            }
+        self._step_index += 1
+        return _Step(plan, tokens, logits, hidden, timing)
 
     def _check_compilations(self, before: int, label: str) -> None:
         compiled = self.compilations.count - before
@@ -309,7 +350,21 @@ class TpuRunner:
         # Asynchronous device failures surface when outputs are read, after
         # the step consumed its donated caches.
         try:
-            return self._harvest(step)
+            if step.timing is None:
+                return self._harvest(step)
+            waiting = time.perf_counter()
+            jax.block_until_ready(step.tokens)
+            ready = time.perf_counter()
+            output = self._harvest(step)
+            step.timing.update(
+                t_wait=waiting,
+                t_ready=ready,
+                wait_ms=(ready - waiting) * 1e3,
+                harvest_ms=(time.perf_counter() - ready) * 1e3,
+            )
+            assert self._step_log is not None
+            self._step_log.write(step.timing)
+            return output
         except PostAcceptTpuError:
             raise
         except Exception as error:
