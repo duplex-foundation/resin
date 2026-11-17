@@ -7,6 +7,7 @@ live here; launchers share checkpoint handling and runtime lifecycle code.
 from __future__ import annotations
 
 import os
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,8 +44,9 @@ class ModelSpec:
     checkpoint: Checkpoint
     gpu: str
     label: str
-    # "cuda" presets run on Modal or local NVIDIA GPUs; "mlx" presets run
-    # locally on Apple Silicon from an explicit checkpoint directory.
+    # "cuda" presets run on Modal or local NVIDIA GPUs. "mlx" presets run
+    # locally on Apple Silicon. "tpu" presets run on chip 0 of
+    # dev-tpu-tpu7x8b-0, from an explicit checkpoint directory.
     backend: str = "cuda"
     model_mount: str | None = None
     model_volume: str | None = None
@@ -381,8 +383,126 @@ MODEL_SPECS.update(
             draft_tokens=7,
             image_warmup=True,
         ),
+        # BF16 checkpoint, quantized to FP8 at load. The three InferenceX
+        # shapes differ by context limit and decode buckets; see TPU_WORKLOADS.
+        "qwen3-32b": ModelSpec(
+            name="qwen3-32b",
+            family="qwen3",
+            checkpoint=Checkpoint(
+                repo_id="Qwen/Qwen3-32B",
+                revision="9216db5781bf21249d130ec9da846c4624c16137",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                ),
+            ),
+            backend="tpu",
+            gpu="tpu7x",
+            label="qwen3-32b-fp8",
+            context_length=9216,
+            max_batch_size=320,
+            prefill_chunk_size=4096,
+            draft_tokens=0,
+            gpu_memory_utilization=0.98,
+            expert_backend="none",
+            text_only=True,
+            enable_anthropic=False,
+        ),
     }
 )
+
+
+# Our claimed slot. tpu-env.sh refuses every other host.
+TPU_HOST = "dev-tpu-tpu7x8b-0"
+
+
+@dataclass(frozen=True, slots=True)
+class TpuWorkload:
+    """One InferenceX server shape for the Qwen3-32B TPU preset.
+
+    ``prompt + output`` is the server context limit. ``decode_buckets`` are
+    that server's vLLM compilation sizes. bench.py measures a short decode
+    window inside the limit; it does not generate ``output`` tokens.
+    """
+
+    prompt: int
+    output: int
+    max_model_len: int
+    decode_buckets: tuple[int, ...]
+    max_num_seqs: int = 320
+    max_batch_tokens: int = 4096
+
+    def __post_init__(self) -> None:
+        if self.prompt + self.output != self.max_model_len:
+            raise ValueError("max_model_len must equal prompt + output")
+        if not self.decode_buckets or self.decode_buckets[-1] != self.max_num_seqs:
+            raise ValueError("the largest decode bucket must hold max_num_seqs")
+
+
+# 1k/1k uses the short server. 1k/8k and 8k/1k share the 9216-token server
+# and Google's compilation sizes. See the showcase plan.
+TPU_WORKLOADS = {
+    "1k/1k": TpuWorkload(1024, 1024, 2048, (320,)),
+    "1k/8k": TpuWorkload(1024, 8192, 9216, (96, 160, 192, 224, 288, 320)),
+    "8k/1k": TpuWorkload(8192, 1024, 9216, (96, 160, 192, 224, 288, 320)),
+}
+
+
+TPU_COMPILE_CACHE_DIR = os.path.expanduser("~/.cache/resin/jax-compile")
+COMPILE_CACHE_ENV = (
+    "JAX_COMPILATION_CACHE_DIR",
+    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+)
+
+
+def export_tpu_compile_cache_env() -> None:
+    """Point JAX's persistent compile cache at a directory, keeping any override.
+
+    The TPU runner leaves JAX configuration alone, and JAX reads these variables
+    when it is imported, so call this before the first JAX import.
+    """
+
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", TPU_COMPILE_CACHE_DIR)
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+
+
+def require_tpu_chip(*, queued: bool = False) -> None:
+    """Refuse to start JAX on this host unless the process is pinned to chip 0.
+
+    Importing JAX on the TPU host initializes every visible chip, so this
+    checks the environment before any JAX import. ``JAX_PLATFORMS=cpu`` is
+    the off-chip path and skips the check. The pin is the one ``tpu-env.sh``
+    exports, including the host bounds that keep JAX off the other host.
+    ``queued`` also requires ``RESIN_TPU_QUEUED=1``, which
+    ``scripts/tpu_serve.sh`` sets under the chip queue. The queue itself
+    clears its lock flag before the child starts, so the child cannot see it.
+    """
+
+    if os.environ.get("JAX_PLATFORMS") == "cpu":
+        return
+    host = socket.gethostname().split(".", 1)[0]
+    if host != TPU_HOST:
+        return
+    pinned = (
+        os.environ.get("TPU_VISIBLE_CHIPS") == "0"
+        and os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS") == "1,1,1"
+        and os.environ.get("TPU_HOST_BOUNDS") == "1,1,1"
+        and os.environ.get("TPU_WORKER_ID") == "0"
+    )
+    if not pinned:
+        raise RuntimeError(
+            "On dev-tpu-tpu7x8b-0, source tpu-env.sh before a TPU preset. "
+            "That pins the process to chip 0."
+        )
+    if queued and os.environ.get("RESIN_TPU_QUEUED") != "1":
+        raise RuntimeError(
+            "On dev-tpu-tpu7x8b-0, run the TPU preset under the chip queue "
+            "(scripts/tpu_serve.sh, or tpu-queue.sh with RESIN_TPU_QUEUED=1)."
+        )
 
 
 def get_model(model: str | ModelSpec) -> ModelSpec:
@@ -583,6 +703,95 @@ def prepare_runtime(model: str | ModelSpec) -> None:
                 Path(value).mkdir(parents=True, exist_ok=True)
 
 
+def _tpu_buckets(workload: TpuWorkload, max_batch_tokens: int):
+    from resin.backend.tpu.buckets import ShapeBuckets
+
+    base = ShapeBuckets.powers_of_two(
+        max_num_seqs=workload.max_num_seqs, max_batch_tokens=max_batch_tokens
+    )
+    return ShapeBuckets(
+        decode_seqs=workload.decode_buckets,
+        prefill_tokens=base.prefill_tokens,
+    )
+
+
+def _create_tpu_runner(
+    spec: ModelSpec,
+    checkpoint: str | Path | None,
+    *,
+    context_length: int,
+    max_batch_size: int,
+    prefill_chunk_size: int,
+    draft_tokens: int,
+    gpu_memory_utilization: float | None,
+    groups,
+    expert_backend: str | None,
+    assistant_checkpoint: str | Path | None,
+    workload: str | None,
+):
+    """Build a mesh and wrap the family plug-in in ``TpuRunner``.
+
+    The plug-in exports ``load_model(checkpoint, mesh) -> (model, params)``.
+    Qwen3 lives at ``resin_models_tpu.qwen3``.
+    """
+
+    require_tpu_chip(queued=True)
+    if workload not in TPU_WORKLOADS:
+        raise ValueError("a TPU preset requires workload " + ", ".join(TPU_WORKLOADS))
+    selected = TPU_WORKLOADS[workload]
+    if context_length != selected.max_model_len:
+        raise ValueError(
+            f"{workload} serves {selected.max_model_len} tokens, not {context_length}"
+        )
+    if max_batch_size > selected.max_num_seqs:
+        raise ValueError(f"{workload} serves at most {selected.max_num_seqs} sequences")
+    if draft_tokens:
+        raise ValueError(f"{spec.name} has no draft model; use draft_tokens=0")
+    if groups is not None:
+        raise ValueError(
+            f"{spec.name} runs in one process; tensor parallel is the on-chip mesh"
+        )
+    if assistant_checkpoint is not None:
+        raise ValueError(f"{spec.name} has no assistant checkpoint")
+    if expert_backend not in (None, "none"):
+        raise ValueError(f"{spec.name} has no expert backend")
+    if prefill_chunk_size < 1:
+        raise ValueError("prefill_chunk_size must be positive")
+    if checkpoint is None:
+        raise ValueError(f"{spec.name} runs locally; pass its checkpoint directory")
+    checkpoint = Path(checkpoint)
+    if spec.family != "qwen3":
+        raise ValueError(f"no TPU plug-in for {spec.family}")
+    try:
+        from resin_models_tpu.qwen3 import load_model
+    except ImportError as error:
+        raise ImportError(
+            "qwen3-32b needs resin_models_tpu.qwen3.load_model from the TPU plug-in"
+        ) from error
+    from resin.backend.tpu.mesh import make_mesh
+    from resin.backend.tpu.runner import TpuRunner
+
+    batch_tokens = max(prefill_chunk_size, selected.max_batch_tokens)
+    mesh = make_mesh()
+    model, params = load_model(checkpoint, mesh)
+    memory = (
+        spec.gpu_memory_utilization
+        if gpu_memory_utilization is None
+        else gpu_memory_utilization
+    )
+    return TpuRunner(
+        model,
+        params,
+        mesh=mesh,
+        max_seq_len=selected.max_model_len,
+        max_num_seqs=selected.max_num_seqs,
+        max_batch_tokens=batch_tokens,
+        prefill_chunk_size=prefill_chunk_size,
+        buckets=_tpu_buckets(selected, batch_tokens),
+        memory_utilization=memory,
+    )
+
+
 def create_runner(
     model: str | ModelSpec,
     checkpoint: str | Path | None = None,
@@ -601,9 +810,24 @@ def create_runner(
     profile_graph_phases: bool = False,
     fast_allreduce: bool = False,
     assistant_checkpoint: str | Path | None = None,
+    workload: str | None = None,
 ):
     """Construct one runner with model-specific cache geometry and draft support."""
     spec = get_model(model)
+    if spec.backend == "tpu":
+        return _create_tpu_runner(
+            spec,
+            checkpoint,
+            context_length=context_length,
+            max_batch_size=max_batch_size,
+            prefill_chunk_size=prefill_chunk_size,
+            draft_tokens=draft_tokens,
+            gpu_memory_utilization=gpu_memory_utilization,
+            groups=groups,
+            expert_backend=expert_backend,
+            assistant_checkpoint=assistant_checkpoint,
+            workload=workload,
+        )
     checkpoint = spec.path if checkpoint is None else Path(checkpoint)
     assistant = (
         spec.assistant_path
@@ -765,6 +989,98 @@ def create_runner(
     raise ValueError(f"unsupported runner family: {spec.family}")
 
 
+class _Qwen3ChatRecipe:
+    """Render Qwen3 with the checkpoint's own chat template.
+
+    The native Qwen recipes are Qwen3.5 and later. This checkpoint's template
+    is the one the tokenizer ships, including ``enable_thinking``. The parser
+    emits the decoded text suffix of the token ids seen so far.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        self._tokenizer = tokenizer
+        eos = tokenizer.eos_token_id
+        if type(eos) is not int:
+            raise ValueError("the Qwen3 tokenizer must publish one eos token id")
+        self.stop_token_ids = [eos]
+        self.tokenizer = None
+
+    def render(self, messages, *, tools=(), options=None):
+        from resin.recipe import RenderedPrompt, Role, Text
+
+        if tools:
+            raise ValueError("the Qwen3 TPU recipe does not render tools")
+        rows = []
+        for message in messages:
+            if message.role == Role.SYSTEM:
+                role = "system"
+            elif message.role == Role.USER:
+                role = "user"
+            elif message.role == Role.ASSISTANT:
+                role = "assistant"
+            else:
+                raise ValueError(
+                    f"the Qwen3 TPU recipe does not render {message.role!r}"
+                )
+            if not message.content or any(
+                not isinstance(block, Text) for block in message.content
+            ):
+                raise ValueError("the Qwen3 TPU recipe renders text only")
+            rows.append(
+                {
+                    "role": role,
+                    "content": "".join(block.text for block in message.content),
+                }
+            )
+        thinking = False
+        add_prompt = True
+        if options is not None:
+            if options.enable_thinking is not None:
+                thinking = bool(options.enable_thinking)
+            elif options.reasoning_effort not in (None, "none", 0):
+                thinking = True
+            if options.add_generation_prompt is not None:
+                add_prompt = bool(options.add_generation_prompt)
+        token_ids = self._tokenizer.apply_chat_template(
+            rows,
+            add_generation_prompt=add_prompt,
+            enable_thinking=thinking,
+            tokenize=True,
+        )
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        return RenderedPrompt([int(token) for token in token_ids])
+
+    def create_parser(self, prompt):
+        from resin.recipe import TextDelta
+
+        tokenizer = self._tokenizer
+
+        class Parser:
+            def __init__(self) -> None:
+                self._ids: list[int] = []
+                self._shown = ""
+
+            def feed(self, token_ids):
+                self._ids.extend(int(token) for token in token_ids)
+                text = tokenizer.decode(self._ids, skip_special_tokens=True)
+                # ponytail: suffix of a full decode. Upgrade to offset mapping
+                # if a token rewrites characters already shown.
+                if not text.startswith(self._shown):
+                    delta, self._shown = text, text
+                else:
+                    delta = text[len(self._shown) :]
+                    self._shown = text
+                return [TextDelta(delta)] if delta else []
+
+            def finish(self, reason):
+                del reason
+                return []
+
+        del prompt
+        return Parser()
+
+
 def create_recipe(
     model: str | ModelSpec, checkpoint: str | Path | None = None, *, runner=None
 ):
@@ -772,6 +1088,13 @@ def create_recipe(
 
     spec = get_model(model)
     path = spec.path if checkpoint is None else Path(checkpoint)
+    if spec.family == "qwen3":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            path, local_files_only=True, trust_remote_code=False
+        )
+        return _Qwen3ChatRecipe(tokenizer)
     if spec.family in {"deepseek_v41", "glm5_3_flash"}:
         from tokenizers import Tokenizer
 
