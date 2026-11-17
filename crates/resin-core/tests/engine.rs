@@ -2600,3 +2600,163 @@ fn overlap_admission_skips_wide_lookahead_while_requests_wait_in_queue() {
     assert_eq!(plan.cache_groups[0].block_indptr, [0, 4]);
     assert!(!engine.retain_continuation(&plan));
 }
+
+fn pressure_engine(
+    capacity: u32,
+    max_running: usize,
+    conservativeness: f64,
+    prefix_cache: bool,
+) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        max_running,
+        64,
+        SchedulerConfig {
+            schedule_conservativeness: conservativeness,
+            ..Default::default()
+        },
+        prefix_cache,
+    )
+    .unwrap()
+}
+
+fn complete_with_next_tokens(
+    engine: &mut EngineCore<&'static str>,
+    model: &mut Model,
+    plan: &ExecutionPlan<&'static str>,
+) {
+    let tokens = plan
+        .token_indptr
+        .windows(2)
+        .map(|range| plan.token_ids[range[1] as usize - 1] + 1)
+        .collect::<Vec<_>>();
+    let offsets = (0..=tokens.len() as u32).collect::<Vec<_>>();
+    engine
+        .complete_step_with(model, TokenRows::new(&tokens, &offsets), Ok)
+        .unwrap();
+}
+
+/// Two long decoders outgrow the pool. Returns the plan that handled the first
+/// retraction, with the ratio before and after it.
+fn first_running_retraction(
+    engine: &mut EngineCore<&'static str>,
+    model: &mut Model,
+    late_request: Option<(usize, Submission<&'static str>)>,
+) -> (f64, f64, ExecutionPlan<&'static str>) {
+    let mut late_request = late_request;
+    for step in 0..200 {
+        if late_request.as_ref().is_some_and(|(at, _)| *at == step) {
+            engine.submit(late_request.take().unwrap().1).unwrap();
+        }
+        let before = engine.new_token_ratio();
+        let retracted = engine.metrics_snapshot().unwrap().retracted_requests;
+        let plan = engine.prepare_step(model, None).unwrap().unwrap();
+        if engine.metrics_snapshot().unwrap().retracted_requests > retracted {
+            return (before, engine.new_token_ratio(), plan);
+        }
+        complete_with_next_tokens(engine, model, &plan);
+    }
+    panic!("the pool never forced a retraction");
+}
+
+#[test]
+fn running_retraction_keeps_waiting_rows_out_of_the_retry_and_raises_the_ratio() {
+    let mut engine = pressure_engine(6, 2, 0.0, false);
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let first = engine.submit(input(vec![1; 8], 10)).unwrap();
+    let second = engine.submit(input(vec![50; 8], 10)).unwrap();
+    let (before, after, plan) =
+        first_running_retraction(&mut engine, &mut model, Some((2, input(vec![90; 4], 2))));
+    // Freeing the victim leaves room for the small waiting request, but
+    // admitting it would trade one running request for another every step.
+    assert_eq!(plan.phase, resin_core::Phase::Decode);
+    assert_eq!(plan.sequence_ids, [second.id()]);
+    assert!(!first.done());
+    assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 1);
+    assert_eq!((before, after), (0.0, 0.5));
+}
+
+#[test]
+fn running_retraction_never_lowers_the_ratio_below_its_initial_value() {
+    let mut engine = pressure_engine(10, 2, 0.5, false);
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 8], 20)).unwrap();
+    engine.submit(input(vec![50; 8], 20)).unwrap();
+    let (before, after, _) = first_running_retraction(&mut engine, &mut model, None);
+    let initial = 0.7 * 0.5;
+    assert!(before < initial, "ratio should have decayed");
+    // The old rule recomputed the ratio from decode progress, which here
+    // lands near 1.0 and elsewhere falls below the initial value.
+    assert!((after - (initial + 0.5)).abs() < 1e-9, "{after}");
+}
+
+#[test]
+fn waiting_miss_retracts_an_idle_prefix_holder_and_leaves_running_work_alone() {
+    let mut engine = pressure_engine(16, 4, 0.0, true);
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let seed = engine.submit(input(vec![1; 8], 1)).unwrap();
+    while !seed.done() {
+        engine.step(&mut model).unwrap();
+    }
+    let decoder = engine.submit(input((100..148).collect(), 10)).unwrap();
+    engine.step(&mut model).unwrap();
+    engine.step(&mut model).unwrap();
+    // The holder pins the seeded prefix pages outside the admission estimate.
+    let mut holder_prompt = vec![1; 8];
+    holder_prompt.push(99);
+    let holder = engine.submit(input(holder_prompt, 2)).unwrap();
+    assert_eq!(holder.cached_tokens(), 8);
+    let mut fresh = input((200..216).collect(), 2);
+    fresh.priority = 1;
+    let fresh = engine.submit(fresh).unwrap();
+
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    // Plain retraction of the miss would have retried with the running
+    // decoder alone, leaving the higher-priority request waiting.
+    assert_eq!(plan.sequence_ids, [fresh.id()]);
+    assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 1);
+    complete_with_next_tokens(&mut engine, &mut model, &plan);
+    assert!(!decoder.done() && !holder.done());
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    assert_eq!(decoder.take_result().unwrap().len(), 10);
+}
+
+#[test]
+fn capacity_failure_is_reported_by_the_cohort_preflight_without_partial_growth() {
+    let mut engine = pressure_engine(6, 2, 0.0, false);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1; 8], 40)).unwrap();
+    let error = loop {
+        let free = engine.cache_free_parent_count();
+        match engine.prepare_step(&mut model, None) {
+            Ok(Some(plan)) => complete_with_next_tokens(&mut engine, &mut model, &plan),
+            Ok(None) => panic!("work remains"),
+            Err(error) => {
+                assert_eq!(engine.cache_free_parent_count(), free);
+                break error;
+            }
+        }
+    };
+    assert_eq!(error.kind, ErrorKind::Memory);
+    let message = error.to_string();
+    assert!(
+        message.contains("lacks capacity for the scheduled batch"),
+        "{message}"
+    );
+    assert!(!request.done());
+}
