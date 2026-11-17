@@ -247,6 +247,7 @@ class TestTpuRunner:
         continued = engine.overlap_stats[1]
         outputs = _generate(engine, PROMPTS, overlap=overlap, max_output_tokens=9)
         assert runner.compilations_after_warmup == 0
+        assert runner.metrics_snapshot().compilations == 0
         assert outputs == [model.dense_greedy(params, prompt, 9) for prompt in PROMPTS]
         assert (engine.overlap_stats[1] > continued) == overlap
 
