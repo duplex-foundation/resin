@@ -109,17 +109,17 @@ class _Loader:
     def params(self) -> Qwen3Params:
         config = self.config
         embed_shape = (config.vocab_size, config.hidden_size)
-        embed = self.tensor("model.embed_tokens.weight", embed_shape, P())
-        layers = []
-        for index in range(config.num_hidden_layers):
-            layers.append(self.layer(index))
-            jax.block_until_ready(layers[-1])
-        if config.tie_word_embeddings:
-            lm_head = jax.device_put(embed, NamedSharding(self.mesh, COLUMN))
-        else:
-            lm_head = self.tensor("lm_head.weight", embed_shape, COLUMN)
-        norm = self.tensor("model.norm.weight", (config.hidden_size,), P())
-        self.reader.close()
+        with self.reader:
+            embed = self.tensor("model.embed_tokens.weight", embed_shape, P())
+            layers = []
+            for index in range(config.num_hidden_layers):
+                layers.append(self.layer(index))
+                jax.block_until_ready(layers[-1])
+            if config.tie_word_embeddings:
+                lm_head = jax.device_put(embed, NamedSharding(self.mesh, COLUMN))
+            else:
+                lm_head = self.tensor("lm_head.weight", embed_shape, COLUMN)
+            norm = self.tensor("model.norm.weight", (config.hidden_size,), P())
         return Qwen3Params(embed, tuple(layers), norm, lm_head)
 
 

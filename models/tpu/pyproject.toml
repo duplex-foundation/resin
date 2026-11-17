@@ -6,7 +6,7 @@ build-backend = "uv_build"
 name = "resin-models-tpu"
 version = "0.1.0"
 description = "TPU model plug-ins for Resin, in JAX"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
   "resin==0.1.0",

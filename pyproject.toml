@@ -162,6 +162,8 @@ resin-models-torch = { workspace = true }
 
 [tool.uv.workspace]
 members = ["models/*"]
+# JAX needs Python 3.12; the TPU plug-in installs from its own environment.
+exclude = ["models/tpu"]
 
 [tool.ty.rules]
 # Development doesn't have all GPU-only packages available.
