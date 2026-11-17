@@ -407,7 +407,10 @@ class TestDefaultImpl:
         yield
         attention.default_impl.cache_clear()
 
-    def test_missing_kernel_module_falls_back_to_the_reference(self) -> None:
+    def test_missing_kernel_module_falls_back_to_the_reference(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, attention._KERNEL_MODULE, None)
         assert attention.default_impl() is ragged_paged_attention
 
     @pytest.mark.parametrize("missing", [None, "jax.experimental.pallas.absent"])
