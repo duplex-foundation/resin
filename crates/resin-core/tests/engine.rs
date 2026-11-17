@@ -2607,6 +2607,16 @@ fn pressure_engine(
     conservativeness: f64,
     prefix_cache: bool,
 ) -> EngineCore<&'static str> {
+    pressure_engine_with_context(capacity, max_running, 64, conservativeness, prefix_cache)
+}
+
+fn pressure_engine_with_context(
+    capacity: u32,
+    max_running: usize,
+    context: u32,
+    conservativeness: f64,
+    prefix_cache: bool,
+) -> EngineCore<&'static str> {
     EngineCore::new(
         RunnerConfig {
             cache_layout: Some(
@@ -2620,7 +2630,7 @@ fn pressure_engine(
             ..Default::default()
         },
         max_running,
-        64,
+        context,
         SchedulerConfig {
             schedule_conservativeness: conservativeness,
             ..Default::default()
@@ -2671,11 +2681,13 @@ fn first_running_retraction(
 
 #[test]
 fn running_retraction_keeps_waiting_rows_out_of_the_retry_and_raises_the_ratio() {
-    let mut engine = pressure_engine(6, 2, 0.0, false);
+    let mut engine = pressure_engine_with_context(40, 2, 512, 0.0, false);
     engine.enable_metrics().unwrap();
     let mut model = Model::default();
-    let first = engine.submit(input(vec![1; 8], 10)).unwrap();
-    let second = engine.submit(input(vec![50; 8], 10)).unwrap();
+    // The limit is large enough that observed progress stays well below the
+    // clamp, so only `running_only` keeps the waiting request out of the retry.
+    let first = engine.submit(input(vec![1; 8], 200)).unwrap();
+    let second = engine.submit(input(vec![50; 8], 200)).unwrap();
     let (before, after, plan) =
         first_running_retraction(&mut engine, &mut model, Some((2, input(vec![90; 4], 2))));
     // Freeing the victim leaves room for the small waiting request, but
@@ -2684,7 +2696,8 @@ fn running_retraction_keeps_waiting_rows_out_of_the_retry_and_raises_the_ratio()
     assert_eq!(plan.sequence_ids, [second.id()]);
     assert!(!first.done());
     assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 1);
-    assert_eq!((before, after), (0.0, 1.0));
+    assert_eq!(before, 0.0);
+    assert!(after > 0.0 && after < 0.8, "{after}");
 }
 
 #[test]

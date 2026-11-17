@@ -1591,9 +1591,9 @@ impl<P: Clone> EngineCore<P> {
                             if self.retract_one_matching(runner, false)? {
                                 continue;
                             }
-                            // Unreachable for single-group layouts while `AdmissionEstimate`
-                            // floors at owned pages: once idle holders are retracted the
-                            // estimate equals the real need. Kept for estimate/allocator divergence.
+                            // No test reaches this for single-group layouts: `AdmissionEstimate`
+                            // floors at owned pages, so once idle holders are retracted the
+                            // estimate covers the real need. Kept for estimate/allocator divergence.
                             self.update_new_token_ratio_after_retraction();
                             running_only = true;
                             continue;
