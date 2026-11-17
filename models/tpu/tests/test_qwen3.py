@@ -35,9 +35,7 @@ from resin_models_tpu.qwen3 import load_model  # noqa: E402
 
 MAX_SEQ_LEN = 64
 PAGE_TOKENS = 4
-BUCKETS = ShapeBuckets(
-    decode_seqs=(2, 4), prefill_tokens=(8, 16, 32), prefill_seqs=(1, 2, 4)
-)
+BUCKETS = ShapeBuckets(decode_seqs=(2, 4), prefill_tokens=(8, 16, 32))
 PROMPTS = [[3, 1, 4, 1, 5, 9, 2], [6, 5], [3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4, 7, 1]]
 
 
@@ -96,7 +94,6 @@ def _runner(directory: Path, tp: int = 1, *, prefill_chunk_size=None, **options)
         prefill_chunk_size=prefill_chunk_size,
         buckets=BUCKETS,
         cache_slab_capacity=64,
-        compile_cache_dir=None,
     )
     return runner, params
 
