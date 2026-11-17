@@ -1710,3 +1710,45 @@ async fn completions_follow_the_openai_route_flag() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(start_paused = true)]
+async fn slow_first_event_on_completion_stream_has_no_sse_comment_line() {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+    tokio::spawn(async move {
+        let job = receiver.recv().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+        job.events
+            .try_send(GenerationEvent::TextDelta {
+                delta: "hi".to_owned(),
+                logprobs: vec![],
+            })
+            .unwrap();
+        job.events
+            .try_send(GenerationEvent::Finished {
+                reason: FinishReason::Stop,
+                input_tokens: 1,
+                cached_tokens: 0,
+                output_tokens: 1,
+                elapsed_ms: 16_000.0,
+                generation_elapsed_ms: 1.0,
+                time_to_first_token_ms: 16_000.0,
+            })
+            .unwrap();
+    });
+    let app = router("test-model", jobs, None, RouteConfig::default(), None);
+    let response = app
+        .oneshot(completion_request(json!({
+            "prompt": "hi",
+            "stream": true,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.lines().all(|line| !line.starts_with(':')),
+        "emitted an SSE comment: {text:?}"
+    );
+    assert!(text.contains("hi"), "{text}");
+}

@@ -572,7 +572,7 @@ fn completion_stream(
         }
         yield Ok(Event::default().data("[DONE]"));
     };
-    Sse::new(output).keep_alive(KeepAlive::default())
+    Sse::new(output)
 }
 
 fn completion_chunk(
