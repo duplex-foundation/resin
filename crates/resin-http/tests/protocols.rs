@@ -1494,3 +1494,44 @@ async fn responses_keep_output_indices_when_text_precedes_multiple_tool_calls() 
         assert_eq!(item["type"], kind);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn slow_first_event_on_openai_streams_has_no_sse_comment_line() {
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+        tokio::spawn(async move {
+            let job = receiver.recv().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+            job.events
+                .try_send(GenerationEvent::Started { input_tokens: 1 })
+                .unwrap();
+            job.events
+                .try_send(GenerationEvent::TextDelta {
+                    delta: "hi".to_owned(),
+                    logprobs: vec![],
+                })
+                .unwrap();
+            job.events
+                .try_send(GenerationEvent::Finished {
+                    reason: FinishReason::Stop,
+                    input_tokens: 1,
+                    cached_tokens: 0,
+                    output_tokens: 1,
+                    elapsed_ms: 16_000.0,
+                    generation_elapsed_ms: 1.0,
+                    time_to_first_token_ms: 16_000.0,
+                })
+                .unwrap();
+        });
+        let app = router("test-model", jobs, None, RouteConfig::default(), None);
+        let response = app.oneshot(generation_request(path, true)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.lines().all(|line| !line.starts_with(':')),
+            "{path} emitted an SSE comment: {text:?}"
+        );
+        assert!(text.contains("hi"), "{path}: {text}");
+    }
+}
