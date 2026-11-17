@@ -51,6 +51,7 @@ _DEVICE_VMEM_BYTES = {
     8: 128 * 1024 * 1024,
 }
 _DECODE_VMEM_SCRATCH_FRACTION = 0.375
+_MIXED_VMEM_SCRATCH_FRACTION = 0.625
 _TUNED_VMEM_CAP_FRACTION = 0.75
 
 
@@ -209,52 +210,140 @@ def prepare_outputs(
     )
 
 
+def unpack_prepared_inputs(
+    q_packed: jax.Array,
+    kv_merged: jax.Array,
+    *,
+    actual_num_q_heads: int | None = None,
+    actual_num_kv_heads: int | None = None,
+    actual_head_dim: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Unpack ``(q_packed, kv_merged)`` back to 3D ``(queries, keys, values)``."""
+    kv_heads = q_packed.shape[0] if actual_num_kv_heads is None else actual_num_kv_heads
+    tokens = q_packed.shape[1]
+    padded_group = q_packed.shape[2] * q_packed.shape[3]
+    q_heads = (
+        kv_heads * padded_group if actual_num_q_heads is None else actual_num_q_heads
+    )
+    group_size = q_heads // kv_heads
+    head_dim = q_packed.shape[4] if actual_head_dim is None else actual_head_dim
+
+    q = (
+        q_packed[:kv_heads]
+        .swapaxes(0, 1)
+        .reshape(tokens, kv_heads, padded_group, q_packed.shape[4])[
+            :, :, :group_size, :head_dim
+        ]
+        .reshape(tokens, q_heads, head_dim)
+    )
+    kv_flat = kv_merged.reshape(
+        tokens, kv_merged.shape[1] * kv_merged.shape[2], kv_merged.shape[3]
+    )[:, : 2 * kv_heads, :head_dim]
+    return q, kv_flat[:, 0::2, :], kv_flat[:, 1::2, :]
+
+
 def static_validate_inputs(
     queries: jax.Array,
     keys: jax.Array,
-    values: jax.Array,
+    values: jax.Array | None,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     *,
+    prepared: bool = False,
+    actual_num_q_heads: int | None = None,
+    actual_head_dim: int | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     d_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> None:
-    if not (queries.ndim == keys.ndim == values.ndim == 3):
-        raise ValueError(
-            f"Expected 3D Q/K/V, got {queries.shape=}, {keys.shape=}, {values.shape=}"
+    if prepared:
+        if values is not None:
+            raise ValueError("Expected values=None when prepared=True.")
+        if queries.ndim != 5 or keys.ndim != 4:
+            raise ValueError(
+                f"Expected 5D q_packed and 4D kv_merged when prepared=True, got {queries.shape=}, {keys.shape=}"
+            )
+        if queries.shape[1] != keys.shape[0]:
+            raise ValueError(
+                f"Mismatched token count in prepared inputs: {queries.shape=} vs {keys.shape=}"
+            )
+        actual_num_kv_heads = queries.shape[0]
+        q_packing = get_dtype_packing(queries.dtype)
+        if queries.shape[3] != q_packing:
+            raise ValueError(
+                f"Expected q_packed axis 3 == {q_packing}, got {queries.shape[3]}"
+            )
+        padded_group = queries.shape[2] * q_packing
+        eff_q_heads = (
+            actual_num_kv_heads * padded_group
+            if actual_num_q_heads is None
+            else actual_num_q_heads
         )
-    if keys.shape != values.shape:
-        raise ValueError(f"Expected {keys.shape=} == {values.shape=}")
-    if queries.shape[0] != keys.shape[0] or queries.shape[2] != keys.shape[2]:
-        raise ValueError(f"Mismatched Q/K shapes: {queries.shape=} vs {keys.shape=}")
+        eff_head_dim = queries.shape[4] if actual_head_dim is None else actual_head_dim
+        if eff_q_heads % actual_num_kv_heads != 0:
+            raise ValueError(
+                f"{eff_q_heads=} must be divisible by {actual_num_kv_heads=}."
+            )
+        if align_to(eff_q_heads // actual_num_kv_heads, q_packing) != padded_group:
+            raise ValueError(f"Incompatible {eff_q_heads=} and {queries.shape=}.")
+        expected_kv_shape = get_kv_cache_shape(
+            kv_cache.shape[0],
+            kv_cache.shape[1],
+            actual_num_kv_heads,
+            eff_head_dim,
+            kv_cache.dtype,
+        )
+        if kv_cache.shape != expected_kv_shape:
+            raise ValueError(f"Expected {kv_cache.shape=} == {expected_kv_shape=}")
+        if (
+            keys.shape[1:] != kv_cache.shape[2:]
+            or queries.shape[4] != kv_cache.shape[4]
+        ):
+            raise ValueError(
+                f"Prepared shapes {queries.shape=}, {keys.shape=} do not match {kv_cache.shape=}"
+            )
+        if keys.dtype != kv_cache.dtype:
+            raise ValueError(
+                f"Expected matching KV dtypes: {kv_cache.dtype=}, {keys.dtype=}"
+            )
+    else:
+        if values is None or not (queries.ndim == keys.ndim == values.ndim == 3):
+            raise ValueError(
+                f"Expected 3D Q/K/V, got {queries.shape=}, {keys.shape=}, {getattr(values, 'shape', None)=}"
+            )
+        if keys.shape != values.shape:
+            raise ValueError(f"Expected {keys.shape=} == {values.shape=}")
+        if queries.shape[0] != keys.shape[0] or queries.shape[2] != keys.shape[2]:
+            raise ValueError(
+                f"Mismatched Q/K shapes: {queries.shape=} vs {keys.shape=}"
+            )
 
-    actual_num_q_heads = queries.shape[1]
-    actual_head_dim = queries.shape[2]
-    actual_num_kv_heads = keys.shape[1]
-    if actual_num_q_heads % actual_num_kv_heads != 0:
-        raise ValueError(
-            f"{actual_num_q_heads=} must be divisible by {actual_num_kv_heads=}."
-        )
+        eff_q_heads = queries.shape[1]
+        eff_head_dim = queries.shape[2]
+        actual_num_kv_heads = keys.shape[1]
+        if eff_q_heads % actual_num_kv_heads != 0:
+            raise ValueError(
+                f"actual_num_q_heads={eff_q_heads} must be divisible by {actual_num_kv_heads=}."
+            )
 
-    expected_kv_shape = get_kv_cache_shape(
-        kv_cache.shape[0],
-        kv_cache.shape[1],
-        actual_num_kv_heads,
-        actual_head_dim,
-        kv_cache.dtype,
-    )
-    if kv_cache.shape != expected_kv_shape:
-        raise ValueError(f"Expected {kv_cache.shape=} == {expected_kv_shape=}")
-    if not (kv_cache.dtype == keys.dtype == values.dtype):
-        raise ValueError(
-            f"Expected matching KV dtypes: {kv_cache.dtype=}, {keys.dtype=}, {values.dtype=}"
+        expected_kv_shape = get_kv_cache_shape(
+            kv_cache.shape[0],
+            kv_cache.shape[1],
+            actual_num_kv_heads,
+            eff_head_dim,
+            kv_cache.dtype,
         )
+        if kv_cache.shape != expected_kv_shape:
+            raise ValueError(f"Expected {kv_cache.shape=} == {expected_kv_shape=}")
+        if not (kv_cache.dtype == keys.dtype == values.dtype):
+            raise ValueError(
+                f"Expected matching KV dtypes: {kv_cache.dtype=}, {keys.dtype=}, {values.dtype=}"
+            )
     if not jnp.issubdtype(kv_cache.dtype, jnp.floating):
         raise ValueError(f"Expected floating KV cache dtype, got {kv_cache.dtype=}")
 
@@ -380,6 +469,7 @@ def get_default_block_sizes(
 
 
 _DecodeTableKey = tuple[int, str, int, int, int, int]
+_MixedTableKey = tuple[int, str, int, int, int, int, int]
 
 
 def _largest_pow2_multiple(limit: int, unit: int) -> int:
@@ -479,6 +569,139 @@ def _build_tpu7x_rpa_decode_tuned_table() -> dict[_DecodeTableKey, RpaBlockSizes
 _TPU7X_RPA_DECODE_TUNED_BLOCKS = _build_tpu7x_rpa_decode_tuned_table()
 
 
+def _clamp_mixed_vmem(
+    blocks: RpaBlockSizes,
+    *,
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    min_kv_unit: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+    max_scratch: int,
+) -> RpaBlockSizes:
+    bq_sz = blocks.bq_sz
+    bkv_sz = blocks.bkv_sz
+    bq_csz = min(blocks.bq_csz, bq_sz)
+    bkv_csz = min(blocks.bkv_csz, bkv_sz)
+    while bq_sz >= 2 * bq_csz and (
+        get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+            bq_sz,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > max_scratch
+    ):
+        bq_sz //= 2
+        bq_csz = min(bq_csz, bq_sz)
+    while bkv_sz >= 2 * min_kv_unit and (
+        get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+            bq_sz,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > max_scratch
+    ):
+        bkv_sz //= 2
+        bkv_csz = min(bkv_csz, bkv_sz)
+    while bq_sz >= 2 and (
+        get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+            bq_sz,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > max_scratch
+    ):
+        bq_sz //= 2
+        bq_csz = min(bq_csz, bq_sz)
+    while bq_sz % bq_csz != 0:
+        bq_csz -= 1
+    while bkv_sz % bkv_csz != 0:
+        bkv_csz -= min_kv_unit
+    return RpaBlockSizes(bq_sz, bkv_sz, bq_csz, max(min_kv_unit, bkv_csz))
+
+
+def _build_tpu7x_rpa_mixed_tuned_table() -> dict[_MixedTableKey, RpaBlockSizes]:
+    shapes = (
+        (32, 4, 128),
+        (64, 8, 128),
+        (16, 2, 128),
+        (16, 2, 256),
+        (16, 4, 256),
+        (32, 4, 256),
+        (32, 8, 256),
+        (8, 2, 256),
+    )
+    table: dict[_MixedTableKey, RpaBlockSizes] = {}
+    for page_size in (128, 256):
+        for kv_name in ("float8_e4m3fn", "float8_e5m2", "bfloat16"):
+            q_dtype = jnp.bfloat16
+            kv_dtype = jnp.dtype(kv_name)
+            for q_heads, kv_heads, aligned_hd in shapes:
+                group_pow2 = next_power_of_2(q_heads // kv_heads)
+                target_bq = max(1, 2048 // group_pow2)
+                target_bq_c = max(1, 1024 // group_pow2)
+                for q_bucket in (128, 256, 512, 1024, 2048, 4096, 8192):
+                    bq = max(1, min(target_bq, max(1, q_bucket // 2)))
+                    bq_c = max(1, min(target_bq_c, bq))
+                    while bq % bq_c != 0:
+                        bq_c -= 1
+                    for kv_bucket in (256, 512, 1024, 2048, 4096, 8192):
+                        if kv_bucket < page_size:
+                            continue
+                        if kv_bucket <= 2048:
+                            # Short/medium horizons (~1k prompts): bkv_sz=512 skips
+                            # upper-triangular causal blocks and shrinks softmax tiles.
+                            bkv = min(512, kv_bucket)
+                            bkv_c = min(512 if page_size == 128 else 256, bkv)
+                        else:
+                            bkv = min(1024, kv_bucket)
+                            bkv_c = min(512, bkv)
+                        bkv = max(page_size, (bkv // page_size) * page_size)
+                        bkv_c = max(page_size, (bkv_c // page_size) * page_size)
+                        while bkv % bkv_c != 0:
+                            bkv_c -= page_size
+                        cand = _clamp_mixed_vmem(
+                            RpaBlockSizes(bq, bkv, bq_c, bkv_c),
+                            actual_num_kv_heads=kv_heads,
+                            actual_num_q_heads_per_kv_head=q_heads // kv_heads,
+                            actual_head_dim=aligned_hd,
+                            min_kv_unit=page_size,
+                            q_dtype=q_dtype,
+                            kv_dtype=kv_dtype,
+                            max_scratch=int(
+                                _MIXED_VMEM_SCRATCH_FRACTION * _TPU7X_VMEM_BYTES
+                            ),
+                        )
+                        table[
+                            (
+                                page_size,
+                                kv_name,
+                                q_heads,
+                                kv_heads,
+                                aligned_hd,
+                                q_bucket,
+                                kv_bucket,
+                            )
+                        ] = cand
+    return table
+
+
+_TPU7X_RPA_MIXED_TUNED_BLOCKS = _build_tpu7x_rpa_mixed_tuned_table()
+
+
 def get_rpa_block_sizes(
     q_dtype: Any,
     kv_dtype: Any,
@@ -495,7 +718,7 @@ def get_rpa_block_sizes(
     sliding_window: int | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> RpaBlockSizes:
-    """Return tuned TPU7x decode block sizes, falling back to ``get_default_block_sizes``."""
+    """Return tuned TPU7x decode/mixed block sizes, falling back to ``get_default_block_sizes``."""
     version = get_tpu_version() if tpu_version is None else tpu_version
     if case == RpaCase.DECODE and version == 7:
         table_kv = pages_per_seq * page_size
@@ -528,6 +751,47 @@ def get_rpa_block_sizes(
                 q_dtype=q_dtype,
                 kv_dtype=kv_dtype,
                 max_scratch=int(cap_frac * eff_limit),
+            )
+    elif case == RpaCase.MIXED and version == 7:
+        table_kv = pages_per_seq * page_size
+        horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+        kv_bucket = _largest_pow2_multiple(min(horizon_kv, 8192), page_size)
+        q_bucket = next_power_of_2(min(max(max_num_tokens, 128), 8192))
+        mixed_key = (
+            page_size,
+            jnp.dtype(kv_dtype).name,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            align_to(head_dim, 128),
+            q_bucket,
+            kv_bucket,
+        )
+        if (tuned := _TPU7X_RPA_MIXED_TUNED_BLOCKS.get(mixed_key)) is not None:
+            max_q_pow2 = max(1, next_power_of_2(max_num_tokens))
+            clamped_bq = max(1, min(tuned.bq_sz, max(1, max_q_pow2 // 2)))
+            clamped_bq_c = max(1, min(tuned.bq_csz, clamped_bq))
+            while clamped_bq % clamped_bq_c != 0:
+                clamped_bq_c -= 1
+            clamped_bkv = min(tuned.bkv_sz, _largest_pow2_multiple(table_kv, page_size))
+            clamped_bkv_c = min(tuned.bkv_csz, clamped_bkv)
+            while clamped_bkv % clamped_bkv_c != 0:
+                clamped_bkv_c -= page_size
+            eff_limit = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+            return _clamp_mixed_vmem(
+                RpaBlockSizes(
+                    clamped_bq,
+                    clamped_bkv,
+                    clamped_bq_c,
+                    max(page_size, clamped_bkv_c),
+                ),
+                actual_num_kv_heads=actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head=actual_num_q_heads
+                // actual_num_kv_heads,
+                actual_head_dim=head_dim,
+                min_kv_unit=page_size,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                max_scratch=int(_MIXED_VMEM_SCRATCH_FRACTION * eff_limit),
             )
 
     return RpaBlockSizes(
@@ -598,6 +862,9 @@ _DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
         "k_scale",
         "v_scale",
         "q_scale",
+        "prepared",
+        "actual_num_q_heads",
+        "actual_head_dim",
         "use_causal_mask",
         "update_kv_cache",
         "mask_value",
@@ -612,7 +879,7 @@ _DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
 def ragged_paged_attention(
     queries: jax.Array,
     keys: jax.Array,
-    values: jax.Array,
+    values: jax.Array | None,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
     page_indices: jax.Array,
@@ -625,6 +892,9 @@ def ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     q_scale: float | None = None,
+    prepared: bool = False,
+    actual_num_q_heads: int | None = None,
+    actual_head_dim: int | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
     mask_value: float | None = None,
@@ -641,10 +911,13 @@ def ragged_paged_attention(
     and a jit-traceable pure-JAX fallback on CPU otherwise. Online softmax and
     cross-block accumulation run in ``float32``; outputs match ``queries.dtype``.
     """
-    if keys.dtype != kv_cache.dtype:
-        keys = quantize_kv(keys, kv_cache.dtype, k_scale)
-    if values.dtype != kv_cache.dtype:
-        values = quantize_kv(values, kv_cache.dtype, v_scale)
+    if not prepared:
+        if values is None:
+            raise ValueError("values is required when prepared=False.")
+        if keys.dtype != kv_cache.dtype:
+            keys = quantize_kv(keys, kv_cache.dtype, k_scale)
+        if values.dtype != kv_cache.dtype:
+            values = quantize_kv(values, kv_cache.dtype, v_scale)
 
     if mask_value is None:
         mask_value = _DEFAULT_MASK_VALUE
@@ -664,6 +937,9 @@ def ragged_paged_attention(
         page_indices,
         cu_q_lens,
         distribution,
+        prepared=prepared,
+        actual_num_q_heads=actual_num_q_heads,
+        actual_head_dim=actual_head_dim,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         d_block_sizes=d_block_sizes,
@@ -676,10 +952,21 @@ def ragged_paged_attention(
             raise NotImplementedError(
                 "Non-causal or KV-share RPA on CPU requires interpret=True."
             )
+        if prepared:
+            cpu_q, cpu_k, cpu_v = unpack_prepared_inputs(
+                queries,
+                keys,
+                actual_num_q_heads=actual_num_q_heads,
+                actual_num_kv_heads=queries.shape[0],
+                actual_head_dim=actual_head_dim,
+            )
+        else:
+            assert values is not None
+            cpu_q, cpu_k, cpu_v = queries, keys, values
         return _cpu_ragged_paged_attention(
-            queries,
-            keys,
-            values,
+            cpu_q,
+            cpu_k,
+            cpu_v,
             kv_cache,
             kv_lens,
             page_indices,
@@ -693,12 +980,24 @@ def ragged_paged_attention(
             v_scale=v_scale,
         )
 
-    actual_num_q_heads = queries.shape[1]
-    actual_head_dim = queries.shape[2]
-    actual_num_kv_heads = keys.shape[1]
-    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    if prepared:
+        actual_num_kv_heads = queries.shape[0]
+        eff_q_heads = (
+            actual_num_kv_heads * queries.shape[2] * queries.shape[3]
+            if actual_num_q_heads is None
+            else actual_num_q_heads
+        )
+        eff_head_dim = queries.shape[4] if actual_head_dim is None else actual_head_dim
+        actual_num_q_heads_per_kv_head = eff_q_heads // actual_num_kv_heads
+        q, kv = queries, keys
+    else:
+        assert values is not None
+        eff_q_heads = queries.shape[1]
+        eff_head_dim = queries.shape[2]
+        actual_num_kv_heads = keys.shape[1]
+        actual_num_q_heads_per_kv_head = eff_q_heads // actual_num_kv_heads
+        q, kv = prepare_inputs(queries, keys, values)
 
-    q, kv = prepare_inputs(queries, keys, values)
     (
         _,
         max_num_tokens,
@@ -844,9 +1143,9 @@ def ragged_paged_attention(
         return get_rpa_block_sizes(
             q.dtype,
             kv_cache.dtype,
-            actual_num_q_heads,
+            eff_q_heads,
             actual_num_kv_heads,
-            actual_head_dim,
+            eff_head_dim,
             page_size,
             max_num_tokens,
             max_num_seqs,
@@ -857,22 +1156,34 @@ def ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
         ).as_dict()
 
-    q, kv_cache = run_rpa_case(
-        q,
-        kv_cache,
-        **_blocks_for(d_block_sizes, RpaCase.DECODE),
-        static_q_len=1,
-        case=RpaCase.DECODE,
+    d_blocks = _blocks_for(d_block_sizes, RpaCase.DECODE)
+    q, kv_cache = jax.lax.cond(
+        distribution[0] > 0,
+        lambda args: run_rpa_case(
+            args[0],
+            args[1],
+            **d_blocks,
+            static_q_len=1,
+            case=RpaCase.DECODE,
+        ),
+        lambda args: args,
+        (q, kv_cache),
     )
-    q, kv_cache = run_rpa_case(
-        q,
-        kv_cache,
-        **_blocks_for(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
+    m_blocks = _blocks_for(m_block_sizes, RpaCase.MIXED)
+    q, kv_cache = jax.lax.cond(
+        distribution[2] > distribution[1],
+        lambda args: run_rpa_case(
+            args[0],
+            args[1],
+            **m_blocks,
+            static_q_len=None,
+            case=RpaCase.MIXED,
+        ),
+        lambda args: args,
+        (q, kv_cache),
     )
     return (
-        prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
+        prepare_outputs(q, actual_num_q_heads_per_kv_head, eff_head_dim),
         kv_cache,
     )
 
@@ -884,7 +1195,10 @@ __all__ = [
     "get_kv_cache_shape",
     "get_rpa_block_sizes",
     "get_vmem_estimate_bytes",
+    "merge_kv",
+    "prepare_inputs",
     "quantize_kv",
     "ragged_paged_attention",
     "static_validate_inputs",
+    "unpack_prepared_inputs",
 ]

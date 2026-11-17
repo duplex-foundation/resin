@@ -4,14 +4,16 @@ Tensors stream one at a time from the memory-mapped safetensors files to their
 final sharding, so host memory stays near one weight. With ``quantization="fp8"``
 each linear weight is quantized on device after it is placed, per output
 channel, so a row-parallel weight's scale uses the absmax over the full input
-dimension.
+dimension. Column-parallel ``(q, k, v)`` and ``(gate, up)`` projections are
+concatenated per ``tp`` shard after sharding so each die holds contiguous
+``[q_local; k_local; v_local]`` and ``[gate_local; up_local]`` slices.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +24,8 @@ from jax.sharding import PartitionSpec as P
 from resin.backend.loading import read_config
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.tpu.attention import AttentionImpl
-from resin.backend.tpu.kernels import Fp8Weight, quantize_fp8_weight
+from resin.backend.tpu.kernels import Fp8Weight, build_rope_cache, quantize_fp8_weight
+from resin.backend.tpu.mesh import TP_AXIS
 from resin.models.qwen3.config import Qwen3Config
 from resin_models_tpu.qwen3.model import (
     COLUMN,
@@ -58,14 +61,65 @@ class _Loader:
         self.mesh = mesh
         self.dtype = jnp.dtype(config.dtype)
         self.quantizers: dict[P, Callable[[jax.Array], Fp8Weight]] = {}
+        self.fp8_packers: dict[int, Callable[..., Fp8Weight]] = {}
+        self.dense_packers: dict[int, Callable[..., jax.Array]] = {}
+        col_sharding = NamedSharding(mesh, COLUMN)
+        scale_sharding = NamedSharding(mesh, P(TP_AXIS))
+
         if quantization == "fp8":
             for spec in (COLUMN, ROW):
                 self.quantizers[spec] = jax.jit(
                     quantize_fp8_weight,
-                    out_shardings=Fp8Weight(
+                    out_shardings=cast(Any, Fp8Weight)(
                         NamedSharding(mesh, spec), NamedSharding(mesh, P(spec[0]))
                     ),
                 )
+            for arity in (2, 3):
+
+                def _make_fp8_packer(n: int) -> Callable[..., Fp8Weight]:
+                    q_specs = (COLUMN,) * n
+                    s_specs = (P(TP_AXIS),) * n
+
+                    def _pack(*parts: Fp8Weight) -> Fp8Weight:
+                        qvalue = jax.shard_map(
+                            lambda *qs: jnp.concatenate(qs, axis=0),
+                            mesh=mesh,
+                            in_specs=q_specs,
+                            out_specs=COLUMN,
+                        )(*(p.qvalue for p in parts))
+                        scale = jax.shard_map(
+                            lambda *ss: jnp.concatenate(ss, axis=0),
+                            mesh=mesh,
+                            in_specs=s_specs,
+                            out_specs=P(TP_AXIS),
+                        )(*(p.scale for p in parts))
+                        return Fp8Weight(qvalue=qvalue, scale=scale)
+
+                    return jax.jit(
+                        _pack,
+                        out_shardings=cast(Any, Fp8Weight)(
+                            col_sharding, scale_sharding
+                        ),
+                    )
+
+                self.fp8_packers[arity] = _make_fp8_packer(arity)
+        else:
+            for arity in (2, 3):
+
+                def _make_dense_packer(n: int) -> Callable[..., jax.Array]:
+                    in_specs = (COLUMN,) * n
+
+                    def _pack(*parts: jax.Array) -> jax.Array:
+                        return jax.shard_map(
+                            lambda *xs: jnp.concatenate(xs, axis=0),
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=COLUMN,
+                        )(*parts)
+
+                    return jax.jit(_pack, out_shardings=col_sharding)
+
+                self.dense_packers[arity] = _make_dense_packer(arity)
 
     def tensor(self, name: str, shape: tuple[int, ...], spec: P) -> jax.Array:
         if name not in self.files:
@@ -84,6 +138,12 @@ class _Loader:
         quantize = self.quantizers.get(spec)
         return weight if quantize is None else quantize(weight)
 
+    def _pack_column(self, parts: Sequence[Linear]) -> Linear:
+        arity = len(parts)
+        if isinstance(parts[0], Fp8Weight):
+            return self.fp8_packers[arity](*parts)
+        return self.dense_packers[arity](*parts)
+
     def layer(self, index: int) -> LayerParams:
         config = self.config
         hidden, head_dim = config.hidden_size, config.head_dim
@@ -92,23 +152,26 @@ class _Loader:
         ffn = config.intermediate_size
         prefix = f"model.layers.{index}."
         norm = (hidden,), P()
+        q = self.linear(prefix + "self_attn.q_proj.weight", (query, hidden), COLUMN)
+        k = self.linear(prefix + "self_attn.k_proj.weight", (kv, hidden), COLUMN)
+        v = self.linear(prefix + "self_attn.v_proj.weight", (kv, hidden), COLUMN)
+        gate = self.linear(prefix + "mlp.gate_proj.weight", (ffn, hidden), COLUMN)
+        up = self.linear(prefix + "mlp.up_proj.weight", (ffn, hidden), COLUMN)
         return LayerParams(
             input_norm=self.tensor(prefix + "input_layernorm.weight", *norm),
             q_norm=self.tensor(prefix + "self_attn.q_norm.weight", (head_dim,), P()),
             k_norm=self.tensor(prefix + "self_attn.k_norm.weight", (head_dim,), P()),
             post_norm=self.tensor(prefix + "post_attention_layernorm.weight", *norm),
-            q=self.linear(prefix + "self_attn.q_proj.weight", (query, hidden), COLUMN),
-            k=self.linear(prefix + "self_attn.k_proj.weight", (kv, hidden), COLUMN),
-            v=self.linear(prefix + "self_attn.v_proj.weight", (kv, hidden), COLUMN),
+            qkv=self._pack_column((q, k, v)),
             o=self.linear(prefix + "self_attn.o_proj.weight", (hidden, query), ROW),
-            gate=self.linear(prefix + "mlp.gate_proj.weight", (ffn, hidden), COLUMN),
-            up=self.linear(prefix + "mlp.up_proj.weight", (ffn, hidden), COLUMN),
+            gate_up=self._pack_column((gate, up)),
             down=self.linear(prefix + "mlp.down_proj.weight", (hidden, ffn), ROW),
         )
 
     def params(self) -> Qwen3Params:
         config = self.config
         embed_shape = (config.vocab_size, config.hidden_size)
+        rep = NamedSharding(self.mesh, P())
         with self.reader:
             embed = self.tensor("model.embed_tokens.weight", embed_shape, P())
             layers = []
@@ -120,7 +183,11 @@ class _Loader:
             else:
                 lm_head = self.tensor("lm_head.weight", embed_shape, COLUMN)
             norm = self.tensor("model.norm.weight", (config.hidden_size,), P())
-        return Qwen3Params(embed, tuple(layers), norm, lm_head)
+        cos_full, sin_signed = build_rope_cache(
+            config.max_position_embeddings, config.head_dim, config.rope_theta
+        )
+        rope_cache = (jax.device_put(cos_full, rep), jax.device_put(sin_signed, rep))
+        return Qwen3Params(embed, tuple(layers), norm, lm_head, rope_cache)
 
 
 def load_model(

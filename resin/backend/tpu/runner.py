@@ -198,11 +198,17 @@ class TpuRunner:
         # layout. Logits and hidden keep the model's sharding: replicating a
         # vocab-sharded head's logits would all-gather [seqs, vocab] per step.
         cache_shardings = jax.tree.map(lambda array: array.sharding, self._arena.caches)
-        self._forward = jax.jit(
-            self._forward_step,
-            donate_argnums=(1,),
-            out_shardings=(None, None, cache_shardings),
-        )
+        forward_kwargs: dict[str, Any] = {
+            "donate_argnums": (1,),
+            "out_shardings": (None, None, cache_shardings),
+        }
+        if jax.default_backend() == "tpu":
+            forward_kwargs["compiler_options"] = {
+                "xla_tpu_all_gather_collective_matmul_mode": "post_spmd_conservative",
+                "xla_tpu_reduce_scatter_collective_matmul_mode": "post_spmd_conservative",
+                "xla_tpu_use_minor_sharding_for_major_trivial_input": "true",
+            }
+        self._forward = jax.jit(self._forward_step, **forward_kwargs)
         self._samplers = {
             stochastic: jax.jit(
                 functools.partial(sample, stochastic=stochastic),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -13,13 +14,15 @@ from jax.sharding import PartitionSpec as P
 
 from resin.backend.tpu import reference
 from resin.backend.tpu.arena import KV_PARTITION
-from resin.backend.tpu.mesh import TP_AXIS
+from resin.backend.tpu.mesh import TP_AXIS, tp_size
 from resin.backend.tpu.metadata import AttentionMetadata
 
 logger = logging.getLogger(__name__)
 
 AttentionImpl = Callable[..., tuple[jax.Array, jax.Array]]
 HEADS = P(None, TP_AXIS, None)
+Q_PACKED_PARTITION = P(TP_AXIS, None, None, None, None)
+KV_MERGED_PARTITION = P(None, TP_AXIS, None, None)
 
 
 def quantize_kv(x: jax.Array, dtype, scale: float | None) -> jax.Array:
@@ -62,7 +65,7 @@ def default_impl() -> AttentionImpl:
 def paged_attention(
     queries: jax.Array,
     keys: jax.Array,
-    values: jax.Array,
+    values: jax.Array | None,
     kv_cache: jax.Array,
     metadata: AttentionMetadata,
     *,
@@ -73,22 +76,150 @@ def paged_attention(
     soft_cap: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    prepared: bool = False,
+    actual_num_q_heads: int | None = None,
+    actual_head_dim: int | None = None,
     impl: AttentionImpl | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Attend for one layer and return ``(output, updated kv_cache)``.
 
     ``queries`` is ``[tokens, q_heads, head_dim]`` and ``keys``/``values`` are
-    ``[tokens, kv_heads, head_dim]``, all sharded on heads over ``tp``. The
-    kernel runs once per die on local shapes. Pass the ``group`` whose cache
-    ``kv_cache`` is and that group's ``KvCacheSpec.sliding_window``, so the
-    page table and the Engine's retention match this layer. K/V scales apply
-    only to 8-bit caches.
+    ``[tokens, kv_heads, head_dim]``, all sharded on heads over ``tp`` (or,
+    when ``prepared=True``, pre-packed ``q_packed`` and ``kv_merged`` with
+    ``values=None``). The kernel runs once per die on local shapes. Pass the
+    ``group`` whose cache ``kv_cache`` is and that group's
+    ``KvCacheSpec.sliding_window``, so the page table and the Engine's
+    retention match this layer. K/V scales apply only to 8-bit caches.
     """
 
     if jnp.dtype(kv_cache.dtype).itemsize != 1:
         k_scale = v_scale = None
+    chosen_impl = impl or default_impl()
+
+    if prepared:
+        if values is not None:
+            raise ValueError("values must be None when prepared=True")
+        tp = tp_size(mesh)
+        if actual_num_q_heads is not None and actual_num_q_heads % tp != 0:
+            raise ValueError(f"{actual_num_q_heads=} must be divisible by tp={tp}")
+        local_q_heads = None if actual_num_q_heads is None else actual_num_q_heads // tp
+        if chosen_impl is reference.ragged_paged_attention:
+            from resin.backend.tpu.kernels.ragged_paged_attention import (
+                unpack_prepared_inputs,
+            )
+
+            def _ref_prepared(
+                q_packed: jax.Array,
+                kv_merged: jax.Array,
+                cache_local: jax.Array,
+                kv_lens: Any,
+                pages: Any,
+                cu_q_lens: Any,
+                dist: Any,
+            ) -> tuple[jax.Array, jax.Array]:
+                q_u, k_u, v_u = unpack_prepared_inputs(
+                    q_packed,
+                    kv_merged,
+                    actual_num_q_heads=local_q_heads,
+                    actual_num_kv_heads=q_packed.shape[0],
+                    actual_head_dim=actual_head_dim,
+                )
+                return reference.ragged_paged_attention(
+                    q_u,
+                    k_u,
+                    v_u,
+                    cache_local,
+                    kv_lens,
+                    pages,
+                    cu_q_lens,
+                    dist,
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+            return jax.shard_map(
+                _ref_prepared,
+                mesh=mesh,
+                in_specs=(
+                    Q_PACKED_PARTITION,
+                    KV_MERGED_PARTITION,
+                    KV_PARTITION,
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                ),
+                out_specs=(HEADS, KV_PARTITION),
+                check_vma=False,
+            )(
+                queries,
+                keys,
+                kv_cache,
+                metadata.kv_lens,
+                metadata.page_indices[group],
+                metadata.cu_q_lens,
+                metadata.distribution,
+            )
+
+        def _kernel_prepared(
+            q_packed: jax.Array,
+            kv_merged: jax.Array,
+            cache_local: jax.Array,
+            kv_lens: Any,
+            pages: Any,
+            cu_q_lens: Any,
+            dist: Any,
+        ) -> tuple[jax.Array, jax.Array]:
+            return chosen_impl(
+                q_packed,
+                kv_merged,
+                None,
+                cache_local,
+                kv_lens,
+                pages,
+                cu_q_lens,
+                dist,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                prepared=True,
+                actual_num_q_heads=local_q_heads,
+                actual_head_dim=actual_head_dim,
+            )
+
+        return jax.shard_map(
+            _kernel_prepared,
+            mesh=mesh,
+            in_specs=(
+                Q_PACKED_PARTITION,
+                KV_MERGED_PARTITION,
+                KV_PARTITION,
+                P(),
+                P(),
+                P(),
+                P(),
+            ),
+            out_specs=(HEADS, KV_PARTITION),
+            check_vma=False,
+        )(
+            queries,
+            keys,
+            kv_cache,
+            metadata.kv_lens,
+            metadata.page_indices[group],
+            metadata.cu_q_lens,
+            metadata.distribution,
+        )
+
+    if values is None:
+        raise ValueError("values is required when prepared=False")
     kernel = functools.partial(
-        impl or default_impl(),
+        chosen_impl,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -114,4 +245,11 @@ def paged_attention(
     )
 
 
-__all__ = ["AttentionImpl", "default_impl", "paged_attention", "quantize_kv"]
+__all__ = [
+    "KV_MERGED_PARTITION",
+    "Q_PACKED_PARTITION",
+    "AttentionImpl",
+    "default_impl",
+    "paged_attention",
+    "quantize_kv",
+]
