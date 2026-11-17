@@ -2,9 +2,14 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 Concrete recipes implement the `Recipe` trait for GPT-OSS, DeepSeek V4.1,
-Inkling2, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
+Inkling2, Qwen3, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
 parameters, such as `GptOssRecipeParams`, and its matching renderer, parser,
 message policy and stop markers.
+
+`qwen3` renders the dense Qwen3 checkpoint's own template: JSON `<tool_call>`
+bodies, text content only, and a generation prompt that leaves `<think>` to the
+model unless thinking is off. It shares the Qwen parser with `qwen3_5`, which uses
+XML tool calls; do not use one for the other's checkpoints.
 
 Rust callers construct a recipe once from its parameters. `render` merges and
 validates each request's `extra` controls against those defaults. The matching

@@ -749,6 +749,9 @@ pub(crate) fn get_native_recipe(
             image_processor_params(tokenizer, params)?,
         )?)),
         "lfm2" => Box::new(resin_recipe::lfm2::Lfm2Recipe::new(recipe_params(params)?)),
+        "qwen3" => Box::new(resin_recipe::qwen3::Qwen3Recipe::new(recipe_params(
+            params,
+        )?)),
         "qwen3_5" => Box::new(resin_recipe::qwen::Qwen35Recipe::new(recipe_params(
             image_processor_params(tokenizer, params)?,
         )?)),

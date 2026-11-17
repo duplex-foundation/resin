@@ -2,6 +2,7 @@ Pinned Hugging Face chat templates are development-only differential oracles.
 Production code neither loads nor interprets these templates.
 
 - Inkling2: thinkingmachines/Inkling-2-Small, 2ad1157016e1aac77b6ff1b770e7c05229403134, chat_template.jinja.
+- Qwen3: Qwen/Qwen3-32B, 9216db5781bf21249d130ec9da846c4624c16137, the `chat_template` field of tokenizer_config.json (Apache-2.0). Dense Qwen3 uses JSON tool calls; Qwen3.5 and later do not.
 - Qwen3.5: Qwen/Qwen3.5-35B-A3B, 59d61f3ce65a6d9863b86d2e96597125219dc754, chat_template.jinja (Apache-2.0).
 - Qwen3.8: RadixArk/Qwen3.8-27B-NVFP4, 554ebba9b5f1b79dc11246341960360e6ef05ef4, chat_template.jinja.
 - Ornith: ornith-ai/Ornith-1.0-35B, 5df2ed3f675c7beaa490328cc70bb573b65fb660, chat_template.jinja (MIT). A modified Qwen3.5 template: past reasoning is always rendered and non-string tool arguments use JSON.
