@@ -13,6 +13,7 @@ import pytest
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+from deploy.models import COMPILE_CACHE_ENV  # noqa: E402
 from scripts import tpu_serve  # noqa: E402
 
 
@@ -58,28 +59,11 @@ def test_wrapper_requires_the_queue_path():
     assert "RESIN_TPU_QUEUE" in done.stderr
 
 
-COMPILE_CACHE_ENV = (
-    "JAX_COMPILATION_CACHE_DIR",
-    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
-    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
-)
-
-
 @pytest.fixture(autouse=True)
 def _restore_compile_cache_env(monkeypatch):
     for name in COMPILE_CACHE_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
-
-
-def test_serve_exports_the_jax_compile_cache(monkeypatch):
-    tpu_serve.export_compile_cache_env()
-    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == tpu_serve.COMPILE_CACHE_DIR
-    assert os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
-    assert os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] == "-1"
-    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", "/elsewhere")
-    tpu_serve.export_compile_cache_env()
-    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == "/elsewhere"
 
 
 def test_serve_builds_the_workload_and_keeps_prefix_cache(
@@ -145,5 +129,6 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert seen["engine"]["max_running_requests"] == 320
     assert seen["serve"] == ("127.0.0.1", 9)
     assert "warmup 1.5s" in capsys.readouterr().out
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"]
     with pytest.raises(SystemExit):
         tpu_serve.main(["--model", "qwen3-32b", "--checkpoint", str(checkpoint)])

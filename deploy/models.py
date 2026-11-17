@@ -450,6 +450,26 @@ TPU_WORKLOADS = {
 }
 
 
+TPU_COMPILE_CACHE_DIR = os.path.expanduser("~/.cache/resin/jax-compile")
+COMPILE_CACHE_ENV = (
+    "JAX_COMPILATION_CACHE_DIR",
+    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+)
+
+
+def export_tpu_compile_cache_env() -> None:
+    """Point JAX's persistent compile cache at a directory, keeping any override.
+
+    The TPU runner leaves JAX configuration alone, and JAX reads these variables
+    when it is imported, so call this before the first JAX import.
+    """
+
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", TPU_COMPILE_CACHE_DIR)
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+
+
 def require_tpu_chip(*, queued: bool = False) -> None:
     """Refuse to start JAX on this host unless the process is pinned to chip 0.
 

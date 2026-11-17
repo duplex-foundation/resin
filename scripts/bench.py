@@ -31,6 +31,7 @@ from deploy.models import (
     MODEL_SPECS,
     TPU_WORKLOADS,
     create_runner,
+    export_tpu_compile_cache_env,
     get_model,
     require_tpu_chip,
     validate_gpu,
@@ -320,6 +321,7 @@ def _rank(
     kind = spec.backend
     if kind == "tpu":
         require_tpu_chip(queued=True)
+        export_tpu_compile_cache_env()
         import jax
 
         def synchronize():

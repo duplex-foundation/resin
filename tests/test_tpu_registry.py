@@ -12,9 +12,12 @@ import pytest
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from deploy.models import (  # noqa: E402
+    COMPILE_CACHE_ENV,
+    TPU_COMPILE_CACHE_DIR,
     TPU_WORKLOADS,
     create_recipe,
     create_runner,
+    export_tpu_compile_cache_env,
     get_model,
     require_tpu_chip,
 )
@@ -213,3 +216,31 @@ def test_qwen3_recipe_uses_the_checkpoint_template(monkeypatch, tmp_path):
         recipe.render([Message(Role.USER, [Thinking("secret")])])
     with pytest.raises(ValueError, match="tools"):
         recipe.render([Message(Role.USER, [Text("Hello")])], tools=(object(),))
+
+
+def test_compile_cache_env_is_exported_and_overridable(monkeypatch):
+    for name in COMPILE_CACHE_ENV:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    export_tpu_compile_cache_env()
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == TPU_COMPILE_CACHE_DIR
+    assert os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
+    assert os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] == "-1"
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", "/elsewhere")
+    export_tpu_compile_cache_env()
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == "/elsewhere"
+
+
+def test_bench_exports_the_compile_cache_before_importing_jax(monkeypatch):
+    from scripts import bench
+
+    class Stop(Exception):
+        pass
+
+    def stop():
+        raise Stop
+
+    monkeypatch.setattr(bench, "require_tpu_chip", lambda **kwargs: None)
+    monkeypatch.setattr(bench, "export_tpu_compile_cache_env", stop)
+    with pytest.raises(Stop):
+        bench._rank(0, 0, None, "qwen3-32b", None, [], None, {})
