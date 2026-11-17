@@ -692,7 +692,6 @@ def _tpu_buckets(workload: TpuWorkload, max_batch_tokens: int):
     return ShapeBuckets(
         decode_seqs=workload.decode_buckets,
         prefill_tokens=base.prefill_tokens,
-        prefill_seqs=base.prefill_seqs,
     )
 
 

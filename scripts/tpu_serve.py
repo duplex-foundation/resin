@@ -14,6 +14,7 @@ count is ``resin:compilations_total`` on ``/metrics``; pass it to
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,20 @@ from deploy.models import (
     require_tpu_chip,
 )
 
+COMPILE_CACHE_DIR = os.path.expanduser("~/.cache/resin/jax-compile")
+
+
+def export_compile_cache_env() -> None:
+    """Point JAX's persistent compile cache at a directory, keeping any override.
+
+    The runner leaves JAX configuration alone, and JAX reads these variables when
+    it is imported, so the server exports them before its first JAX import.
+    """
+
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", COMPILE_CACHE_DIR)
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+
 
 def main(argv=None) -> None:
     presets = [name for name, spec in MODEL_SPECS.items() if spec.backend == "tpu"]
@@ -43,6 +58,7 @@ def main(argv=None) -> None:
     )
     args = parser.parse_args(argv)
     require_tpu_chip(queued=True)
+    export_compile_cache_env()
 
     from resin import Engine, SchedulerConfig
     from resin.server import HttpServer

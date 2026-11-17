@@ -58,6 +58,30 @@ def test_wrapper_requires_the_queue_path():
     assert "RESIN_TPU_QUEUE" in done.stderr
 
 
+COMPILE_CACHE_ENV = (
+    "JAX_COMPILATION_CACHE_DIR",
+    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_compile_cache_env(monkeypatch):
+    for name in COMPILE_CACHE_ENV:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def test_serve_exports_the_jax_compile_cache(monkeypatch):
+    tpu_serve.export_compile_cache_env()
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == tpu_serve.COMPILE_CACHE_DIR
+    assert os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
+    assert os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] == "-1"
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", "/elsewhere")
+    tpu_serve.export_compile_cache_env()
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == "/elsewhere"
+
+
 def test_serve_builds_the_workload_and_keeps_prefix_cache(
     monkeypatch, tmp_path, capsys
 ):
