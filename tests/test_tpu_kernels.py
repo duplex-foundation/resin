@@ -1185,6 +1185,17 @@ class TestFp8Matmul:
             _raw_vmem_estimate_bytes,
         )
 
+        tp2_shapes = (
+            (4096, 5120),
+            (512, 5120),
+            (5120, 4096),
+            (5120, 5120),
+            (5120, 12800),
+            (12800, 5120),
+            (25600, 5120),
+        )
+        tp2_decode_shapes = set(tp2_shapes) | {(2560, 4096), (2560, 12800)}
+
         vmem_cap = 48 * 1024 * 1024
         for (batch, n_out, n_in), tile in _TPU7X_FP8_TUNED_BLOCKS.items():
             assert get_tuned_block_sizes(batch, n_out, n_in, tpu_version=7) == tile
@@ -1225,7 +1236,7 @@ class TestFp8Matmul:
                     tpu_version=7,
                 )
                 assert est <= vmem_cap
-                if batch <= 320:
+                if batch <= 320 and (n_out, n_in) in tp2_decode_shapes:
                     raw = _raw_vmem_estimate_bytes(
                         n_batch=nb,
                         n_out=no,
@@ -1243,27 +1254,30 @@ class TestFp8Matmul:
                     assert raw <= vmem_cap
                     assert tile.batch_block_size == batch
                     assert tile.out_block_size % 256 == 0
+                    assert tile.in_block_size == n_in
 
         buckets = {
             bucket.tokens
             for workload in TPU_WORKLOADS.values()
             for bucket in _tpu_buckets(workload, workload.max_batch_tokens).shapes()
         }
-        tp2_shapes = (
-            (4096, 5120),
-            (512, 5120),
-            (5120, 4096),
-            (5120, 5120),
-            (5120, 12800),
-            (12800, 5120),
-            (25600, 5120),
-        )
         for batch in buckets:
             for n_out, n_in in tp2_shapes:
                 assert (batch, n_out, n_in) in _TPU7X_FP8_TUNED_BLOCKS
-                if batch <= 320:
-                    tile = _TPU7X_FP8_TUNED_BLOCKS[(batch, n_out, n_in)]
-                    assert tile.in_block_size == n_in
+
+        # Confirm tp=1 decode entries remain at their base values (unmodified in RT-32).
+        assert get_tuned_block_sizes(
+            320, 5120, 8192, tpu_version=7
+        ) == Fp8MatmulTileSizes(320, 2560, 4096)
+        assert get_tuned_block_sizes(
+            320, 5120, 25600, tpu_version=7
+        ) == Fp8MatmulTileSizes(320, 2560, 2560)
+        assert get_tuned_block_sizes(
+            320, 10240, 5120, tpu_version=7
+        ) == Fp8MatmulTileSizes(320, 2560, 2560)
+        assert get_tuned_block_sizes(
+            320, 51200, 5120, tpu_version=7
+        ) == Fp8MatmulTileSizes(320, 2560, 2560)
 
     @pytest.mark.parametrize(("batch", "live_rows"), [(8, 1), (8, 4), (16, 9)], ids=str)
     @pytest.mark.parametrize(
@@ -2141,6 +2155,32 @@ class TestPrefillKernels:
 
 
 class TestDecodeMatmulPath:
+    @staticmethod
+    def _iter_jaxpr_eqns(jaxpr_obj, *, enter_pallas: bool = True):
+        jaxpr = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+        for eqn in jaxpr.eqns:
+            yield eqn
+            if not enter_pallas and eqn.primitive.name == "pallas_call":
+                continue
+            for val in eqn.params.values():
+                if hasattr(val, "jaxpr") or hasattr(val, "eqns"):
+                    yield from TestDecodeMatmulPath._iter_jaxpr_eqns(
+                        val, enter_pallas=enter_pallas
+                    )
+                elif isinstance(val, (tuple, list)):
+                    for item in val:
+                        if hasattr(item, "jaxpr") or hasattr(item, "eqns"):
+                            yield from TestDecodeMatmulPath._iter_jaxpr_eqns(
+                                item, enter_pallas=enter_pallas
+                            )
+
+    @classmethod
+    def _assert_no_pad_eqns(cls, jaxpr_obj) -> None:
+        assert all(
+            eqn.primitive.name != "pad" and eqn.params.get("name") != "_pad"
+            for eqn in cls._iter_jaxpr_eqns(jaxpr_obj)
+        )
+
     @pytest.mark.parametrize(
         ("batch", "live_rows"),
         [(8, 1), (16, 9), (96, 71), (320, 289)],
@@ -2174,7 +2214,11 @@ class TestDecodeMatmulPath:
                 xq_i, xs_i, w_gu_q, w_gu_s, interpret=True
             )
         )(xq, jnp.transpose(xs))
-        assert all(eqn.primitive.name != "pad" for eqn in jaxpr.jaxpr.eqns)
+        self._assert_no_pad_eqns(jaxpr)
+        assert all(
+            eqn.primitive.name not in ("concatenate", "slice", "dynamic_slice")
+            for eqn in self._iter_jaxpr_eqns(jaxpr, enter_pallas=False)
+        )
 
         gated, tile_absmax = pallas_fp8_gate_up_swiglu(
             xq, jnp.transpose(xs), w_gu_q, w_gu_s, interpret=True
@@ -2226,9 +2270,10 @@ class TestDecodeMatmulPath:
                 xi, nw, 1e-6, transposed_scale=True, interpret=True
             )
         )(x)
+        self._assert_no_pad_eqns(norm_jaxpr)
         assert all(
-            eqn.primitive.name not in ("pad", "transpose")
-            for eqn in norm_jaxpr.jaxpr.eqns
+            eqn.primitive.name != "transpose"
+            for eqn in self._iter_jaxpr_eqns(norm_jaxpr, enter_pallas=False)
         )
 
         add_norm_jaxpr = jax.make_jaxpr(
@@ -2236,9 +2281,10 @@ class TestDecodeMatmulPath:
                 xi, ri, nw, 1e-6, transposed_scale=True, interpret=True
             )
         )(x, res)
+        self._assert_no_pad_eqns(add_norm_jaxpr)
         assert all(
-            eqn.primitive.name not in ("pad", "transpose")
-            for eqn in add_norm_jaxpr.jaxpr.eqns
+            eqn.primitive.name != "transpose"
+            for eqn in self._iter_jaxpr_eqns(add_norm_jaxpr, enter_pallas=False)
         )
 
         xq, xs_t, next_res = fused_add_rms_norm_fp8_quant(
@@ -2284,7 +2330,7 @@ class TestDecodeMatmulPath:
                 interpret=True,
             )
         )(qkv, pos)
-        assert all(eqn.primitive.name != "pad" for eqn in qkv_jaxpr.jaxpr.eqns)
+        self._assert_no_pad_eqns(qkv_jaxpr)
 
         qp, kvm = pallas_qkv_norm_rope_pack(
             qkv,
@@ -2317,12 +2363,17 @@ class TestDecodeMatmulPath:
             atol=2e-2,
         )
 
-        # Unpack attention + FP8 quant across reshape & bitcast_u32 with zero pad primitives.
+        # Unpack attention + FP8 quant across reshape & bitcast_u32 with zero pad primitives,
+        # anchored directly to the original 3D heads q_ref (M15).
         out_packed = pack_outputs(q_ref, kv_heads)
-        ref_unpacked = prepare_outputs(
-            out_packed, q_heads // kv_heads, head_dim
-        ).reshape(batch, q_heads * head_dim)
-        ref_att_q, ref_att_s = quantize_fp8_act(ref_unpacked)
+        np.testing.assert_array_equal(np.asarray(out_packed), np.asarray(exp_qp))
+        np.testing.assert_array_equal(
+            np.asarray(prepare_outputs(out_packed, q_heads // kv_heads, head_dim)),
+            np.asarray(q_ref),
+        )
+        ref_att_q, ref_att_s = quantize_fp8_act(
+            q_ref.reshape(batch, q_heads * head_dim)
+        )
 
         unpack_modes: tuple[Literal["reshape", "bitcast_u32"], ...] = (
             "reshape",
@@ -2338,7 +2389,7 @@ class TestDecodeMatmulPath:
                     interpret=True,
                 )
             )(out_packed)
-            assert all(eqn.primitive.name != "pad" for eqn in unpack_jaxpr.jaxpr.eqns)
+            self._assert_no_pad_eqns(unpack_jaxpr)
             att_q, att_s = pallas_unpack_attn_fp8_quant(
                 out_packed,
                 q_heads // kv_heads,
@@ -2483,6 +2534,49 @@ class TestDecodeMatmulPath:
             )
         )(xq_rep, xs_rep, w_gu_q, w_gu_s)
         assert "pmax" not in str(gu_jaxpr)
+
+        # Verify per-die gate_up absmax reduces across all FFN tiles (n_out > 1, M3).
+        ffn_local = 2560  # 2 * 1280 -> n_out = 2 tiles per die
+        w_gu_multi_np = (
+            rng.standard_normal((2 * 2 * ffn_local, 256)).astype(np.float32) * 0.02
+        )
+        # Amplify tile 1 (rows 1280..2559 of gate and up on each die) so tile 0 alone under-reports absmax.
+        for die in range(2):
+            base_row = die * (2 * ffn_local)
+            w_gu_multi_np[base_row + 1280 : base_row + 2560] *= 10.0
+            w_gu_multi_np[base_row + ffn_local + 1280 : base_row + 2 * ffn_local] *= (
+                10.0
+            )
+        w_gu_multi = quantize_fp8_weight(jnp.asarray(w_gu_multi_np, jnp.bfloat16))
+        w_gu_m_q = jax.device_put(w_gu_multi.qvalue, NamedSharding(mesh, P("tp", None)))
+        w_gu_m_s = jax.device_put(w_gu_multi.scale, NamedSharding(mesh, P("tp")))
+        g_multi, g_abs_per_die = sharded_fp8_gate_up_swiglu(
+            xq_rep,
+            xs_rep,
+            w_gu_m_q,
+            w_gu_m_s,
+            mesh=mesh,
+            sequence_parallel=False,
+            sync_tp_scale=False,
+            backend="pallas",
+            interpret=True,
+        )
+        assert g_abs_per_die is not None
+        assert g_abs_per_die.shape == (2, 32)
+        g_multi_f32 = np.asarray(g_multi, np.float32)
+        expected_per_die = np.stack(
+            [
+                np.max(np.abs(g_multi_f32[:, :ffn_local]), axis=-1),
+                np.max(np.abs(g_multi_f32[:, ffn_local:]), axis=-1),
+            ],
+            axis=0,
+        )
+        np.testing.assert_allclose(
+            np.asarray(g_abs_per_die, np.float32),
+            expected_per_die,
+            rtol=1e-2,
+            atol=2e-3,
+        )
 
 
 @pytest.mark.skipif(

@@ -104,7 +104,7 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         (8192, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (8192, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
     }
-    # Qwen3-32B decode buckets (bs <= 320):
+    # Qwen3-32B tp=2 decode buckets (bs <= 320):
     # batch_block == bs keeps n_batch == 1 (zero 128-lane scale pad), out_block % 256 == 0
     # fills all 256 MXU columns, and in_block == K_local keeps n_in == 1 (zero acc_scratch).
     for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
@@ -115,16 +115,39 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(
             bs, 2560 if bs <= 192 else 1280, 5120
         )
-        table[(bs, 5120, 8192)] = Fp8MatmulTileSizes(bs, 1024, 8192)
         table[(bs, 2560, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800)
         table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(
             bs, 1024 if bs <= 128 else 512, 12800
         )
-        table[(bs, 5120, 25600)] = Fp8MatmulTileSizes(bs, 512, 12800)
         table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
         table[(bs, 25600, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
-        table[(bs, 10240, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
-        table[(bs, 51200, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
+    # Qwen3-32B tp=1 shapes stay at their base entries (not re-tuned on chip in RT-32):
+    table.update(
+        {
+            (8, 5120, 8192): Fp8MatmulTileSizes(8, 1280, 8192),
+            (8, 5120, 25600): Fp8MatmulTileSizes(8, 640, 25600),
+            (16, 5120, 8192): Fp8MatmulTileSizes(16, 1280, 8192),
+            (16, 5120, 25600): Fp8MatmulTileSizes(16, 640, 25600),
+            (32, 5120, 8192): Fp8MatmulTileSizes(32, 2560, 4096),
+            (32, 5120, 25600): Fp8MatmulTileSizes(32, 640, 25600),
+            (64, 5120, 8192): Fp8MatmulTileSizes(64, 1280, 8192),
+            (64, 5120, 25600): Fp8MatmulTileSizes(64, 640, 25600),
+            (128, 5120, 8192): Fp8MatmulTileSizes(128, 5120, 2048),
+            (128, 5120, 25600): Fp8MatmulTileSizes(128, 512, 25600),
+            (256, 5120, 8192): Fp8MatmulTileSizes(256, 1280, 8192),
+            (256, 5120, 25600): Fp8MatmulTileSizes(256, 5120, 2560),
+        }
+    )
+    for bs in (96, 160, 192, 224, 288, 320):
+        table[(bs, 5120, 8192)] = Fp8MatmulTileSizes(bs, 2560, 4096)
+        table[(bs, 5120, 25600)] = Fp8MatmulTileSizes(bs, 2560, 2560)
+    for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
+        table[(bs, 10240, 5120)] = Fp8MatmulTileSizes(
+            bs, 2048 if bs <= 16 else 2560, 5120 if bs <= 16 else 2560
+        )
+        table[(bs, 51200, 5120)] = Fp8MatmulTileSizes(
+            bs, 1024 if bs <= 16 else 2560, 5120 if bs <= 16 else 2560
+        )
     for bs in (512, 1024, 2048, 4096, 8192):
         table[(bs, 10240, 5120)] = Fp8MatmulTileSizes(256, 2560, 5120)
         table[(bs, 51200, 5120)] = Fp8MatmulTileSizes(512, 2560, 5120)
