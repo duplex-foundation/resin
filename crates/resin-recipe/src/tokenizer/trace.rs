@@ -1,8 +1,10 @@
-//! Byte ownership for the supported stock decoder chains; HF still decodes text.
+//! Streaming UTF-8 decoding and byte ownership for the supported stock decoder chains.
 use super::bytes::{TokenBytes, fallback_byte};
 use crate::{AttributedText, Error, TokenSpan, Tokenizer};
 use serde_json::Value;
 use std::collections::VecDeque;
+
+const MAX_UTF8_HOLD_BYTES: usize = 3;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -63,6 +65,11 @@ impl Trace {
                 .get(id, &spelling)
                 .ok_or_else(|| Error::new("unsupported token byte representation"))?;
             u32::try_from(bytes.len()).map_err(|_| Error::new("token byte length exceeds u32"))?;
+            // An empty piece only matters as the boundary that ends a `<0xNN>` run.
+            if bytes.is_empty() && (matches!(self.kind, Kind::ByteLevel) || self.pending.is_empty())
+            {
+                continue;
+            }
             let token = Token { bytes, fallback };
             self.pending.push_back(Piece {
                 index,
@@ -72,19 +79,53 @@ impl Trace {
         }
         Ok(())
     }
-    pub fn output(&mut self, text: String) -> Result<AttributedText, Error> {
-        if text.is_empty() {
+    /// Decodes every byte whose text is final. Only a trailing incomplete
+    /// scalar prefix, at most `MAX_UTF8_HOLD_BYTES`, waits for later tokens;
+    /// `flush` also replaces that prefix.
+    pub fn decode_pending(&mut self, flush: bool) -> Result<AttributedText, Error> {
+        if self.pending.is_empty() {
             return Ok(AttributedText::default());
         }
-        let length =
-            u32::try_from(text.len()).map_err(|_| Error::new("decoded text length exceeds u32"))?;
         self.raw.clear();
         for piece in &self.pending {
             self.raw
                 .extend_from_slice(&piece.token.bytes[piece.start..]);
         }
-        if self.raw.starts_with(text.as_bytes()) {
-            // Valid copied bytes need no second UTF-8 decode or reconstructed String.
+        let (emit_len, valid) = match self.kind {
+            Kind::ByteLevel => utf8_emit_len(&self.raw, flush),
+            Kind::ByteFallback => {
+                // Only the trailing run of `<0xNN>` tokens can still change meaning.
+                let tail: usize = self
+                    .pending
+                    .iter()
+                    .rev()
+                    .take_while(|piece| piece.token.fallback)
+                    .map(|piece| piece.token.bytes.len() - piece.start)
+                    .sum();
+                let tail_start = self.raw.len() - tail;
+                let emit = tail_start + utf8_emit_len(&self.raw[tail_start..], flush).0;
+                // An empty piece ends a `<0xNN>` run, so bytes on either side never fuse.
+                let fused = self
+                    .pending
+                    .iter()
+                    .any(|piece| piece.token.bytes.is_empty());
+                (
+                    emit,
+                    !fused && std::str::from_utf8(&self.raw[..emit]).is_ok(),
+                )
+            }
+        };
+        if emit_len == 0 {
+            if self.raw.is_empty() {
+                self.pending.clear();
+            }
+            return Ok(AttributedText::default());
+        }
+        if valid {
+            let text = std::str::from_utf8(&self.raw[..emit_len])
+                .map_err(|_| Error::new("decoded bytes are not valid UTF-8"))?
+                .to_owned();
+            u32::try_from(text.len()).map_err(|_| Error::new("decoded text length exceeds u32"))?;
             let mut spans = Vec::with_capacity(self.pending.len());
             let mut offset = 0;
             for piece in &self.pending {
@@ -97,7 +138,7 @@ impl Trace {
                     break;
                 }
             }
-            self.consume(text.len());
+            self.consume(emit_len);
             return Ok(AttributedText { text, spans });
         }
         // The uncommon invalid-byte path preserves each decoder's exact replacement
@@ -105,10 +146,11 @@ impl Trace {
         let pieces = self.pending.make_contiguous();
         let mut decoded = AttributedText::default();
         let (mut offset, mut raw_offset) = (0, 0);
-        while offset < pieces.len() {
+        while offset < pieces.len() && raw_offset < emit_len {
+            let fallback = matches!(self.kind, Kind::ByteFallback) && pieces[offset].token.fallback;
             let end = match self.kind {
                 Kind::ByteLevel => pieces.len(),
-                Kind::ByteFallback if pieces[offset].token.fallback => {
+                Kind::ByteFallback if fallback => {
                     offset
                         + pieces[offset..]
                             .iter()
@@ -117,40 +159,22 @@ impl Trace {
                 }
                 Kind::ByteFallback => offset + 1,
             };
-            let raw_end = raw_offset
+            let raw_end = (raw_offset
                 + pieces[offset..end]
                     .iter()
                     .map(|piece| piece.token.bytes.len() - piece.start)
-                    .sum::<usize>();
+                    .sum::<usize>())
+            .min(emit_len);
             decode(
                 &pieces[offset..end],
                 &self.raw[raw_offset..raw_end],
-                matches!(self.kind, Kind::ByteFallback),
+                fallback,
                 &mut decoded,
             )?;
             offset = end;
             raw_offset = raw_end;
         }
-        if !decoded.text.starts_with(&text) {
-            return Err(Error::new(
-                "decoded text does not match token byte provenance",
-            ));
-        }
-        decoded.spans.retain_mut(|span| {
-            if let Some(clipped) = span.clipped(0..length) {
-                *span = clipped;
-                true
-            } else {
-                false
-            }
-        });
-        let consumed = decoded
-            .spans
-            .iter()
-            .map(|span| (span.source.end - span.source.start) as usize)
-            .sum();
-        self.consume(consumed);
-        decoded.text = text;
+        self.consume(emit_len);
         Ok(decoded)
     }
     fn consume(&mut self, mut bytes: usize) {
@@ -162,11 +186,42 @@ impl Trace {
             }
             bytes -= length;
             self.pending.pop_front();
-            if bytes == 0 {
-                break;
+        }
+    }
+}
+
+/// Returns how many leading bytes are final and whether they are all valid UTF-8.
+/// Unless `flush`, a trailing incomplete scalar prefix (1 to 3 bytes) stays pending.
+fn utf8_emit_len(bytes: &[u8], flush: bool) -> (usize, bool) {
+    let first = match std::str::from_utf8(bytes) {
+        Ok(_) => return (bytes.len(), true),
+        Err(error) => error,
+    };
+    if flush {
+        return (bytes.len(), false);
+    }
+    let Some(invalid_len) = first.error_len() else {
+        // Short buffers wait whole so a scalar split across tokens keeps one source run.
+        return if bytes.len() <= MAX_UTF8_HOLD_BYTES {
+            (0, true)
+        } else {
+            (first.valid_up_to(), true)
+        };
+    };
+    let mut source = first.valid_up_to() + invalid_len;
+    while source < bytes.len() {
+        match std::str::from_utf8(&bytes[source..]) {
+            Ok(_) => return (bytes.len(), false),
+            Err(error) => {
+                source += error.valid_up_to();
+                match error.error_len() {
+                    Some(len) => source += len,
+                    None => break,
+                }
             }
         }
     }
+    (source, false)
 }
 
 /// A token has at most a leading split scalar, a linear middle, and a trailing
@@ -253,27 +308,29 @@ fn decode(
     fallback: bool,
     result: &mut AttributedText,
 ) -> Result<(), Error> {
-    let invalid_fallback = fallback && std::str::from_utf8(bytes).is_err();
     let (mut source, mut piece_index, mut piece_offset) = (0, 0, 0);
     while source < bytes.len() {
-        let (valid_len, invalid_len) = if invalid_fallback {
-            (0, 1)
+        let (valid_len, invalid_len) = match std::str::from_utf8(&bytes[source..]) {
+            Ok(_) => (bytes.len() - source, 0),
+            Err(error) => (
+                error.valid_up_to(),
+                error
+                    .error_len()
+                    .unwrap_or(bytes.len() - source - error.valid_up_to()),
+            ),
+        };
+        // Each ill-formed subpart is fixed by its own bytes, so replacing it alone
+        // keeps the output independent of how pushes split the token stream.
+        let (replacements, replacement_len) = if fallback {
+            (invalid_len, 1)
         } else {
-            match std::str::from_utf8(&bytes[source..]) {
-                Ok(_) => (bytes.len() - source, 0),
-                Err(error) => (
-                    error.valid_up_to(),
-                    error
-                        .error_len()
-                        .unwrap_or(bytes.len() - source - error.valid_up_to()),
-                ),
-            }
+            (usize::from(invalid_len > 0), invalid_len)
         };
         let valid = std::str::from_utf8(&bytes[source..source + valid_len]).unwrap();
         for (character, source_len) in valid
             .chars()
             .map(|character| (character, character.len_utf8()))
-            .chain((invalid_len > 0).then_some(('�', invalid_len)))
+            .chain(std::iter::repeat_n(('�', replacement_len), replacements))
         {
             let event_start = u32::try_from(result.text.len())
                 .map_err(|_| Error::new("decoded text length exceeds u32"))?;

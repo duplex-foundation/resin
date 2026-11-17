@@ -187,6 +187,37 @@ def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
     assert parser.finish("length") == []
 
 
+def test_native_decoder_bounds_invalid_utf8_holdback_during_streaming() -> None:
+    backend = _byte_tokenizer()
+    parser = _inkling2_parser(Tokenizer(_FastTokenizer(backend)), content=True)
+    invalid = backend.token_to_id("\u00ff")
+    crab = backend.encode("🦀", add_special_tokens=False).ids
+    assert invalid is not None and len(crab) == 4
+
+    next_token = 1
+    for _ in range(256):
+        assert parser.feed([invalid]) == [
+            resin.recipe.TextDelta("\ufffd", token_spans=[(next_token, 0, 1, 0, 3)])
+        ]
+        next_token += 1
+    for token_id in crab[:-1]:
+        assert parser.feed([token_id]) == []
+    assert parser.feed(crab[-1:]) == [
+        resin.recipe.TextDelta(
+            "🦀",
+            token_spans=[(next_token + index, 0, 1, 0, 4) for index in range(4)],
+        )
+    ]
+    next_token += 4
+    assert parser.feed(crab[:2]) == []
+    assert parser.finish("length") == [
+        resin.recipe.TextDelta(
+            "\ufffd",
+            token_spans=[(next_token + index, 0, 1, 0, 3) for index in range(2)],
+        )
+    ]
+
+
 def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> None:
     backend = _byte_tokenizer()
     tokenizer = Tokenizer(_FastTokenizer(backend))
