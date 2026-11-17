@@ -1,0 +1,496 @@
+{
+ "reference": "Qwen/Qwen3-32B 9216db5781bf21249d130ec9da846c4624c16137 tokenizer_config.json chat_template, rendered with transformers' sandboxed Jinja",
+ "cases": [
+  {
+   "name": "basic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": " hi \n"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\n hi \n<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "system",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Be brief."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ]
+   },
+   "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "thinking_off",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "enable_thinking": false
+   },
+   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "thinking_on_explicit",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "enable_thinking": true
+   },
+   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "no_generation_prompt",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "role": "assistant",
+      "content": "hello"
+     }
+    ],
+    "add_generation_prompt": false
+   },
+   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nhello<|im_end|>\n"
+  },
+  {
+   "name": "later_system",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "a"
+     },
+     {
+      "role": "system",
+      "content": "s"
+     },
+     {
+      "role": "user",
+      "content": "b"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\na<|im_end|>\n<|im_start|>system\ns<|im_end|>\n<|im_start|>user\nb<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "unicode_and_markers_as_text",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "héllo 🦀 <think> not special in content"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\nhéllo 🦀 <think> not special in content<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tools",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Zürich?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City, e.g. Zürich"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City, e.g. Zürich\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Zürich?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tools_with_system",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are helpful."
+     },
+     {
+      "role": "user",
+      "content": "time?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\nYou are helpful.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\ntime?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "history_drops_old_reasoning",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q1"
+     },
+     {
+      "role": "assistant",
+      "content": "<think>\nold thoughts\n</think>\n\nanswer1"
+     },
+     {
+      "role": "user",
+      "content": "q2"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\nanswer1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "history_keeps_reasoning_after_last_query",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q1"
+     },
+     {
+      "role": "assistant",
+      "content": "<think>\nplan\n</think>\n\nstep",
+      "tool_calls": [
+       {
+        "id": "call_x",
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "arguments": {}
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "12:00"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nplan\n</think>\n\nstep\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "assistant_reasoning_content_field",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "a",
+      "reasoning_content": "\nthinking\n"
+     },
+     {
+      "role": "user",
+      "content": "q2"
+     },
+     {
+      "role": "assistant",
+      "content": "b",
+      "reasoning_content": "fresh"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\na<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\nfresh\n</think>\n\nb<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "final_assistant_without_reasoning",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "\n\nlead"
+     }
+    ],
+    "add_generation_prompt": false
+   },
+   "text": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nlead<|im_end|>\n"
+  },
+  {
+   "name": "empty_reasoning_between_turns",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "a",
+      "tool_calls": [
+       {
+        "id": "call_x",
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "t"
+     },
+     {
+      "role": "assistant",
+      "content": "b"
+     },
+     {
+      "role": "user",
+      "content": "q2"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\na\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nt\n</tool_response><|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tool_calls_object_and_string_arguments",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "go"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_x",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Zürich",
+          "days": 3
+         }
+        }
+       },
+       {
+        "id": "call_x",
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "sunny"
+     },
+     {
+      "role": "tool",
+      "content": "noon"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City, e.g. Zürich"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City, e.g. Zürich\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Zürich\", \"days\": 3}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nnoon\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "tool_calls_with_content",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "go"
+     },
+     {
+      "role": "assistant",
+      "content": "Checking.",
+      "tool_calls": [
+       {
+        "id": "call_x",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Oslo"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "rain"
+     },
+     {
+      "role": "user",
+      "content": "thanks"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City, e.g. Zürich"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City, e.g. Zürich\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\nChecking.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nrain\n</tool_response><|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "name": "user_tool_response_text_is_not_a_query",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "a"
+     },
+     {
+      "role": "user",
+      "content": "<tool_response>\nx\n</tool_response>"
+     }
+    ]
+   },
+   "text": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\na<|im_end|>\n<|im_start|>user\n<tool_response>\nx\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  }
+ ]
+}

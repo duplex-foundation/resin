@@ -12,6 +12,7 @@ mod parser;
 mod prompt;
 mod provenance;
 pub mod qwen;
+pub mod qwen3;
 mod recipe;
 mod render;
 mod tokenizer;
@@ -28,7 +29,7 @@ pub use inkling2::{Inkling2Parser, Inkling2Tokens};
 pub use lfm2::{Lfm2Parser, Lfm2Tokens};
 pub use prompt::{Encoder, Prompt, PromptSpan, TokenizerEncoder};
 pub use provenance::{AttributedEvent, AttributedText, TokenSpan};
-pub use qwen::{QwenParser, QwenTokens};
+pub use qwen::{QwenParser, QwenTokens, ToolFormat};
 pub use recipe::{BlockKind, MediaConfig, MessagePolicy, ReasoningEffort, Recipe, ToolScope};
 pub use tokenizer::{TokenBytes, Tokenizer, TokenizerDecoder};
 

@@ -1,7 +1,7 @@
 //! Qwen3.5, Qwen3.8 and Ornith conversation formats.
 
 mod parser;
-pub use parser::{QwenParser, QwenTokens};
+pub use parser::{QwenParser, QwenTokens, ToolFormat};
 
 use crate::{
     Error, Prompt,
