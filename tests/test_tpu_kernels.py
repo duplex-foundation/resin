@@ -23,9 +23,11 @@ from resin.backend.tpu.arena import KV_PARTITION, KvCacheSpec  # noqa: E402
 from resin.backend.tpu.attention import default_impl, paged_attention  # noqa: E402
 from resin.backend.tpu.compilation import CompilationCounter  # noqa: E402
 from resin.backend.tpu.kernels.fp8_matmul import (  # noqa: E402
+    _TPU7X_FP8_TUNED_BLOCKS,
     Fp8MatmulTileSizes,
     fp8_matmul,
     fp8_matmul_prequantized,
+    get_tuned_block_sizes,
     quantize_fp8_weight,
     sharded_fp8_matmul,
     xla_fp8_matmul,
@@ -734,6 +736,69 @@ class TestFp8Matmul:
         )
         assert cosine > 0.999
 
+    def test_qwen3_32b_tp2_buckets_all_hit_zero_pad_tpu7x_tiles(self) -> None:
+        buckets = (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320)
+        buckets += (512, 1024, 2048, 4096)
+        shapes = (
+            (4096, 5120),
+            (512, 5120),
+            (5120, 4096),
+            (5120, 5120),
+            (5120, 12800),
+            (12800, 5120),
+            (25600, 5120),
+        )
+        for batch in buckets:
+            for n_out, n_in in shapes:
+                tile = _TPU7X_FP8_TUNED_BLOCKS[(batch, n_out, n_in)]
+                assert get_tuned_block_sizes(batch, n_out, n_in, tpu_version=7) == tile
+                assert batch % tile.batch_block_size == 0
+                assert n_out % tile.out_block_size == 0
+                assert n_in % tile.in_block_size == 0
+                assert tile.batch_block_size % 8 == 0
+                assert tile.out_block_size % 128 == 0
+                assert tile.in_block_size % 128 == 0
+                assert (
+                    batch == tile.batch_block_size or tile.batch_block_size % 128 == 0
+                )
+
+    @pytest.mark.parametrize(("batch", "live_rows"), [(8, 1), (8, 4), (16, 9)], ids=str)
+    @pytest.mark.parametrize(
+        ("n_out", "n_in", "out_block", "in_block"),
+        [(512, 5120, 512, 2560), (256, 512, 128, 512)],
+        ids=["accumulate-k", "cache-x-q"],
+    )
+    def test_small_decode_buckets_8_and_16_match_xla_in_pallas_interpret(
+        self,
+        batch: int,
+        live_rows: int,
+        n_out: int,
+        n_in: int,
+        out_block: int,
+        in_block: int,
+    ) -> None:
+        rng = np.random.default_rng(batch * 1000 + live_rows)
+        x_np = rng.standard_normal((batch, n_in)).astype(np.float32)
+        x_np[live_rows:] = 0.0
+        w_np = rng.standard_normal((n_out, n_in)).astype(np.float32) * 0.1
+        x = jnp.asarray(x_np, jnp.bfloat16)
+        fw = quantize_fp8_weight(jnp.asarray(w_np, jnp.bfloat16))
+
+        expected = np.asarray(xla_fp8_matmul(x, fw.qvalue, fw.scale), np.float32)
+        actual = np.asarray(
+            fp8_matmul(
+                x,
+                fw.qvalue,
+                fw.scale,
+                backend="pallas",
+                tile_sizes=Fp8MatmulTileSizes(batch, out_block, in_block),
+                interpret=True,
+            ),
+            np.float32,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=2e-2)
+        np.testing.assert_allclose(actual[live_rows:], 0.0, atol=0.0)
+
     def test_tp2_column_and_row_parallel_match_single_device_qwix(self) -> None:
         devices = jax.devices()
         if len(devices) < 2:
@@ -1053,6 +1118,42 @@ class TestTpuHardwareMosaic:
             rtol=2e-2,
             atol=5e-2,
         )
+
+        for small in (8, 16):
+            x_small = jnp.asarray(x_np[:small], jnp.bfloat16)
+            small_pallas = jax.jit(
+                lambda inp, wq, ws: sharded_fp8_matmul(
+                    inp, wq, ws, P("tp", None), mesh=mesh, backend="pallas"
+                )
+            )(
+                jax.device_put(x_small, NamedSharding(mesh, P(None, None))),
+                jax.device_put(fw_col.qvalue, NamedSharding(mesh, P("tp", None))),
+                jax.device_put(fw_col.scale, NamedSharding(mesh, P("tp"))),
+            )
+            small_xla = xla_fp8_matmul(x_small, fw_col.qvalue, fw_col.scale)
+            assert not np.any(np.isnan(np.asarray(small_pallas, np.float32)))
+            np.testing.assert_allclose(
+                np.asarray(small_pallas, np.float32),
+                np.asarray(small_xla, np.float32),
+                rtol=2e-2,
+                atol=5e-2,
+            )
+            small_row = jax.jit(
+                lambda inp, wq, ws: sharded_fp8_matmul(
+                    inp, wq, ws, P(None, "tp"), mesh=mesh, backend="pallas"
+                )
+            )(
+                jax.device_put(small_pallas, NamedSharding(mesh, P(None, "tp"))),
+                jax.device_put(fw_row.qvalue, NamedSharding(mesh, P(None, "tp"))),
+                jax.device_put(fw_row.scale, NamedSharding(mesh, P())),
+            )
+            small_row_xla = xla_fp8_matmul(small_pallas, fw_row.qvalue, fw_row.scale)
+            np.testing.assert_allclose(
+                np.asarray(small_row, np.float32),
+                np.asarray(small_row_xla, np.float32),
+                rtol=2e-2,
+                atol=5e-2,
+            )
 
         # Also exercise Pallas rms_norm_fp8_quant and Qwen3-32B MLP gate_up shape (256, 5120) -> 25600/die.
         norm_w = jnp.ones((5120,), dtype=jnp.bfloat16)

@@ -125,7 +125,20 @@ def test_tpu_factory_uses_the_workload_shape(monkeypatch, tmp_path):
     assert kwargs["max_num_seqs"] == 320
     assert kwargs["max_batch_tokens"] == 4096
     assert kwargs["memory_utilization"] == 0.98
-    assert kwargs["buckets"].decode_seqs == (96, 160, 192, 224, 288, 320)
+    assert kwargs["buckets"].decode_seqs == (
+        8,
+        16,
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+        288,
+        320,
+    )
     assert kwargs["buckets"].prefill_tokens[-1] == 4096
     create_runner(
         spec,
@@ -138,7 +151,7 @@ def test_tpu_factory_uses_the_workload_shape(monkeypatch, tmp_path):
         workload="1k/1k",
     )
     assert calls["runner"][2]["max_seq_len"] == 2048
-    assert calls["runner"][2]["buckets"].decode_seqs == (320,)
+    assert calls["runner"][2]["buckets"].decode_seqs == (8, 16, 32, 64, 128, 256, 320)
     with pytest.raises(ValueError, match="2048"):
         create_runner(
             spec,

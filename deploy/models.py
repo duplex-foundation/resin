@@ -423,8 +423,11 @@ class TpuWorkload:
     """One InferenceX server shape for the Qwen3-32B TPU preset.
 
     ``prompt + output`` is the server context limit. ``decode_buckets`` are
-    that server's vLLM compilation sizes. bench.py measures a short decode
-    window inside the limit; it does not generate ``output`` tokens.
+    that server's vLLM compilation sizes. ``_tpu_buckets`` unions them with the
+    ``(8, 16, ..., max_num_seqs)`` ladder from ``ShapeBuckets.powers_of_two``, as
+    vLLM does, so low concurrency does not pad to the first listed size. bench.py
+    measures a short decode window inside the limit; it does not generate
+    ``output`` tokens.
     """
 
     prompt: int
@@ -710,7 +713,7 @@ def _tpu_buckets(workload: TpuWorkload, max_batch_tokens: int):
         max_num_seqs=workload.max_num_seqs, max_batch_tokens=max_batch_tokens
     )
     return ShapeBuckets(
-        decode_seqs=workload.decode_buckets,
+        decode_seqs=(*base.decode_seqs, *workload.decode_buckets),
         prefill_tokens=base.prefill_tokens,
     )
 
