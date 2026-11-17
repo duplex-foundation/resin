@@ -117,6 +117,7 @@ def pallas_rms_norm_fp8_quant(
     *,
     residual: None = None,
     dtype: Any = jnp.float8_e4m3fn,
+    transposed_scale: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]: ...
 
@@ -129,6 +130,7 @@ def pallas_rms_norm_fp8_quant(
     *,
     residual: jax.Array,
     dtype: Any = jnp.float8_e4m3fn,
+    transposed_scale: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
 
@@ -140,6 +142,7 @@ def pallas_rms_norm_fp8_quant(
     *,
     residual: jax.Array | None = None,
     dtype: Any = jnp.float8_e4m3fn,
+    transposed_scale: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Single-pass Pallas VMEM kernel fusing optional residual add, RMSNorm, and FP8 quant."""
@@ -152,12 +155,12 @@ def pallas_rms_norm_fp8_quant(
     if residual is not None and residual.shape != x.shape:
         raise ValueError(f"Expected residual shape {x.shape}, got {residual.shape}")
 
-    x_2d = x.reshape(-1, k_dim)
+    x_2d = x if x.ndim == 2 else x.reshape(-1, k_dim)
     orig_batch = x_2d.shape[0]
     max_block = 256 if (residual is not None and k_dim >= 4096) else 512
     batch_block = (
         align_to(max(8, orig_batch), 8)
-        if orig_batch < 128
+        if orig_batch <= max(320, max_block)
         else min(align_to(orig_batch, 128), max_block)
     )
     padded_batch = align_to(orig_batch, batch_block)
@@ -202,12 +205,20 @@ def pallas_rms_norm_fp8_quant(
             name=f"rms_norm_fp8_quant_{batch_block}_{k_dim}",
         )
         x_q, scale_t = kernel(x_2d, w_2d)
+        if orig_batch < padded_batch:
+            x_q = x_q[:orig_batch]
+            scale_t = scale_t[:, :orig_batch]
+        scale_out = (
+            scale_t if transposed_scale else jnp.transpose(scale_t).reshape(*leading, 1)
+        )
         return (
-            x_q[:orig_batch].reshape(*leading, k_dim),
-            jnp.transpose(scale_t)[:orig_batch].reshape(*leading, 1),
+            x_q if x.ndim == 2 else x_q.reshape(*leading, k_dim),
+            scale_out,
         )
 
-    res_2d = residual.astype(x.dtype).reshape(-1, k_dim)
+    res_2d = residual.astype(x.dtype)
+    if res_2d.ndim != 2:
+        res_2d = res_2d.reshape(-1, k_dim)
     if orig_batch < padded_batch:
         res_2d = jnp.pad(res_2d, ((0, padded_batch - orig_batch), (0, 0)))
 
@@ -240,10 +251,17 @@ def pallas_rms_norm_fp8_quant(
         name=f"fused_add_rms_norm_fp8_quant_{batch_block}_{k_dim}",
     )
     x_q, scale_t, next_res = fused_kernel(x_2d, res_2d, w_2d)
+    if orig_batch < padded_batch:
+        x_q = x_q[:orig_batch]
+        scale_t = scale_t[:, :orig_batch]
+        next_res = next_res[:orig_batch]
+    scale_out = (
+        scale_t if transposed_scale else jnp.transpose(scale_t).reshape(*leading, 1)
+    )
     return (
-        x_q[:orig_batch].reshape(*leading, k_dim),
-        jnp.transpose(scale_t)[:orig_batch].reshape(*leading, 1),
-        next_res[:orig_batch].reshape(*leading, k_dim),
+        x_q if x.ndim == 2 else x_q.reshape(*leading, k_dim),
+        scale_out,
+        next_res if x.ndim == 2 else next_res.reshape(*leading, k_dim),
     )
 
 
@@ -253,14 +271,23 @@ def rms_norm_fp8_quant(
     eps: float = 1e-6,
     *,
     dtype: Any = jnp.float8_e4m3fn,
+    transposed_scale: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fuse RMSNorm with dynamic per-token FP8 quantization, preserving BF16 rounding."""
     if x.shape[-1] % 128 == 0 and (interpret or get_tpu_version() >= 6):
         return pallas_rms_norm_fp8_quant(
-            x, weight=weight, eps=eps, dtype=dtype, interpret=interpret
+            x,
+            weight=weight,
+            eps=eps,
+            dtype=dtype,
+            transposed_scale=transposed_scale,
+            interpret=interpret,
         )
-    return quantize_fp8_act(rms_norm(x, weight=weight, eps=eps), dtype=dtype)
+    x_q, x_scale = quantize_fp8_act(rms_norm(x, weight=weight, eps=eps), dtype=dtype)
+    if transposed_scale:
+        x_scale = jnp.transpose(x_scale.reshape(-1, 1))
+    return x_q, x_scale
 
 
 def fused_add_rms_norm_fp8_quant(
@@ -270,6 +297,7 @@ def fused_add_rms_norm_fp8_quant(
     eps: float = 1e-6,
     *,
     dtype: Any = jnp.float8_e4m3fn,
+    transposed_scale: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Fuse residual add, RMSNorm, and dynamic per-token FP8 quantization."""
@@ -280,10 +308,13 @@ def fused_add_rms_norm_fp8_quant(
             eps=eps,
             residual=residual,
             dtype=dtype,
+            transposed_scale=transposed_scale,
             interpret=interpret,
         )
     normed, next_res = fused_add_rms_norm(x, residual, weight=weight, eps=eps)
     x_q, x_scale = quantize_fp8_act(normed, dtype=dtype)
+    if transposed_scale:
+        x_scale = jnp.transpose(x_scale.reshape(-1, 1))
     return x_q, x_scale, next_res
 
 
@@ -389,7 +420,7 @@ def apply_rope(
 
 
 def _select_qk_token_block(orig_tokens: int) -> int:
-    if orig_tokens < 128:
+    if orig_tokens <= 320:
         return align_to(max(8, orig_tokens), 8)
     for candidate in (128, 64, 32, 16, 8):
         if orig_tokens % candidate == 0:
@@ -844,6 +875,158 @@ def pallas_qkv_norm_rope_pack(
     )
 
 
+def _unpack_attn_fp8_pallas_kernel(
+    in_ref,
+    out_q_ref,
+    scale_t_ref,
+    *,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    bound: float,
+    unpack_mode: Literal["bitcast_u32", "reshape"],
+) -> None:
+    h_kv, bsz, pairs_per_kv, q_packing, hd = in_ref.shape
+    out_width = h_kv * actual_num_q_heads_per_kv_head * actual_head_dim
+    if unpack_mode == "bitcast_u32":
+        u32_ref = in_ref.bitcast(jnp.uint32)
+        tiles: list[jax.Array] = []
+        for h in range(h_kv):
+            head_u32 = u32_ref.at[h].reshape(bsz * pairs_per_kv, hd)
+            for p in range(pairs_per_kv):
+                w_u32 = head_u32[pl.ds(p, bsz, pairs_per_kv)]
+                g0, g1 = 2 * p, 2 * p + 1
+                if g0 < actual_num_q_heads_per_kv_head:
+                    even = pltpu.bitcast(w_u32 << jnp.uint32(16), jnp.float32)
+                    tiles.append(even[:, :actual_head_dim])
+                if g1 < actual_num_q_heads_per_kv_head:
+                    odd = pltpu.bitcast(w_u32 & jnp.uint32(0xFFFF0000), jnp.float32)
+                    tiles.append(odd[:, :actual_head_dim])
+        flat_f32 = jnp.concatenate(tiles, axis=-1)
+    else:
+        unpacked = (
+            in_ref[...]
+            .swapaxes(0, 1)
+            .reshape(bsz, h_kv, pairs_per_kv * q_packing, hd)[
+                :, :, :actual_num_q_heads_per_kv_head, :actual_head_dim
+            ]
+            .reshape(bsz, out_width)
+        )
+        flat_f32 = unpacked.astype(jnp.float32)
+
+    absmax = jnp.max(jnp.abs(flat_f32), axis=-1, keepdims=True)
+    scale = safe_fp8_scale(absmax, bound)
+    out_q_ref[...] = jnp.clip(flat_f32 / scale, -bound, bound).astype(out_q_ref.dtype)
+    scale_t_ref[...] = jnp.transpose(scale)
+
+
+def pallas_unpack_attn_fp8_quant(
+    out_packed: jax.Array,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    *,
+    dtype: Any = jnp.float8_e4m3fn,
+    unpack_mode: Literal["auto", "bitcast_u32", "reshape"] = "auto",
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Unpack 5D RPA v3 ``out_packed`` in VMEM and quantize per token to ``(attn_q, attn_scale)``."""
+    if out_packed.ndim != 5:
+        raise ValueError(
+            f"Expected 5D packed attention output, got {out_packed.shape=}"
+        )
+    h_kv, orig_b, pairs_per_kv, q_packing, hd = out_packed.shape
+    padded_group = pairs_per_kv * q_packing
+    if not (0 < actual_num_q_heads_per_kv_head <= padded_group):
+        raise ValueError(
+            f"Invalid {actual_num_q_heads_per_kv_head=} for {padded_group=}"
+        )
+    if not (0 < actual_head_dim <= hd):
+        raise ValueError(f"Invalid {actual_head_dim=} for {hd=}")
+
+    out_width = h_kv * actual_num_q_heads_per_kv_head * actual_head_dim
+    if out_width % 128 != 0:
+        raise ValueError(
+            f"pallas_unpack_attn_fp8_quant requires width divisible by 128, got {out_width}"
+        )
+
+    target = jnp.dtype(dtype)
+    bound = float(jnp.finfo(target).max)
+    batch_block = align_to(max(8, orig_b), 8) if orig_b <= 320 else 256
+    padded_b = align_to(orig_b, batch_block)
+    packed_in = (
+        jnp.pad(out_packed, ((0, 0), (0, padded_b - orig_b), (0, 0), (0, 0), (0, 0)))
+        if orig_b < padded_b
+        else out_packed
+    )
+
+    can_bitcast = (
+        out_packed.dtype == jnp.bfloat16
+        and q_packing == 2
+        and actual_head_dim == hd
+        and hd % 128 == 0
+    )
+    if unpack_mode == "auto":
+        resolved_mode: Literal["bitcast_u32", "reshape"] = (
+            "bitcast_u32" if (not interpret and can_bitcast) else "reshape"
+        )
+    else:
+        if unpack_mode == "bitcast_u32" and not can_bitcast:
+            raise ValueError(
+                f"bitcast_u32 unpack requires bfloat16 q_packing=2 actual_head_dim==hd%128==0, got {out_packed.dtype}, {out_packed.shape}, {actual_head_dim=}"
+            )
+        resolved_mode = unpack_mode
+
+    n_grid = padded_b // batch_block
+    b_idx = (lambda _b: 0) if n_grid == 1 else (lambda b: b)
+    vmem_limit_bytes = (
+        32 * 1024 * 1024 if (get_tpu_version() >= 6 and not interpret) else None
+    )
+    interpret_arg: Any = (
+        (True if resolved_mode == "bitcast_u32" else pltpu.InterpretParams())
+        if interpret
+        else False
+    )
+
+    kernel = pl.pallas_call(
+        functools.partial(
+            _unpack_attn_fp8_pallas_kernel,
+            actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+            actual_head_dim=actual_head_dim,
+            bound=bound,
+            unpack_mode=resolved_mode,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(
+                    (h_kv, batch_block, pairs_per_kv, q_packing, hd),
+                    lambda b: (0, b_idx(b), 0, 0, 0),
+                )
+            ],
+            out_specs=[
+                pl.BlockSpec((batch_block, out_width), lambda b: (b_idx(b), 0)),
+                pl.BlockSpec((1, batch_block), lambda b: (0, b_idx(b))),
+            ],
+            grid=(n_grid,),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((padded_b, out_width), target),
+            jax.ShapeDtypeStruct((1, padded_b), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit_bytes,
+        ),
+        interpret=interpret_arg,
+        name=f"unpack_attn_fp8_quant_{batch_block}_{out_width}",
+    )
+
+    attn_q, attn_scale = kernel(packed_in)
+    if orig_b < padded_b:
+        attn_q = attn_q[:orig_b]
+        attn_scale = attn_scale[:, :orig_b]
+    return attn_q, attn_scale
+
+
 __all__ = [
     "apply_rope",
     "build_rope_cache",
@@ -852,6 +1035,7 @@ __all__ = [
     "pallas_qk_norm_rope_pack",
     "pallas_qkv_norm_rope_pack",
     "pallas_rms_norm_fp8_quant",
+    "pallas_unpack_attn_fp8_quant",
     "rms_norm",
     "rms_norm_fp8_quant",
 ]

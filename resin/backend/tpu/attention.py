@@ -77,6 +77,7 @@ def paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     prepared: bool = False,
+    return_packed: bool = False,
     actual_num_q_heads: int | None = None,
     actual_head_dim: int | None = None,
     impl: AttentionImpl | None = None,
@@ -92,6 +93,8 @@ def paged_attention(
     retention match this layer. K/V scales apply only to 8-bit caches.
     """
 
+    if return_packed and not prepared:
+        raise ValueError("return_packed=True requires prepared=True")
     if jnp.dtype(kv_cache.dtype).itemsize != 1:
         k_scale = v_scale = None
     chosen_impl = impl or default_impl()
@@ -103,8 +106,10 @@ def paged_attention(
         if actual_num_q_heads is not None and actual_num_q_heads % tp != 0:
             raise ValueError(f"{actual_num_q_heads=} must be divisible by tp={tp}")
         local_q_heads = None if actual_num_q_heads is None else actual_num_q_heads // tp
+        out_partition = Q_PACKED_PARTITION if return_packed else HEADS
         if chosen_impl is reference.ragged_paged_attention:
             from resin.backend.tpu.kernels.ragged_paged_attention import (
+                pack_outputs,
                 unpack_prepared_inputs,
             )
 
@@ -124,7 +129,7 @@ def paged_attention(
                     actual_num_kv_heads=q_packed.shape[0],
                     actual_head_dim=actual_head_dim,
                 )
-                return reference.ragged_paged_attention(
+                ref_out, ref_cache = reference.ragged_paged_attention(
                     q_u,
                     k_u,
                     v_u,
@@ -139,6 +144,9 @@ def paged_attention(
                     k_scale=k_scale,
                     v_scale=v_scale,
                 )
+                if return_packed:
+                    return pack_outputs(ref_out, q_packed.shape[0]), ref_cache
+                return ref_out, ref_cache
 
             return jax.shard_map(
                 _ref_prepared,
@@ -152,7 +160,7 @@ def paged_attention(
                     P(),
                     P(),
                 ),
-                out_specs=(HEADS, KV_PARTITION),
+                out_specs=(out_partition, KV_PARTITION),
                 check_vma=False,
             )(
                 queries,
@@ -163,6 +171,8 @@ def paged_attention(
                 metadata.cu_q_lens,
                 metadata.distribution,
             )
+
+        extra_kw: dict[str, Any] = {"return_packed": True} if return_packed else {}
 
         def _kernel_prepared(
             q_packed: jax.Array,
@@ -190,6 +200,7 @@ def paged_attention(
                 prepared=True,
                 actual_num_q_heads=local_q_heads,
                 actual_head_dim=actual_head_dim,
+                **extra_kw,
             )
 
         return jax.shard_map(
@@ -204,7 +215,7 @@ def paged_attention(
                 P(),
                 P(),
             ),
-            out_specs=(HEADS, KV_PARTITION),
+            out_specs=(out_partition, KV_PARTITION),
             check_vma=False,
         )(
             queries,

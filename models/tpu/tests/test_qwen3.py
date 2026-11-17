@@ -346,6 +346,7 @@ class TestFp8Weights:
         from resin_models_tpu.qwen3.model import (
             COLUMN,
             ROW,
+            DecodeMatmulMode,
             LayerParams,
             Qwen3Model,
             Qwen3Params,
@@ -440,32 +441,153 @@ class TestFp8Weights:
             ),
             mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
         ):
-            model = Qwen3Model(
-                cfg,
-                mesh,
-                jnp.float8_e4m3fn,
-                page_tokens=256,
-                impl=ragged_paged_attention,
+            export_modes: tuple[DecodeMatmulMode, ...] = (
+                "pallas",
+                "n_split_pallas",
+                "xla",
+                "n_split_xla",
+                "gspmd_xla",
             )
-            for tokens, seqs in ((8, 8), (320, 320), (4096, 320)):
-                inp = ModelInputs(
-                    input_ids=jax.ShapeDtypeStruct((tokens,), jnp.int32, sharding=rep),
-                    positions=jax.ShapeDtypeStruct((tokens,), jnp.int32, sharding=rep),
-                    logits_indices=jax.ShapeDtypeStruct(
-                        (seqs,), jnp.int32, sharding=rep
-                    ),
-                    attention=AttentionMetadata(
-                        jax.ShapeDtypeStruct((seqs,), jnp.int32, sharding=rep),
-                        (jax.ShapeDtypeStruct((seqs * 9,), jnp.int32, sharding=rep),),
-                        jax.ShapeDtypeStruct((seqs + 1,), jnp.int32, sharding=rep),
-                        jax.ShapeDtypeStruct((3,), jnp.int32, sharding=rep),
+            for mode in export_modes:
+                model = Qwen3Model(
+                    cfg,
+                    mesh,
+                    jnp.float8_e4m3fn,
+                    page_tokens=256,
+                    decode_matmul_mode=mode,
+                    impl=ragged_paged_attention,
+                )
+                tokens_to_check = (
+                    ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320), (4096, 320))
+                    if mode == "pallas"
+                    else ((320, 320),)
+                )
+                for tokens, seqs in tokens_to_check:
+                    inp = ModelInputs(
+                        input_ids=jax.ShapeDtypeStruct(
+                            (tokens,), jnp.int32, sharding=rep
+                        ),
+                        positions=jax.ShapeDtypeStruct(
+                            (tokens,), jnp.int32, sharding=rep
+                        ),
+                        logits_indices=jax.ShapeDtypeStruct(
+                            (seqs,), jnp.int32, sharding=rep
+                        ),
+                        attention=AttentionMetadata(
+                            jax.ShapeDtypeStruct((seqs,), jnp.int32, sharding=rep),
+                            (
+                                jax.ShapeDtypeStruct(
+                                    (seqs * 9,), jnp.int32, sharding=rep
+                                ),
+                            ),
+                            jax.ShapeDtypeStruct((seqs + 1,), jnp.int32, sharding=rep),
+                            jax.ShapeDtypeStruct((3,), jnp.int32, sharding=rep),
+                        ),
+                    )
+                    exported = export.export(
+                        jax.jit(model.hidden_states, donate_argnums=(1,)),
+                        platforms=["tpu"],
+                    )(params, caches, inp)
+                    mlir = exported.mlir_module()
+                    assert "tpu_custom_call" in mlir
+                    assert "func.func private @_run(" not in mlir
+
+    def test_decode_matmul_modes_tp2_vs_tp1_parity_and_zero_pmax(
+        self, tmp_path
+    ) -> None:
+        import functools as _ft
+
+        from resin.backend.tpu.kernels import ragged_paged_attention
+        from resin_models_tpu.qwen3.model import DecodeMatmulMode
+
+        devices = jax.devices("cpu")
+        if len(devices) < 2:
+            pytest.skip("needs 2 host devices")
+
+        hd128_dir = tmp_path / "qwen3-decode-modes"
+        hd128_dir.mkdir()
+        values = tiny_qwen3_config()
+        values.update(
+            {
+                "head_dim": 128,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "torch_dtype": "bfloat16",
+                "dtype": "bfloat16",
+            }
+        )
+        torch.manual_seed(29)
+        hd_model = (
+            transformers.Qwen3ForCausalLM(transformers.Qwen3Config.from_dict(values))
+            .to(torch.bfloat16)
+            .eval()
+        )
+        hd_model.save_pretrained(hd128_dir)
+
+        def _run_mode(tp: int, mode: DecodeMatmulMode) -> list[float]:
+            mesh = make_mesh(tp, devices)
+            m, p = load_model(
+                hd128_dir,
+                mesh,
+                page_tokens=8,
+                quantization="fp8",
+                kv_dtype=jnp.float8_e4m3fn,
+            )
+            m.decode_matmul_mode = mode
+            m.decode_n_split_min_tokens = 2
+            m._force_fused_qkv_pack_interpret = True
+            m._force_decode_pallas_interpret = mode in ("pallas", "n_split_pallas")
+            m.impl = _ft.partial(
+                ragged_paged_attention,
+                d_block_sizes=(1, 8, 1, 8),
+                m_block_sizes=(4, 8, 4, 8),
+                interpret=True,
+            )
+            r = TpuRunner(
+                m,
+                p,
+                mesh=mesh,
+                max_seq_len=32,
+                max_num_seqs=2,
+                max_batch_tokens=16,
+                buckets=ShapeBuckets(decode_seqs=(8,), prefill_tokens=(16,)),
+                cache_slab_capacity=32,
+            )
+            if tp == 2 and mode != "gspmd_xla":
+                from resin.backend.tpu.buckets import Bucket
+                from resin.backend.tpu.metadata import empty_inputs
+
+                dec_inp = r._put(empty_inputs(Bucket(8, 8), r.pages_per_seq))
+                dec_jaxpr = jax.make_jaxpr(m.hidden_states)(p, r._arena.caches, dec_inp)
+                assert "pmax" not in str(dec_jaxpr)
+            with closing(
+                Engine(
+                    r,
+                    max_running_requests=2,
+                    context_length=32,
+                    scheduler_config=SchedulerConfig(max_batch_tokens=16),
+                    enable_metrics=False,
+                )
+            ) as eng:
+                lease = eng.submit(
+                    PROMPTS[0],
+                    sampling_params=SamplingParams(
+                        temperature=0.0, max_output_tokens=3, logprobs=True
                     ),
                 )
-                exported = export.export(
-                    jax.jit(model.hidden_states, donate_argnums=(1,)),
-                    platforms=["tpu"],
-                )(params, caches, inp)
-                assert "tpu_custom_call" in exported.mlir_module()
+                evs = []
+                while eng.has_work():
+                    evs.extend(eng.step())
+                del lease
+            assert r.compilations_after_warmup == 0
+            return [ev.logprobs.logprob for ev in evs if ev.logprobs is not None]
+
+        tp1_ref = _run_mode(1, "pallas")
+        for mode in ("pallas", "n_split_pallas", "xla", "n_split_xla", "gspmd_xla"):
+            tp2_lps = _run_mode(2, mode)
+            np.testing.assert_allclose(tp2_lps, tp1_ref, rtol=2e-2, atol=5e-2)
 
     def test_logits_track_the_reference(self, checkpoint) -> None:
         directory, reference = checkpoint

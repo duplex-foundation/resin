@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -42,6 +42,7 @@ from resin.backend.tpu.kernels import (
     fused_add_rms_norm,
     fused_add_rms_norm_fp8_quant,
     pallas_qkv_norm_rope_pack,
+    pallas_unpack_attn_fp8_quant,
     rms_norm,
     rms_norm_fp8_quant,
     sharded_fp8_gate_up_swiglu,
@@ -58,6 +59,15 @@ COLUMN = P(TP_AXIS, None)
 ROW = P(None, TP_AXIS)
 TOKENS_SHARDED = P(TP_AXIS, None)
 _PREFILL_MATMUL_MIN_TOKENS = 512
+
+DecodeMatmulMode = Literal[
+    "auto",
+    "pallas",
+    "n_split_pallas",
+    "xla",
+    "n_split_xla",
+    "gspmd_xla",
+]
 
 Linear = jax.Array | Fp8Weight
 
@@ -118,8 +128,12 @@ class Qwen3Model:
     page_tokens: int = 256
     impl: AttentionImpl | None = None
     prefill_matmul_backend: MatmulBackend = "auto"
+    decode_matmul_mode: DecodeMatmulMode = "auto"
+    decode_n_split_min_tokens: int = 128
+    fuse_unpack_attn_quant: bool = True
     sequence_parallel_min_tokens: int = _PREFILL_MATMUL_MIN_TOKENS
     _force_fused_qkv_pack_interpret: bool = field(default=False, repr=False)
+    _force_decode_pallas_interpret: bool = field(default=False, repr=False)
     vocab_size: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -139,6 +153,24 @@ class Qwen3Model:
             ),
         )
 
+    def _resolve_decode_matmul_mode(self, tokens: int) -> DecodeMatmulMode:
+        del tokens
+        if self.decode_matmul_mode != "auto":
+            return self.decode_matmul_mode
+        return "pallas"
+
+    def _can_use_fused_qkv_pack(
+        self,
+        act_dtype: Any,
+        rope_cache: tuple[jax.Array, jax.Array] | None,
+    ) -> bool:
+        return (
+            self.config.head_dim == 128
+            and jnp.dtype(act_dtype) == jnp.bfloat16
+            and rope_cache is not None
+            and (get_tpu_version() >= 6 or self._force_fused_qkv_pack_interpret)
+        )
+
     def _linear(
         self,
         x: jax.Array,
@@ -147,8 +179,11 @@ class Qwen3Model:
         *,
         x_scale: jax.Array | None = None,
         x_abs_max: jax.Array | None = None,
+        sync_tp_scale: bool = True,
+        n_split: int = 1,
         out_dtype: Any = None,
         backend: MatmulBackend = "auto",
+        interpret: bool = False,
     ) -> jax.Array:
         target_dtype = x.dtype if out_dtype is None else out_dtype
         if isinstance(weight, Fp8Weight):
@@ -160,8 +195,11 @@ class Qwen3Model:
                 mesh=self.mesh,
                 x_scale=x_scale,
                 x_abs_max=x_abs_max,
+                sync_tp_scale=sync_tp_scale,
+                n_split=n_split,
                 out_dtype=target_dtype,
                 backend=backend,
+                interpret=interpret,
             )
         return x @ weight.T
 
@@ -172,6 +210,8 @@ class Qwen3Model:
         kv_cache: jax.Array,
         inputs: ModelInputs,
         rope_cache: tuple[jax.Array, jax.Array] | None,
+        *,
+        return_packed: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         config = self.config
         eps = config.rms_norm_eps
@@ -183,12 +223,7 @@ class Qwen3Model:
         local_heads = heads // tp
         local_kv_heads = kv_heads // tp
 
-        use_fused_pack = (
-            head_dim == 128
-            and qkv_out.dtype == jnp.bfloat16
-            and rope_cache is not None
-            and (get_tpu_version() >= 6 or self._force_fused_qkv_pack_interpret)
-        )
+        use_fused_pack = self._can_use_fused_qkv_pack(qkv_out.dtype, rope_cache)
         if use_fused_pack:
             assert rope_cache is not None
             cos_full, sin_signed = rope_cache
@@ -237,6 +272,7 @@ class Qwen3Model:
                 mesh=self.mesh,
                 sm_scale=head_dim**-0.5,
                 prepared=True,
+                return_packed=return_packed,
                 actual_num_q_heads=heads,
                 actual_head_dim=head_dim,
                 impl=self.impl,
@@ -456,16 +492,72 @@ class Qwen3Model:
         eps = config.rms_norm_eps
         tokens = inputs.input_ids.shape[0]
         q_width = config.num_attention_heads * config.head_dim
+        group_size = config.num_attention_heads // config.num_key_value_heads
+        tp = tp_size(self.mesh)
         layers = params.layers
         is_prefill = tokens >= _PREFILL_MATMUL_MIN_TOKENS
-        backend = self.prefill_matmul_backend if is_prefill else "auto"
+        dec_interp = (not is_prefill) and self._force_decode_pallas_interpret
+        if is_prefill:
+            col_backend: MatmulBackend = self.prefill_matmul_backend
+            gu_backend: MatmulBackend = self.prefill_matmul_backend
+            row_backend: MatmulBackend = self.prefill_matmul_backend
+            row_sync_tp_scale = True
+            row_n_split = 1
+        else:
+            mode = self._resolve_decode_matmul_mode(tokens)
+            per_die_scale = (q_width // tp) >= 128 and (
+                config.intermediate_size // tp
+            ) >= 128
+            if mode == "gspmd_xla":
+                col_backend = "gspmd_xla"
+                gu_backend = "gspmd_xla"
+                row_backend = "gspmd_xla"
+                row_sync_tp_scale = True
+                row_n_split = 1
+            elif mode in ("xla", "n_split_xla"):
+                col_backend = "xla"
+                gu_backend = "auto"
+                row_backend = "xla"
+                row_sync_tp_scale = not per_die_scale
+                row_n_split = (
+                    2
+                    if (
+                        mode == "n_split_xla"
+                        and tp > 1
+                        and tokens >= self.decode_n_split_min_tokens
+                        and config.hidden_size % 2 == 0
+                    )
+                    else 1
+                )
+            else:
+                col_backend = "pallas" if dec_interp else "auto"
+                gu_backend = "pallas" if dec_interp else "auto"
+                row_backend = "pallas" if dec_interp else "auto"
+                row_sync_tp_scale = not per_die_scale
+                can_split_pallas = config.hidden_size % 2 == 0 and (
+                    (config.hidden_size // 2) % 128 == 0
+                    or not (get_tpu_version() >= 7 or dec_interp)
+                )
+                row_n_split = (
+                    2
+                    if (
+                        mode == "n_split_pallas"
+                        and tp > 1
+                        and tokens >= self.decode_n_split_min_tokens
+                        and can_split_pallas
+                    )
+                    else 1
+                )
+
         rep_2d = P(None, None)
 
         def _rep_norm_quant(
             x_in: jax.Array, norm_w: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
             return jax.shard_map(
-                lambda xl, nw: rms_norm_fp8_quant(xl, nw, eps),
+                lambda xl, nw: rms_norm_fp8_quant(
+                    xl, nw, eps, transposed_scale=True, interpret=dec_interp
+                ),
                 mesh=self.mesh,
                 in_specs=(rep_2d, P()),
                 out_specs=(rep_2d, rep_2d),
@@ -476,7 +568,9 @@ class Qwen3Model:
             delta: jax.Array, res: jax.Array, norm_w: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return jax.shard_map(
-                lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(dl, rl, nw, eps),
+                lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(
+                    dl, rl, nw, eps, transposed_scale=True, interpret=dec_interp
+                ),
                 mesh=self.mesh,
                 in_specs=(rep_2d, rep_2d, P()),
                 out_specs=(rep_2d, rep_2d, rep_2d),
@@ -485,6 +579,14 @@ class Qwen3Model:
 
         x = params.embed[inputs.input_ids]
         act_dtype = x.dtype
+        use_fused_unpack_quant = (
+            self.fuse_unpack_attn_quant
+            and not is_prefill
+            and not row_sync_tp_scale
+            and self._can_use_fused_qkv_pack(act_dtype, params.rope_cache)
+            and (q_width // tp) % 128 == 0
+        )
+
         h_q, h_scale = _rep_norm_quant(x, layers[0].input_norm)
         layer_caches = []
         num_layers = len(layers)
@@ -501,52 +603,84 @@ class Qwen3Model:
                 COLUMN,
                 x_scale=h_scale,
                 out_dtype=act_dtype,
-                backend=backend,
+                backend=col_backend,
+                interpret=dec_interp,
             )
-            attended, kv_cache = self._attend_qkv(
-                qkv_out, weights, kv_cache, inputs, params.rope_cache
-            )
-            layer_caches.append(kv_cache)
-
-            o_out = self._linear(
-                attended.reshape(tokens, q_width),
-                weights.o,
-                ROW,
-                out_dtype=act_dtype,
-                backend=backend,
-            )
-            mlp_q, mlp_scale, x = _rep_add_norm_quant(o_out, x, weights.post_norm)
-
-            if is_prefill:
-                gated, gated_absmax = sharded_fp8_gate_up_swiglu(
-                    mlp_q,
-                    mlp_scale,
-                    weights.gate_up.qvalue,
-                    weights.gate_up.scale,
+            if use_fused_unpack_quant:
+                att_packed, kv_cache = self._attend_qkv(
+                    qkv_out,
+                    weights,
+                    kv_cache,
+                    inputs,
+                    params.rope_cache,
+                    return_packed=True,
+                )
+                layer_caches.append(kv_cache)
+                o_q_dtype = weights.o.qvalue.dtype
+                att_q, att_scale = jax.shard_map(
+                    lambda packed_l, _dt=o_q_dtype: pallas_unpack_attn_fp8_quant(
+                        packed_l,
+                        group_size,
+                        config.head_dim,
+                        dtype=_dt,
+                        interpret=self._force_fused_qkv_pack_interpret,
+                    ),
                     mesh=self.mesh,
-                    sequence_parallel=False,
+                    in_specs=Q_PACKED_PARTITION,
+                    out_specs=(ROW, P(TP_AXIS, None)),
+                    check_vma=False,
+                )(att_packed)
+                o_out = self._linear(
+                    att_q,
+                    weights.o,
+                    ROW,
+                    x_scale=att_scale,
+                    sync_tp_scale=False,
+                    n_split=row_n_split,
                     out_dtype=act_dtype,
-                    backend=backend,
+                    backend=row_backend,
+                    interpret=dec_interp,
                 )
             else:
-                gate_up_out = self._linear(
-                    mlp_q,
-                    weights.gate_up,
-                    COLUMN,
-                    x_scale=mlp_scale,
-                    out_dtype=act_dtype,
-                    backend="auto",
+                attended, kv_cache = self._attend_qkv(
+                    qkv_out, weights, kv_cache, inputs, params.rope_cache
                 )
-                gated = _per_shard_swiglu(gate_up_out, self.mesh)
-                gated_absmax = None
+                layer_caches.append(kv_cache)
+                o_out = self._linear(
+                    attended.reshape(tokens, q_width),
+                    weights.o,
+                    ROW,
+                    sync_tp_scale=row_sync_tp_scale,
+                    n_split=row_n_split,
+                    out_dtype=act_dtype,
+                    backend=row_backend,
+                    interpret=dec_interp,
+                )
 
+            mlp_q, mlp_scale, x = _rep_add_norm_quant(o_out, x, weights.post_norm)
+
+            gated, gated_absmax = sharded_fp8_gate_up_swiglu(
+                mlp_q,
+                mlp_scale,
+                weights.gate_up.qvalue,
+                weights.gate_up.scale,
+                mesh=self.mesh,
+                sequence_parallel=False,
+                sync_tp_scale=row_sync_tp_scale,
+                out_dtype=act_dtype,
+                backend=gu_backend,
+                interpret=dec_interp,
+            )
             down_out = self._linear(
                 gated,
                 weights.down,
                 ROW,
                 x_abs_max=gated_absmax,
+                sync_tp_scale=row_sync_tp_scale,
+                n_split=row_n_split,
                 out_dtype=act_dtype,
-                backend=backend,
+                backend=row_backend,
+                interpret=dec_interp,
             )
             if idx + 1 < num_layers:
                 h_q, h_scale, x = _rep_add_norm_quant(
@@ -600,6 +734,7 @@ __all__ = [
     "COLUMN",
     "ROW",
     "TOKENS_SHARDED",
+    "DecodeMatmulMode",
     "LayerParams",
     "Linear",
     "Qwen3Model",

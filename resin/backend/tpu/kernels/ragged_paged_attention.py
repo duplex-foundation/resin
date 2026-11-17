@@ -185,6 +185,40 @@ def prepare_inputs(
     return q_packed, merge_kv(k, v)
 
 
+def pack_outputs(out: jax.Array, actual_num_kv_heads: int) -> jax.Array:
+    """Pack 3D ``[tokens, q_heads, head_dim]`` attention output into 5D RPA v3 layout."""
+    max_num_tokens, actual_num_q_heads, actual_head_dim = out.shape
+    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    q_packing = get_dtype_packing(out.dtype)
+    num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    head_dim = align_to(actual_head_dim, 128)
+    return (
+        jnp.pad(
+            out.reshape(
+                max_num_tokens,
+                actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head,
+                actual_head_dim,
+            ),
+            (
+                (0, 0),
+                (0, 0),
+                (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
+        .reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            head_dim,
+        )
+        .swapaxes(0, 1)
+    )
+
+
 def prepare_outputs(
     out: jax.Array,
     actual_num_q_heads_per_kv_head: int,
@@ -863,6 +897,7 @@ _DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
         "v_scale",
         "q_scale",
         "prepared",
+        "return_packed",
         "actual_num_q_heads",
         "actual_head_dim",
         "use_causal_mask",
@@ -893,6 +928,7 @@ def ragged_paged_attention(
     v_scale: float | None = None,
     q_scale: float | None = None,
     prepared: bool = False,
+    return_packed: bool = False,
     actual_num_q_heads: int | None = None,
     actual_head_dim: int | None = None,
     use_causal_mask: bool = True,
@@ -963,7 +999,7 @@ def ragged_paged_attention(
         else:
             assert values is not None
             cpu_q, cpu_k, cpu_v = queries, keys, values
-        return _cpu_ragged_paged_attention(
+        cpu_out, cpu_cache = _cpu_ragged_paged_attention(
             cpu_q,
             cpu_k,
             cpu_v,
@@ -979,6 +1015,9 @@ def ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         )
+        if return_packed:
+            return pack_outputs(cpu_out, cpu_k.shape[1]), cpu_cache
+        return cpu_out, cpu_cache
 
     if prepared:
         actual_num_kv_heads = queries.shape[0]
@@ -1122,17 +1161,12 @@ def ragged_paged_attention(
         )
 
         if pin_hbm:
-
-            @jax.jit
-            def _run(prefetches, q_in, kv_in, cache_in):
-                return kernel(
-                    *prefetches,
-                    pltpu.with_memory_space_constraint(q_in, pltpu.HBM),
-                    pltpu.with_memory_space_constraint(kv_in, pltpu.HBM),
-                    pltpu.with_memory_space_constraint(cache_in, pltpu.HBM),
-                )
-
-            return _run(scalar_prefetches, cur_q, kv, cur_cache)
+            return kernel(
+                *scalar_prefetches,
+                pltpu.with_memory_space_constraint(cur_q, pltpu.HBM),
+                pltpu.with_memory_space_constraint(kv, pltpu.HBM),
+                pltpu.with_memory_space_constraint(cur_cache, pltpu.HBM),
+            )
         return kernel(*scalar_prefetches, cur_q, kv, cur_cache)
 
     def _blocks_for(
@@ -1182,6 +1216,8 @@ def ragged_paged_attention(
         lambda args: args,
         (q, kv_cache),
     )
+    if return_packed:
+        return q, kv_cache
     return (
         prepare_outputs(q, actual_num_q_heads_per_kv_head, eff_head_dim),
         kv_cache,
@@ -1196,7 +1232,9 @@ __all__ = [
     "get_rpa_block_sizes",
     "get_vmem_estimate_bytes",
     "merge_kv",
+    "pack_outputs",
     "prepare_inputs",
+    "prepare_outputs",
     "quantize_kv",
     "ragged_paged_attention",
     "static_validate_inputs",
