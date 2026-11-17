@@ -1222,10 +1222,12 @@ impl AdmissionEstimate<'_> {
     ) -> Result<u64, CachePoolError> {
         let mut parents = 0u64;
         for (index, group) in self.layout.groups().iter().copied().enumerate() {
-            let count = group.active_blocks(context).1;
-            let mut added = u64::from(count);
+            // Owned pages stay resident even when the context estimate shrinks.
+            let owned = pages.map_or(0, |pages| pages.groups()[index].pages().len());
+            let count = (group.active_blocks(context).1 as usize).max(owned);
+            let mut added = count as u64;
             if let Some(pages) = pages {
-                for page in pages.groups()[index].pages().iter().take(count as usize) {
+                for page in pages.groups()[index].pages().iter().take(count) {
                     self.occupied_parents[index].insert(page.handle().parent());
                     if group.retention() == KvRetention::FullContext
                         && !group.is_recurrent()
@@ -1611,6 +1613,24 @@ mod tests {
         }
         resources.pool.retire_cached_prefix(prefix).unwrap();
         assert_eq!(resources.pool().free_parent_count(), 8);
+    }
+
+    #[test]
+    fn admission_estimate_never_counts_fewer_pages_than_a_request_owns() {
+        let layout = KvLayout::new(
+            8,
+            vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let mut request = resources
+            .attach(RequestId::new(NonZeroU64::new(1).unwrap()), 0)
+            .unwrap();
+        resources.ensure_context(&mut request, 0, 12).unwrap();
+        let mut estimate = resources.admission_estimate();
+        assert_eq!(estimate.include(Some(&request), 4).unwrap(), 3);
+        drop(estimate);
+        resources.retire(request).unwrap();
     }
 
     #[test]

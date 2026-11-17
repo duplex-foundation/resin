@@ -2422,3 +2422,181 @@ fn a_displaced_rejected_request_does_not_block_a_higher_priority_request() {
     assert_eq!(rejected.take_result().unwrap(), [4]);
     assert_eq!(engine.cache_free_parent_count(), Some(3));
 }
+
+struct LongPromptLoad {
+    requests: usize,
+    capacity: u32,
+    prompt_base: usize,
+    prompt_step: usize,
+    output: usize,
+    chunk: u32,
+}
+
+const BLOCK: u32 = 16;
+
+fn drain_oversubscribed_long_prompts(load: LongPromptLoad, conservativeness: f64) -> u64 {
+    let context = (load.prompt_base + load.prompt_step * load.requests + load.output + 64) as u32;
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    load.capacity,
+                    vec![KvGroupLayout::new(BLOCK, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 2,
+            max_batch_tokens: NonZeroU32::new(load.chunk),
+            prefill_chunk_size: NonZeroU32::new(load.chunk),
+        },
+        load.requests,
+        context,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(load.chunk),
+            prefill_chunk_size: NonZeroU32::new(load.chunk).unwrap(),
+            schedule_conservativeness: conservativeness,
+        },
+        false,
+    )
+    .unwrap();
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let handles = (0..load.requests)
+        .map(|index| {
+            // Distinct leading tokens keep every prompt private to its request.
+            let prompt = vec![1 + index as u32; load.prompt_base + index * load.prompt_step];
+            engine.submit(input(prompt, load.output)).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut steps = 0;
+    while engine.has_work() {
+        steps += 1;
+        assert!(steps < 30_000, "engine livelocked with work still queued");
+        let plan = engine
+            .prepare_overlap_step(&mut model, None)
+            .unwrap()
+            .expect("queued work always yields a plan");
+        let tokens = plan
+            .token_indptr
+            .windows(2)
+            .map(|range| plan.token_ids[range[1] as usize - 1] + 1)
+            .collect::<Vec<_>>();
+        let offsets = (0..=tokens.len() as u32).collect::<Vec<_>>();
+        engine
+            .complete_step_with(&mut model, TokenRows::new(&tokens, &offsets), Ok)
+            .unwrap();
+    }
+    for handle in &handles {
+        assert_eq!(handle.take_result().unwrap().len(), load.output);
+    }
+    assert_eq!(
+        engine.cache_free_parent_count(),
+        Some(load.capacity as usize)
+    );
+    engine.metrics_snapshot().unwrap().retracted_requests
+}
+
+const OVERSUBSCRIBED: LongPromptLoad = LongPromptLoad {
+    requests: 40,
+    capacity: 150,
+    prompt_base: 130,
+    prompt_step: 2,
+    output: 700,
+    chunk: 64,
+};
+
+#[test]
+fn oversubscribed_multi_chunk_long_prompts_drain_without_livelock() {
+    let retracted = drain_oversubscribed_long_prompts(OVERSUBSCRIBED, 1.0);
+    assert!(retracted <= 16, "{retracted} retractions");
+}
+
+#[test]
+fn aggressive_conservativeness_zero_drains_multi_chunk_oversubscribed_queue() {
+    let retracted = drain_oversubscribed_long_prompts(OVERSUBSCRIBED, 0.0);
+    assert!(retracted <= 16, "{retracted} retractions");
+}
+
+#[test]
+fn waiting_chunk_backfill_never_retracts_an_in_progress_running_prefill() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    30,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 2,
+            ..Default::default()
+        },
+        16,
+        128,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(32),
+            prefill_chunk_size: NonZeroU32::new(16).unwrap(),
+            schedule_conservativeness: 0.0,
+        },
+        false,
+    )
+    .unwrap();
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    // After four decodes each of seven requests owns three blocks but, at
+    // ratio zero, an unfloored estimate counts only two.
+    for index in 0..7 {
+        engine.submit(input(vec![100 + index; 4], 50)).unwrap();
+    }
+    for _ in 0..5 {
+        engine.step(&mut model).unwrap();
+    }
+    let running = engine.submit(input(vec![1; 32], 2)).unwrap();
+    engine.step(&mut model).unwrap();
+    engine.submit(input(vec![2; 32], 2)).unwrap();
+
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(plan.sequence_ids, [running.id()]);
+    assert_eq!(plan.token_indptr, [0, 16]);
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[34], &[0, 1]), Ok)
+        .unwrap();
+    assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 0);
+}
+
+#[test]
+fn overlap_admission_skips_wide_lookahead_while_requests_wait_in_queue() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    64,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            max_accepted_per_step: 4,
+            ..Default::default()
+        },
+        1,
+        256,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 10], 40)).unwrap();
+    engine.submit(input(vec![10; 10], 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 4]);
+    assert!(!engine.retain_continuation(&plan));
+}
