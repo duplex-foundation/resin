@@ -45,7 +45,8 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--schedule-conservativeness",
         type=float,
-        help="admission headroom for future output tokens; defaults to the workload's",
+        default=1.0,
+        help="scales the admission reserve for future output tokens; lower admits more",
     )
     parser.add_argument(
         "--prefill-chunk-size",
@@ -65,11 +66,6 @@ def main(argv=None) -> None:
         spec.prefill_chunk_size
         if args.prefill_chunk_size is None
         else args.prefill_chunk_size
-    )
-    conservativeness = (
-        workload.schedule_conservativeness
-        if args.schedule_conservativeness is None
-        else args.schedule_conservativeness
     )
     started = time.perf_counter()
     runner = create_runner(
@@ -92,7 +88,7 @@ def main(argv=None) -> None:
         scheduler_config=SchedulerConfig(
             max_batch_tokens=chunk,
             prefill_chunk_size=chunk,
-            schedule_conservativeness=conservativeness,
+            schedule_conservativeness=args.schedule_conservativeness,
         ),
     )
     warmup = getattr(runner, "benchmark_metadata", {}).get("warmup_seconds")
