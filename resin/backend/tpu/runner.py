@@ -122,7 +122,10 @@ class TpuRunner:
     JAX's persistent compile cache through its ``JAX_COMPILATION_CACHE_DIR``
     environment variables. The Engine's ``max_running_requests`` must not
     exceed ``max_num_seqs``, and its ``context_length`` must not exceed
-    ``max_seq_len``.
+    ``max_seq_len``. With ``mixed_prefill_decode=True`` (off by default) the
+    Engine batches running decode rows with prefill chunks, so decoding
+    continues while prompts arrive; the ragged attention kernel serves both
+    kinds of row in one step.
     """
 
     parallelism_capabilities = ParallelismCapabilities()
@@ -141,6 +144,7 @@ class TpuRunner:
         memory_utilization: float = 0.9,
         workspace_bytes: int | None = None,
         cache_slab_capacity: int | None = None,
+        mixed_prefill_decode: bool = False,
     ) -> None:
         if min(max_seq_len, max_num_seqs, max_batch_tokens) <= 0:
             raise ValueError("runner limits must be positive")
@@ -183,6 +187,7 @@ class TpuRunner:
             prefill_chunk_size=chunk_tokens,
             continuation_prefill=True,
             cache_layout=self.cache_layout,
+            mixed_prefill_decode=mixed_prefill_decode,
         )
         self.benchmark_metadata: dict[str, Any] = {
             "kv_cache_dtype": str(jnp.dtype(specs[0].dtype)),

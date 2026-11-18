@@ -7,6 +7,8 @@ pub struct PlanningConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: NonZeroU32,
     pub checkpoint_alignment: Option<NonZeroU32>,
+    /// Accept running decode rows ahead of prefill rows in one dispatch.
+    pub allow_mixed_phases: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +42,18 @@ pub fn schedule_ready_prefix(
     let Some(first) = requests.first() else {
         return Ok(Vec::new());
     };
-    if requests.iter().any(|request| request.phase != first.phase) {
+    let phases_valid = if config.allow_mixed_phases {
+        let first_prefill = requests
+            .iter()
+            .position(|request| request.phase == Phase::Prefill)
+            .unwrap_or(requests.len());
+        requests[first_prefill..]
+            .iter()
+            .all(|request| request.phase == Phase::Prefill)
+    } else {
+        requests.iter().all(|request| request.phase == first.phase)
+    };
+    if !phases_valid {
         return Err(PlanningError::MixedPhases);
     }
 
@@ -140,6 +153,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(3),
                 prefill_chunk_size: NonZeroU32::new(2).unwrap(),
                 checkpoint_alignment: None,
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -158,6 +172,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4),
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -174,6 +189,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(50).unwrap(),
                 checkpoint_alignment: None,
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -188,6 +204,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -200,6 +217,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -212,6 +230,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -229,6 +248,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4096),
                 prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(64),
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -252,6 +272,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                allow_mixed_phases: false,
             },
         )
         .unwrap();
@@ -275,9 +296,60 @@ mod tests {
                     max_batch_tokens: None,
                     prefill_chunk_size: NonZeroU32::new(4).unwrap(),
                     checkpoint_alignment: None,
+                    allow_mixed_phases: false,
                 },
             ),
             Err(PlanningError::MixedPhases)
         );
+    }
+
+    fn decode() -> RequestProgress {
+        RequestProgress {
+            phase: Phase::Decode,
+            prefill_length: 4,
+            logical_context: 4,
+            sample_at_prefill_end: false,
+            atomic_prefill_spans: Vec::new(),
+        }
+    }
+
+    fn mixed_config(budget: u32) -> PlanningConfig {
+        PlanningConfig {
+            max_batch_tokens: NonZeroU32::new(budget),
+            prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+            checkpoint_alignment: None,
+            allow_mixed_phases: true,
+        }
+    }
+
+    #[test]
+    fn mixed_phases_spend_one_budget_token_per_decode_row_before_prefill() {
+        let steps =
+            schedule_ready_prefix(&[decode(), decode(), prefill(8, 0)], mixed_config(5)).unwrap();
+        let counts = steps
+            .iter()
+            .map(|step| (step.phase, step.tokens.count.get()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            [(Phase::Decode, 1), (Phase::Decode, 1), (Phase::Prefill, 3)]
+        );
+        assert!(steps[0].sample && steps[1].sample && !steps[2].sample);
+    }
+
+    #[test]
+    fn mixed_phases_reject_decode_rows_behind_prefill_rows() {
+        assert_eq!(
+            schedule_ready_prefix(&[prefill(8, 0), decode()], mixed_config(16)),
+            Err(PlanningError::MixedPhases)
+        );
+    }
+
+    #[test]
+    fn decode_rows_can_exhaust_the_budget_before_any_prefill_row() {
+        let steps =
+            schedule_ready_prefix(&[decode(), decode(), prefill(8, 0)], mixed_config(2)).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|step| step.phase == Phase::Decode));
     }
 }

@@ -17,6 +17,7 @@ from jax.sharding import NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from resin import CacheRetention, Engine, SamplingParams, SchedulerConfig  # noqa: E402
+from resin.backend.plans import BatchView  # noqa: E402
 from resin.backend.tpu.arena import KvCacheSpec  # noqa: E402
 from resin.backend.tpu.attention import paged_attention, quantize_kv  # noqa: E402
 from resin.backend.tpu.buckets import Bucket, ShapeBuckets  # noqa: E402
@@ -183,7 +184,12 @@ BUCKETS = ShapeBuckets(decode_seqs=(2, 4), prefill_tokens=(8, 16, 32))
 
 
 def _runner(
-    tp: int = 1, *, prefill_chunk_size=None, cache_slab_capacity=48, **model_options
+    tp: int = 1,
+    *,
+    prefill_chunk_size=None,
+    cache_slab_capacity=48,
+    mixed_prefill_decode=None,
+    **model_options,
 ):
     devices = jax.devices("cpu")
     if len(devices) < tp:
@@ -201,6 +207,11 @@ def _runner(
         prefill_chunk_size=prefill_chunk_size,
         buckets=BUCKETS,
         cache_slab_capacity=cache_slab_capacity,
+        **(
+            {}
+            if mixed_prefill_decode is None
+            else dict(mixed_prefill_decode=mixed_prefill_decode)
+        ),
     )
     return runner, model, params
 
@@ -435,3 +446,63 @@ class TestTpuRunner:
         outputs = _generate(engine, [[1] * 30], max_output_tokens=2)
         assert outputs == [model.dense_greedy(params, [1] * 30, 2)]
         assert runner.compilations_after_warmup == 0
+
+
+class TestMixedPrefillDecode:
+    @staticmethod
+    def _staggered(runner, prompts, *, mixed: bool):
+        decode_rows: list[tuple[int, int]] = []
+        forward = runner.forward
+
+        def spy(plan):
+            decode_rows.append(
+                (BatchView.from_plan(plan).decode_rows, plan.num_sequences)
+            )
+            return forward(plan)
+
+        runner.forward = spy
+        assert runner.runner_config.mixed_prefill_decode is mixed
+        with closing(_engine(runner)) as engine:
+            leases = [
+                engine.submit(
+                    prompts[0],
+                    sampling_params=SamplingParams(
+                        temperature=0.0, max_output_tokens=8
+                    ),
+                )
+            ]
+            outputs: dict[int, list[int]] = {int(leases[0]): []}
+            for _ in range(3):
+                for event in engine.step(allow_overlap=False):
+                    outputs[event.request_id].append(event.token_id)
+            for prompt in prompts[1:]:
+                lease = engine.submit(
+                    prompt,
+                    sampling_params=SamplingParams(
+                        temperature=0.0, max_output_tokens=8
+                    ),
+                )
+                leases.append(lease)
+                outputs[int(lease)] = []
+            while engine.has_work():
+                for event in engine.step(allow_overlap=False):
+                    outputs[event.request_id].append(event.token_id)
+        return [outputs[int(lease)] for lease in leases], decode_rows
+
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_decoders_share_steps_with_chunked_prefills_and_match_dense(
+        self, tp
+    ) -> None:
+        runner, model, params = _runner(
+            tp, prefill_chunk_size=4, mixed_prefill_decode=True
+        )
+        outputs, steps = self._staggered(runner, PROMPTS, mixed=True)
+        assert runner.compilations_after_warmup == 0
+        assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
+        assert any(0 < decode < rows for decode, rows in steps), steps
+
+    def test_decode_and_prefill_stay_in_separate_steps_by_default(self) -> None:
+        runner, model, params = _runner(1, prefill_chunk_size=4)
+        outputs, steps = self._staggered(runner, PROMPTS, mixed=False)
+        assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
+        assert not any(0 < decode < rows for decode, rows in steps), steps

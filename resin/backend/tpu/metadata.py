@@ -12,7 +12,6 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from resin import BatchPhase
 from resin.backend.plans import CacheGroupView, PagedCachePlan
 from resin.backend.tpu.buckets import Bucket
 
@@ -88,8 +87,9 @@ def build_inputs(
     cu_q_lens = _padded(batch.token_indptr, bucket.seqs + 1, fill=tokens)
     logits_indices = _padded(batch.last_token_indices, bucket.seqs)
     # RPA v3 runs its [i, j) prefill range only with a static chunk size, so
-    # variable-length prefill rows go to the mixed range [j, k).
-    decode_rows = rows if plan.phase == BatchPhase.DECODE else 0
+    # variable-length prefill rows go to the mixed range [j, k). A mixed
+    # prefill plan leads with its decode rows, which keep the decode range.
+    decode_rows = batch.decode_rows
     distribution = np.array([decode_rows, decode_rows, rows], dtype=np.int32)
     tables = tuple(
         page_table(group, rows, bucket.seqs, width)

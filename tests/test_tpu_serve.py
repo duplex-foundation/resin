@@ -73,7 +73,16 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
 
     def create_runner(*args, **kwargs):
         seen["runner"] = (args, kwargs)
-        return type("Runner", (), {"benchmark_metadata": {"warmup_seconds": 1.5}})()
+        return type(
+            "Runner",
+            (),
+            {
+                "benchmark_metadata": {
+                    "warmup_seconds": 1.5,
+                    "hbm_headroom_bytes": 1_160_000_000,
+                }
+            },
+        )()
 
     def create_recipe(*args, **kwargs):
         seen["recipe"] = args
@@ -124,6 +133,7 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert kwargs["max_batch_size"] == 320
     assert kwargs["prefill_chunk_size"] == 4096
     assert kwargs["draft_tokens"] == 0
+    assert kwargs["mixed_prefill_decode"] is False
     assert seen["engine"]["prefix_cache"] is False
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 4096,
@@ -133,7 +143,9 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert seen["engine"]["context_length"] == 9216
     assert seen["engine"]["max_running_requests"] == 320
     assert seen["serve"] == ("127.0.0.1", 9)
-    assert "warmup 1.5s" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "warmup 1.5s" in out
+    assert "hbm headroom 1.16 GB/die" in out
     assert os.environ["JAX_COMPILATION_CACHE_DIR"]
     with pytest.raises(SystemExit):
         tpu_serve.main(["--model", "qwen3-32b", "--checkpoint", str(checkpoint)])
@@ -183,9 +195,11 @@ def test_serve_flags_override_the_chunk_and_conservativeness(monkeypatch, tmp_pa
             "0.15",
             "--prefill-chunk-size",
             "8192",
+            "--mixed-prefill-decode",
         ]
     )
     assert seen["runner"]["prefill_chunk_size"] == 8192
+    assert seen["runner"]["mixed_prefill_decode"] is True
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 8192,
         "prefill_chunk_size": 8192,

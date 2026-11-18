@@ -543,6 +543,75 @@ class TestRaggedPagedAttention:
             atol=3e-2,
         )
 
+    @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+    def test_pallas_interpret_split_distribution_decode_rows_then_prefill_row(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        rng = np.random.default_rng(23)
+        fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale, v_scale = (0.5, 0.25) if fp8 else (None, None)
+        page_size, head_dim, q_heads, kv_heads = 8, 128, 4, 2
+        cache = jnp.asarray(
+            rng.standard_normal(
+                get_kv_cache_shape(8, page_size, kv_heads, head_dim, kv_dtype)
+            ),
+            kv_dtype,
+        )
+        q = jnp.asarray(rng.standard_normal((8, q_heads, head_dim)), jnp.bfloat16)
+        k = quantize_kv(
+            jnp.asarray(rng.standard_normal((8, kv_heads, head_dim)), jnp.bfloat16),
+            kv_dtype,
+            k_scale,
+        )
+        v = quantize_kv(
+            jnp.asarray(rng.standard_normal((8, kv_heads, head_dim)), jnp.bfloat16),
+            kv_dtype,
+            v_scale,
+        )
+        # Rows 0 and 1 decode one token each (contexts 8 and 3); row 2 continues
+        # a prefill with 5 new tokens after 2 cached ones.
+        kv_lens = jnp.array([9, 4, 7, 0], jnp.int32)
+        cu_q_lens = jnp.array([0, 1, 2, 7, 7], jnp.int32)
+        pages = jnp.array([5, 1, 3, 0, 6, 0, 0, 0], jnp.int32)
+        distribution = jnp.array([2, 2, 3], jnp.int32)
+        kwargs = dict(sm_scale=head_dim**-0.5, k_scale=k_scale, v_scale=v_scale)
+
+        out, updated = ragged_paged_attention(
+            q,
+            k,
+            v,
+            cache,
+            kv_lens,
+            pages,
+            cu_q_lens,
+            distribution,
+            d_block_sizes=(1, 8, 1, 8),
+            m_block_sizes=(4, 8, 2, 8),
+            interpret=True,
+            **kwargs,
+        )
+        ref_out, ref_cache = _reference_rpa(
+            np.asarray(q),
+            np.asarray(k),
+            np.asarray(v),
+            np.asarray(cache),
+            np.asarray(kv_lens),
+            np.asarray(pages),
+            np.asarray(cu_q_lens),
+            np.asarray(distribution),
+            **kwargs,
+        )
+        atol = 3e-2 if fp8 else 2e-2
+        np.testing.assert_allclose(
+            np.asarray(out[:7], np.float32),
+            np.asarray(ref_out[:7], np.float32),
+            rtol=2e-2,
+            atol=atol,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(updated, np.float32), np.asarray(ref_cache, np.float32)
+        )
+
     def test_pallas_interpret_prefill_and_decode_fp8_kv(self) -> None:
         shape = get_kv_cache_shape(4, 8, 2, 128, jnp.float8_e4m3fn)
         cache = jnp.zeros(shape, jnp.float8_e4m3fn)

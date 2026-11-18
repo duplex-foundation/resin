@@ -37,6 +37,7 @@ struct SelectedIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Selection {
     epoch: u64,
+    mixed: bool,
     selected: Vec<SelectedIdentity>,
 }
 
@@ -94,17 +95,30 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     pub fn selected(&self) -> (Vec<&T>, Selection) {
-        let selected = self.selected_identities();
-        self.selection(selected)
+        let selected = self.selected_identities(false);
+        self.selection(selected, false)
     }
 
     /// Select already-admitted work without considering waiting requests.
     pub fn selected_running(&self) -> (Vec<&T>, Selection) {
-        let selected = self.running_identities();
-        self.selection(selected)
+        let selected = self.running_identities(false);
+        self.selection(selected, false)
     }
 
-    fn selection(&self, selected: Vec<SelectedIdentity>) -> (Vec<&T>, Selection) {
+    /// Like [`Self::selected`], but running decode rows stay in the cohort
+    /// ahead of prefill rows instead of pausing while any prefill is ready.
+    pub fn selected_mixed(&self) -> (Vec<&T>, Selection) {
+        let selected = self.selected_identities(true);
+        self.selection(selected, true)
+    }
+
+    /// Like [`Self::selected_running`] with decode rows ahead of prefill rows.
+    pub fn selected_running_mixed(&self) -> (Vec<&T>, Selection) {
+        let selected = self.running_identities(true);
+        self.selection(selected, true)
+    }
+
+    fn selection(&self, selected: Vec<SelectedIdentity>, mixed: bool) -> (Vec<&T>, Selection) {
         let items = selected
             .iter()
             .map(|identity| &self.ready[identity.index])
@@ -113,6 +127,7 @@ impl<T: Schedulable> Scheduler<T> {
             items,
             Selection {
                 epoch: self.epoch,
+                mixed,
                 selected,
             },
         )
@@ -123,8 +138,8 @@ impl<T: Schedulable> Scheduler<T> {
             selection.epoch, self.epoch,
             "ready queue changed after its dispatch cohort was selected"
         );
-        let current = self.selected_identities();
-        let running = self.running_identities();
+        let current = self.selected_identities(selection.mixed);
+        let running = self.running_identities(selection.mixed);
         let matches = |candidate: &[SelectedIdentity]| {
             selection.selected.len() <= candidate.len()
                 && selection.selected == candidate[..selection.selected.len()]
@@ -217,10 +232,26 @@ impl<T: Schedulable> Scheduler<T> {
         self.ready.drain(..)
     }
 
-    fn selected_identities(&self) -> Vec<SelectedIdentity> {
+    fn selected_identities(&self, mixed: bool) -> Vec<SelectedIdentity> {
         let limit = self.max_running_requests.get();
-        let mut running = self.running_identities();
+        let mut running = self.running_identities(mixed);
         let running_count = self.ready.iter().filter(|item| item.is_running()).count();
+        if mixed {
+            if running_count < limit {
+                let running_key = running
+                    .first()
+                    .and_then(|identity| self.ready[identity.index].batch_key());
+                let running_empty = running.is_empty();
+                self.append_waiting_cohort(&mut running, limit - running_count, |item| {
+                    item.phase() == Phase::Prefill
+                        && (running_empty || item.batch_key() == running_key)
+                });
+            }
+            if running.is_empty() {
+                self.append_waiting_cohort(&mut running, limit, |_| true);
+            }
+            return running;
+        }
         if running
             .first()
             .is_some_and(|identity| self.ready[identity.index].phase() == Phase::Prefill)
@@ -289,8 +320,33 @@ impl<T: Schedulable> Scheduler<T> {
         );
     }
 
-    fn running_identities(&self) -> Vec<SelectedIdentity> {
+    fn running_identities(&self, mixed: bool) -> Vec<SelectedIdentity> {
         let limit = self.max_running_requests.get();
+        if mixed {
+            let Some(anchor_key) = self
+                .ready
+                .iter()
+                .find(|item| item.is_running())
+                .map(Schedulable::batch_key)
+            else {
+                return Vec::new();
+            };
+            // Decode rows lead: a prefill row shortens the batch only at its
+            // tail, and the oldest running rows are never skipped.
+            return [Phase::Decode, Phase::Prefill]
+                .into_iter()
+                .flat_map(|phase| {
+                    self.ready.iter().enumerate().filter(move |(_, item)| {
+                        item.is_running() && item.batch_key() == anchor_key && item.phase() == phase
+                    })
+                })
+                .take(limit)
+                .map(|(index, item)| SelectedIdentity {
+                    index,
+                    turn: item.turn_ordinal(),
+                })
+                .collect();
+        }
         let Some(anchor) = self
             .ready
             .iter()
@@ -712,5 +768,93 @@ mod tests {
         scheduler.enqueue(item(4, 0, None, Phase::Prefill));
         scheduler.restore_rejected(rejected);
         assert_eq!(ready_ids(&scheduler), [1, 2, 3, 4]);
+    }
+
+    fn running_item(id: u32, key: Option<u64>, phase: Phase) -> Item {
+        let mut item = item(id, 0, key, phase);
+        item.running = true;
+        item
+    }
+
+    fn mixed_ids(scheduler: &Scheduler<Item>) -> Vec<u32> {
+        scheduler
+            .selected_mixed()
+            .0
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    #[test]
+    fn mixed_selection_keeps_running_decode_ahead_of_prefill_and_waiting_work() {
+        let scheduler = scheduler(
+            8,
+            vec![
+                running_item(0, Some(1), Phase::Prefill),
+                running_item(1, Some(1), Phase::Decode),
+                item(2, 0, Some(1), Phase::Prefill),
+                running_item(3, Some(1), Phase::Decode),
+                item(4, 0, Some(2), Phase::Prefill),
+            ],
+        );
+        assert_eq!(mixed_ids(&scheduler), [1, 3, 0, 2]);
+        assert_eq!(selected_ids(&scheduler), [0, 2]);
+    }
+
+    #[test]
+    fn mixed_selection_full_running_set_excludes_waiting_prefill() {
+        let scheduler = scheduler(
+            2,
+            vec![
+                running_item(0, None, Phase::Decode),
+                running_item(1, None, Phase::Decode),
+                item(2, 0, None, Phase::Prefill),
+            ],
+        );
+        assert_eq!(mixed_ids(&scheduler), [0, 1]);
+        assert_eq!(
+            scheduler
+                .selected_running_mixed()
+                .0
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn mixed_running_selection_excludes_waiting_prefill_and_other_batch_keys() {
+        let scheduler = scheduler(
+            8,
+            vec![
+                running_item(0, Some(1), Phase::Decode),
+                running_item(1, Some(2), Phase::Decode),
+                running_item(2, Some(1), Phase::Prefill),
+                item(3, 0, Some(1), Phase::Prefill),
+            ],
+        );
+        let ids = scheduler
+            .selected_running_mixed()
+            .0
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [0, 2]);
+    }
+
+    #[test]
+    fn mixed_selection_retakes_only_the_cohort_it_selected() {
+        let mut scheduler = scheduler(
+            8,
+            vec![
+                item(0, 0, None, Phase::Prefill),
+                running_item(1, None, Phase::Decode),
+            ],
+        );
+        let (_, selection) = scheduler.selected_mixed();
+        let taken = scheduler.take_selected(selection);
+        assert_eq!(taken.iter().map(|item| item.id).collect::<Vec<_>>(), [1, 0]);
+        assert!(ready_ids(&scheduler).is_empty());
     }
 }

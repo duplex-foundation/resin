@@ -28,6 +28,8 @@ pub(crate) struct RunnerConfig {
     pub(super) max_accepted_per_step: u32,
     #[pyo3(get)]
     pub(super) cache_layout: Option<Py<CacheLayout>>,
+    #[pyo3(get)]
+    pub(super) mixed_prefill_decode: bool,
 }
 
 impl Default for RunnerConfig {
@@ -38,6 +40,7 @@ impl Default for RunnerConfig {
             continuation_prefill: false,
             max_accepted_per_step: 1,
             cache_layout: None,
+            mixed_prefill_decode: false,
         }
     }
 }
@@ -53,6 +56,7 @@ impl RunnerConfig {
                 .cache_layout
                 .as_ref()
                 .map(|layout| layout.clone_ref(py)),
+            mixed_prefill_decode: self.mixed_prefill_decode,
         }
     }
 }
@@ -66,7 +70,8 @@ impl RunnerConfig {
         prefill_chunk_size = None,
         continuation_prefill = false,
         max_accepted_per_step = 1,
-        cache_layout = None
+        cache_layout = None,
+        mixed_prefill_decode = false
     ))]
     fn new(
         py: Python<'_>,
@@ -75,6 +80,7 @@ impl RunnerConfig {
         continuation_prefill: bool,
         max_accepted_per_step: u32,
         cache_layout: Option<Py<CacheLayout>>,
+        mixed_prefill_decode: bool,
     ) -> PyResult<Self> {
         if max_accepted_per_step == 0 {
             return Err(PyValueError::new_err(
@@ -93,6 +99,7 @@ impl RunnerConfig {
             continuation_prefill,
             max_accepted_per_step,
             cache_layout,
+            mixed_prefill_decode,
         })
     }
 
@@ -108,12 +115,13 @@ impl RunnerConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, max_accepted_per_step={}, cache={})",
+            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, max_accepted_per_step={}, cache={}, mixed_prefill_decode={})",
             self.max_batch_tokens(),
             self.prefill_chunk_size(),
             self.continuation_prefill,
             self.max_accepted_per_step,
             self.cache_layout.is_some(),
+            self.mixed_prefill_decode,
         )
     }
 }

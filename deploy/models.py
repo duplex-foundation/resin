@@ -731,6 +731,7 @@ def _create_tpu_runner(
     expert_backend: str | None,
     assistant_checkpoint: str | Path | None,
     workload: str | None,
+    mixed_prefill_decode: bool,
 ):
     """Build a mesh and wrap the family plug-in in ``TpuRunner``.
 
@@ -792,6 +793,7 @@ def _create_tpu_runner(
         prefill_chunk_size=prefill_chunk_size,
         buckets=_tpu_buckets(selected, batch_tokens),
         memory_utilization=memory,
+        mixed_prefill_decode=mixed_prefill_decode,
     )
 
 
@@ -814,9 +816,15 @@ def create_runner(
     fast_allreduce: bool = False,
     assistant_checkpoint: str | Path | None = None,
     workload: str | None = None,
+    mixed_prefill_decode: bool = False,
 ):
-    """Construct one runner with model-specific cache geometry and draft support."""
+    """Construct one runner with model-specific cache geometry and draft support.
+
+    ``mixed_prefill_decode`` applies to TPU runners only.
+    """
     spec = get_model(model)
+    if mixed_prefill_decode and spec.backend != "tpu":
+        raise ValueError(f"{spec.name} does not support mixed_prefill_decode")
     if spec.backend == "tpu":
         return _create_tpu_runner(
             spec,
@@ -830,6 +838,7 @@ def create_runner(
             expert_backend=expert_backend,
             assistant_checkpoint=assistant_checkpoint,
             workload=workload,
+            mixed_prefill_decode=mixed_prefill_decode,
         )
     checkpoint = spec.path if checkpoint is None else Path(checkpoint)
     assistant = (
