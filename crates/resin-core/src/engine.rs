@@ -152,6 +152,10 @@ pub struct RunnerConfig {
     /// N+1 when drafting N tokens with MTP.
     pub max_accepted_per_step: u32,
     pub cache_layout: Option<KvLayout>,
+    /// Let running decode rows share a dispatch with prefill rows. The plan's
+    /// phase is `Prefill` when any row prefills, and its decode rows come first.
+    /// The runner must accept such plans.
+    pub mixed_prefill_decode: bool,
 }
 
 impl Default for RunnerConfig {
@@ -162,6 +166,7 @@ impl Default for RunnerConfig {
             continuation_prefill: false,
             max_accepted_per_step: 1,
             cache_layout: None,
+            mixed_prefill_decode: false,
         }
     }
 }
@@ -792,7 +797,7 @@ impl<P: Clone> EngineCore<P> {
         }
         Ok(())
     }
-    fn planning_config(&self) -> PlanningConfig {
+    fn planning_config(&self, allow_mixed_phases: bool) -> PlanningConfig {
         let min_limit = |a: Option<NonZeroU32>, b: Option<NonZeroU32>| match (a, b) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -813,6 +818,7 @@ impl<P: Clone> EngineCore<P> {
                     limit.min(self.scheduler_config.prefill_chunk_size)
                 }),
             checkpoint_alignment: self.prefix_alignment().and_then(NonZeroU32::new),
+            allow_mixed_phases,
         }
     }
 
@@ -875,7 +881,7 @@ impl<P: Clone> EngineCore<P> {
             ));
         }
         let mut previous_end = 0;
-        let effective_limits = self.planning_config();
+        let effective_limits = self.planning_config(false);
         let atomic_limit = effective_limits
             .max_batch_tokens
             .map_or(effective_limits.prefill_chunk_size, |budget| {
@@ -1272,11 +1278,19 @@ impl<P: Clone> EngineCore<P> {
         self.complete_batch(runner, batch, output, make_event, Some(template))
     }
 
-    fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
-        let (mut requests, mut selection) = self.scheduler.selected();
+    fn selected_cohort(&self, mixed: bool) -> Result<(Vec<&Request<P>>, Selection)> {
+        let (mut requests, mut selection) = if mixed {
+            self.scheduler.selected_mixed()
+        } else {
+            self.scheduler.selected()
+        };
         let admitted = self.admission_prefix_len(&requests)?;
         if admitted == 0 {
-            (requests, selection) = self.scheduler.selected_running();
+            (requests, selection) = if mixed {
+                self.scheduler.selected_running_mixed()
+            } else {
+                self.scheduler.selected_running()
+            };
         } else {
             requests.truncate(admitted);
             selection.truncate(admitted);
@@ -1288,13 +1302,16 @@ impl<P: Clone> EngineCore<P> {
     pub fn next_phase(&self) -> Result<Option<Phase>> {
         self.raise_if_open()?;
         if let Some(batch) = &self.in_flight {
-            return Ok(batch.rows.first().map(|row| row.scheduled.phase));
+            return Ok(cohort_phase(
+                batch.rows.iter().map(|row| row.scheduled.phase),
+            ));
         }
-        Ok(self
-            .selected_cohort()?
-            .0
-            .first()
-            .map(|request| request.phase()))
+        Ok(cohort_phase(
+            self.selected_cohort(self.runner_config.mixed_prefill_decode)?
+                .0
+                .iter()
+                .map(|request| request.phase()),
+        ))
     }
 
     fn prepare_batch(
@@ -1307,6 +1324,7 @@ impl<P: Clone> EngineCore<P> {
         // After a capacity miss, waiting requests stay out of this dispatch so
         // admitting them cannot evict work that already holds KV pages.
         let mut running_only = false;
+        let mut mixed = self.runner_config.mixed_prefill_decode;
         loop {
             self.poll_storage(false)?;
             if self.scheduler.is_empty() {
@@ -1321,18 +1339,33 @@ impl<P: Clone> EngineCore<P> {
                 has_running,
             ) = {
                 let has_running = self.scheduler.iter().any(|request| request.is_running());
-                let (selected_requests, mut selection) = if running_only {
-                    self.scheduler.selected_running()
-                } else {
-                    self.selected_cohort()?
+                let (selected_requests, mut selection) = match (running_only, mixed) {
+                    (true, true) => self.scheduler.selected_running_mixed(),
+                    (true, false) => self.scheduler.selected_running(),
+                    (false, mixed) => self.selected_cohort(mixed)?,
                 };
                 if selected_requests.is_empty() {
                     return Ok(None);
                 }
-                if phase.is_some_and(|phase| selected_requests[0].phase() != phase) {
+                if phase.is_some_and(|phase| {
+                    cohort_phase(selected_requests.iter().map(|request| request.phase()))
+                        != Some(phase)
+                }) {
                     return Ok(None);
                 }
-                let scheduled_rows = schedule_requests(&selected_requests, self.planning_config())?;
+                let scheduled_rows =
+                    schedule_requests(&selected_requests, self.planning_config(mixed))?;
+                // The token budget can leave no room for a prefill row behind
+                // the decode rows (for example, an atomic span that needs the
+                // whole budget). Prefill alone then makes progress.
+                if mixed
+                    && scheduled_rows.len() < selected_requests.len()
+                    && scheduled_rows.iter().all(|row| row.phase == Phase::Decode)
+                    && selected_requests[scheduled_rows.len()].phase() == Phase::Prefill
+                {
+                    mixed = false;
+                    continue;
+                }
                 if scheduled_rows.is_empty() {
                     return Err(Error::internal(
                         "scheduler produced no token-bearing rows for a nonempty cohort",
@@ -1654,8 +1687,8 @@ impl<P: Clone> EngineCore<P> {
         }
         let decoded_batch = batch
             .rows
-            .first()
-            .is_some_and(|row| row.scheduled.phase == Phase::Decode);
+            .iter()
+            .any(|row| row.scheduled.phase == Phase::Decode);
 
         // Prepare owned scores before cleanup; publish them with logical progress.
         let prompt_updates = if let Some(scores) = prompt_logprobs {
@@ -2460,6 +2493,17 @@ impl<P: Clone> EngineCore<P> {
         }
     }
 }
+/// A dispatch is a prefill if any row prefills; otherwise it is a decode.
+fn cohort_phase(phases: impl IntoIterator<Item = Phase>) -> Option<Phase> {
+    phases.into_iter().reduce(|cohort, phase| {
+        if cohort == Phase::Prefill || phase == Phase::Prefill {
+            Phase::Prefill
+        } else {
+            Phase::Decode
+        }
+    })
+}
+
 fn build_plan<P: Clone>(
     batch_id: u64,
     requests: &[Request<P>],
@@ -2491,10 +2535,18 @@ fn build_plan<P: Clone>(
             "scheduler selected requests with different batch keys",
         ));
     }
-    let phase = scheduled_rows[0].phase;
-    if scheduled_rows.iter().any(|row| row.phase != phase) {
+    let phase = cohort_phase(scheduled_rows.iter().map(|row| row.phase))
+        .expect("nonempty batch has a phase");
+    let decode_rows = scheduled_rows
+        .iter()
+        .take_while(|row| row.phase == Phase::Decode)
+        .count();
+    if scheduled_rows[decode_rows..]
+        .iter()
+        .any(|row| row.phase != Phase::Prefill)
+    {
         return Err(Error::internal(
-            "scheduler selected requests from different phases",
+            "scheduler selected decode rows after prefill rows",
         ));
     }
 
@@ -2665,6 +2717,7 @@ mod tests {
             max_batch_tokens: config.max_batch_tokens,
             prefill_chunk_size: config.prefill_chunk_size,
             checkpoint_alignment: None,
+            allow_mixed_phases: false,
         }
     }
     #[test]

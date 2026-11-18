@@ -64,6 +64,19 @@ class BatchView:
         return np.diff(self.token_indptr)
 
     @property
+    def decode_rows(self) -> int:
+        """Leading rows that decode one token at the end of their history.
+
+        A decode plan consists of them. A prefill plan may lead with them when
+        the Engine runs with ``mixed_prefill_decode``; prefill rows follow.
+        """
+
+        if self.phase == BatchPhase.DECODE:
+            return self.num_sequences
+        decoding = self.context_lengths >= self._plan.prefill_lengths
+        return int(np.cumprod(decoding).sum())
+
+    @property
     def post_lengths(self) -> npt.NDArray[np.uint32]:
         return self.context_lengths + self.query_lengths
 
@@ -197,7 +210,9 @@ class PagedCachePlan:
         query_lengths = batch.query_lengths.astype(np.int64)
         row_ids = np.repeat(np.arange(batch.num_sequences), query_lengths)
         positions = batch.positions.astype(np.int64)
-        lookahead = decode_lookahead if batch.phase == BatchPhase.DECODE else 0
+        decode_rows = batch.decode_rows
+        decode_mask = np.arange(batch.num_sequences) < decode_rows
+        lookahead = decode_lookahead if decode_rows else 0
         # Native fields are u32, but a leased decode span can extend beyond u32.
         # Keep even oversized caller-supplied lookahead from wrapping arithmetic.
         post_lengths = batch.context_lengths.astype(np.int64) + query_lengths
@@ -206,7 +221,9 @@ class PagedCachePlan:
             if lookahead > np.iinfo(np.int64).max - int(post_lengths.max())
             else np.int64
         )
-        write_tokens = query_lengths.astype(arithmetic) + lookahead
+        row_lookahead = np.zeros(batch.num_sequences, dtype=arithmetic)
+        row_lookahead[:decode_rows] = lookahead
+        write_tokens = query_lengths.astype(arithmetic) + row_lookahead
         leased = batch.context_lengths.astype(arithmetic) + write_tokens
 
         groups = []
@@ -255,16 +272,16 @@ class PagedCachePlan:
             invalid_range = (group.block_table_start_indices != expected_first) | (
                 np.diff(group.block_indptr) != last_blocks - expected_first + 1
             )
-            if batch.phase == BatchPhase.DECODE:
+            if decode_rows:
                 # The native table is the lease authority, including any tail
                 # reserved for queued steps. Validate coverage without requiring
                 # the runner to reproduce the Engine's reservation policy.
-                expected_first = group.block_table_start_indices.astype(np.int64)
+                decode_first = group.block_table_start_indices.astype(np.int64)
                 count = np.diff(group.block_indptr).astype(np.int64)
-                table_end = expected_first + count
-                invalid_range = table_end <= last_blocks
+                table_end = decode_first + count
+                decode_invalid = table_end <= last_blocks
                 if window_blocks is None:
-                    invalid_range |= expected_first != 0
+                    decode_invalid |= decode_first != 0
                 else:
                     assert descriptor.read_window_tokens is not None
                     earliest_read = np.maximum(
@@ -272,9 +289,11 @@ class PagedCachePlan:
                         batch.context_lengths.astype(np.int64)
                         - (descriptor.read_window_tokens - 1),
                     )
-                    invalid_range |= (
-                        expected_first != np.maximum(0, table_end - window_blocks)
-                    ) | (expected_first > earliest_read // block_tokens)
+                    decode_invalid |= (
+                        decode_first != np.maximum(0, table_end - window_blocks)
+                    ) | (decode_first > earliest_read // block_tokens)
+                expected_first = np.where(decode_mask, decode_first, expected_first)
+                invalid_range = np.where(decode_mask, decode_invalid, invalid_range)
 
             logical_blocks = positions // block_tokens
             # Layout-inconsistent extents must be rejected before indexing.

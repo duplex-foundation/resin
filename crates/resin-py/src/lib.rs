@@ -493,16 +493,29 @@ impl BatchPlan {
                 "scheduled positions exceed the u32 metadata range",
             ));
         }
-        if plan.phase == BatchPhase::Prefill
-            && context_lengths
+        // A prefill plan may lead with decode rows: one token at the end of
+        // their prefill history.
+        if plan.phase == BatchPhase::Prefill {
+            let rows = context_lengths
                 .iter()
                 .zip(token_indptr.windows(2))
-                .zip(prefill_lengths)
-                .any(|((context, range), length)| *context + (range[1] - range[0]) > *length)
-        {
-            return Err(PyValueError::new_err(
-                "prefill_lengths must cover every scheduled prefill row",
-            ));
+                .zip(prefill_lengths);
+            let mut decode_rows_ended = false;
+            for ((context, range), length) in rows {
+                let tokens = range[1] - range[0];
+                let decode = *context >= *length;
+                if decode && (decode_rows_ended || tokens != 1) {
+                    return Err(PyValueError::new_err(
+                        "decode rows in a prefill plan must be single tokens before every prefill row",
+                    ));
+                }
+                decode_rows_ended |= !decode;
+                if !decode && *context + tokens > *length {
+                    return Err(PyValueError::new_err(
+                        "prefill_lengths must cover every scheduled prefill row",
+                    ));
+                }
+            }
         }
         let mut sorted_ids = sequence_ids.clone();
         sorted_ids.sort_unstable();
@@ -1419,6 +1432,7 @@ impl Engine {
                     .cache_layout
                     .as_ref()
                     .map(|layout| layout.get().inner_native().clone()),
+                mixed_prefill_decode: config.mixed_prefill_decode,
             },
             max_running_requests,
             context_length,

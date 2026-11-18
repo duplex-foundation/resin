@@ -75,11 +75,23 @@ one queue traversal; returning survivors sorts only those survivors and merges
 them into the queue. Neither operation repeatedly scans or sorts all waiting
 requests for each selected row.
 
-Prefill and decode never share a plan. `BatchPlan.phase` is the explicit
+By default prefill and decode never share a plan. `BatchPlan.phase` is the explicit
 `BatchPhase.PREFILL` or `BatchPhase.DECODE` value for the complete batch. A
 one-token continuation prefill therefore remains unambiguously prefill.
 
-Prefill can pause resident decoders, but does not evict them: their KV and
+`RunnerConfig(mixed_prefill_decode=True)` (default `False`) lets one plan carry
+both phases. Running decode rows come first, one token each and charged one
+token of the step budget each. Running and waiting prefill chunks follow and
+share the remaining budget. `BatchPlan.phase` is `PREFILL` when any row
+prefills and `DECODE` otherwise. A row is a decode row when its
+`context_length` is at least its `prefill_length`; decode rows must be single
+tokens and must precede every prefill row. Mixed plans run synchronously, so a
+plan that contains a prefill row is never overlapped. If decode rows leave no
+room for the next prefill row, for example an atomic multimodal span, the Engine
+plans a homogeneous batch instead. Backends that cannot execute a mixed plan
+leave the option off.
+
+Without `mixed_prefill_decode`, prefill can pause resident decoders, but does not evict them: their KV and
 admission remain live. A full admitted set is not displaced merely to accept a
 new prefill.
 
@@ -229,4 +241,4 @@ Scheduling does not choose CUDA graph buckets, kernel shapes, or sampling
 kernels. Those remain runner concerns. Cache admission and request progress are
 Engine concerns; sampling offsets are derived from absolute sequence progress.
 Overlap submits safe decode continuations ahead of CPU completion; prefill and
-decode still execute as separate phases and do not overlap each other.
+decode do not overlap each other, and a mixed plan is never overlapped.

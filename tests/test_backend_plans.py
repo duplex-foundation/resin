@@ -525,3 +525,23 @@ def test_paged_cache_plan_does_not_wrap_oversized_decode_lookahead(
     plan, layout = _mixed_cache_plan(decode=True)
     with pytest.raises(ValueError, match="row 0 has an invalid active range"):
         PagedCachePlan.from_plan(plan, layout, decode_lookahead=lookahead)
+
+
+def test_decode_rows_lead_a_prefill_plan_only_when_their_history_is_complete() -> None:
+    def plan(context_lengths, prefill_lengths, phase=BatchPhase.PREFILL):
+        rows = len(context_lengths)
+        return BatchView.from_plan(
+            BatchPlan(
+                sequence_ids=list(range(rows)),
+                context_lengths=context_lengths,
+                prefill_lengths=prefill_lengths,
+                token_ids=list(range(rows)),
+                token_indptr=list(range(rows + 1)),
+                sampling_mask=[True] * rows,
+                phase=phase,
+            )
+        )
+
+    assert plan([3, 1, 0], [3, 1, 3]).decode_rows == 2
+    assert plan([0, 1], [3, 3]).decode_rows == 0
+    assert plan([3, 3], [3, 3], BatchPhase.DECODE).decode_rows == 2

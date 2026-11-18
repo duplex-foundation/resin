@@ -138,6 +138,37 @@ def _decode_plan() -> PagedCachePlan:
     return PagedCachePlan.from_plan(plan, layout)
 
 
+def _mixed_plan(**plan_options) -> BatchPlan:
+    # Rows 0 and 1 decode (their context equals their prefill length); row 2
+    # prefills one token of a longer prompt.
+    return BatchPlan(
+        sequence_ids=[10, 11, 12],
+        context_lengths=[3, 1, 0],
+        prefill_lengths=[3, 1, 3],
+        token_ids=[10, 11, 12],
+        token_indptr=[0, 1, 2, 3],
+        sampling_mask=[True, True, False],
+        cache_groups=[
+            CacheGroupPlan(
+                group_index=0,
+                block_indptr=[0, 2, 3, 4],
+                block_slab_ids=[1, 2, 3, 4],
+                block_slotnums=[0, 0, 0, 0],
+                block_table_start_indices=[0, 0, 0],
+                append_slab_ids=[2, 3, 4],
+                append_slotnums=[0, 0, 0],
+                append_block_offsets=[1, 1, 0],
+                blocks_per_slab=1,
+            )
+        ],
+        phase=BatchPhase.PREFILL,
+        **plan_options,
+    )
+
+
+_MIXED_LAYOUT = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
+
+
 class TestMetadata:
     def test_build_inputs_pads_to_the_bucket(self) -> None:
         inputs = build_inputs(_paged_plan(), Bucket(8, 4), (3,))
@@ -163,6 +194,42 @@ class TestMetadata:
     def test_decode_rows_run_in_the_decode_range(self) -> None:
         inputs = build_inputs(_decode_plan(), Bucket(4, 4), (4,))
         assert inputs.attention.distribution.tolist() == [2, 2, 2]
+
+    def test_mixed_plan_keeps_its_decode_rows_in_the_decode_range(self) -> None:
+        plan = PagedCachePlan.from_plan(_mixed_plan(), _MIXED_LAYOUT)
+        assert plan.batch.decode_rows == 2
+        inputs = build_inputs(plan, Bucket(8, 4), (2,))
+        assert inputs.attention.distribution.tolist() == [2, 2, 3]
+
+    def test_mixed_plan_requires_decode_rows_to_be_single_leading_tokens(self) -> None:
+        with pytest.raises(ValueError, match="decode rows"):
+            BatchPlan(
+                sequence_ids=[10, 11],
+                context_lengths=[0, 1],
+                prefill_lengths=[3, 1],
+                token_ids=[1, 2],
+                token_indptr=[0, 1, 2],
+                sampling_mask=[False, True],
+            )
+        with pytest.raises(ValueError, match="decode rows"):
+            BatchPlan(
+                sequence_ids=[10],
+                context_lengths=[1],
+                prefill_lengths=[1],
+                token_ids=[1, 2],
+                token_indptr=[0, 2],
+                sampling_mask=[True],
+            )
+
+    def test_mixed_plan_leases_lookahead_pages_for_decode_rows_only(self) -> None:
+        # Row 0 would write beyond its two pages, but the prefill row's table
+        # must stay exact: lookahead applies to the decode rows alone.
+        with pytest.raises(ValueError, match="row 0 has an invalid active range"):
+            PagedCachePlan.from_plan(_mixed_plan(), _MIXED_LAYOUT, decode_lookahead=2)
+        without_decode_lookahead = PagedCachePlan.from_plan(
+            _mixed_plan(), _MIXED_LAYOUT
+        )
+        assert without_decode_lookahead.rows == 3
 
     def test_page_table_packs_slab_slots_after_the_window_start(self) -> None:
         table = build_inputs(_decode_plan(), Bucket(4, 4), (4,)).attention
