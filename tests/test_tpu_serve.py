@@ -73,7 +73,16 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
 
     def create_runner(*args, **kwargs):
         seen["runner"] = (args, kwargs)
-        return type("Runner", (), {"benchmark_metadata": {"warmup_seconds": 1.5}})()
+        return type(
+            "Runner",
+            (),
+            {
+                "benchmark_metadata": {
+                    "warmup_seconds": 1.5,
+                    "hbm_headroom_bytes": 1_160_000_000,
+                }
+            },
+        )()
 
     def create_recipe(*args, **kwargs):
         seen["recipe"] = args
@@ -133,7 +142,9 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert seen["engine"]["context_length"] == 9216
     assert seen["engine"]["max_running_requests"] == 320
     assert seen["serve"] == ("127.0.0.1", 9)
-    assert "warmup 1.5s" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "warmup 1.5s" in out
+    assert "hbm headroom 1.16 GB/die" in out
     assert os.environ["JAX_COMPILATION_CACHE_DIR"]
     with pytest.raises(SystemExit):
         tpu_serve.main(["--model", "qwen3-32b", "--checkpoint", str(checkpoint)])

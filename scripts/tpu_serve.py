@@ -91,10 +91,14 @@ def main(argv=None) -> None:
             schedule_conservativeness=args.schedule_conservativeness,
         ),
     )
-    warmup = getattr(runner, "benchmark_metadata", {}).get("warmup_seconds")
+    metadata = getattr(runner, "benchmark_metadata", {})
+    warmup = metadata.get("warmup_seconds")
+    headroom = metadata.get("hbm_headroom_bytes")
     ready = f"[serve] {spec.name} {args.workload} ready in {time.perf_counter() - started:.1f}s"
     if warmup is not None:
         ready += f" (warmup {warmup:.1f}s)"
+    if headroom is not None:
+        ready += f" (hbm headroom {headroom / 1e9:.2f} GB/die)"
     print(
         ready + f" at http://{args.host}:{args.port}",
         flush=True,
