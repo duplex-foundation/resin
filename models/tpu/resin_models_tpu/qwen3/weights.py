@@ -173,7 +173,7 @@ class _Loader:
         embed_shape = (config.vocab_size, config.hidden_size)
         rep = NamedSharding(self.mesh, P())
         with self.reader:
-            embed = self.tensor("model.embed_tokens.weight", embed_shape, ROW)
+            embed = self.tensor("model.embed_tokens.weight", embed_shape, P())
             layers = []
             for index in range(config.num_hidden_layers):
                 layers.append(self.layer(index))
