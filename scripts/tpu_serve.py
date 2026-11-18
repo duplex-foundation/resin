@@ -61,7 +61,11 @@ def main(argv=None) -> None:
 
     spec = get_model(args.model)
     workload = TPU_WORKLOADS[args.workload]
-    chunk = args.prefill_chunk_size or spec.prefill_chunk_size
+    chunk = (
+        spec.prefill_chunk_size
+        if args.prefill_chunk_size is None
+        else args.prefill_chunk_size
+    )
     conservativeness = (
         workload.schedule_conservativeness
         if args.schedule_conservativeness is None

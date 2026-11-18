@@ -41,7 +41,9 @@ Caches = tuple[tuple[jax.Array, ...], ...]
 
 MIN_HEADROOM_BYTES = 3584 * 1024**2
 """Free HBM across the mesh that a default budget leaves for activations and
-compiled executables, which are allocated after the cache."""
+compiled executables, which are allocated after the cache. A budget whose
+``memory_utilization`` already protects at least this much reserves nothing
+more."""
 
 
 def _align(value: int, multiple: int) -> int:

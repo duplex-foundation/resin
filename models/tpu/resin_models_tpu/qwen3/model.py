@@ -162,7 +162,7 @@ class Qwen3Model:
         Each die gathers its ``H / tp`` columns for every token, then the dies
         exchange columns: an all-gather for replicated activations, an
         all-to-all for token-sharded ones. Both are exact copies of the
-        replicated-table lookup.
+        replicated-table lookup. With one die, ``token_sharded`` has no effect.
         """
 
         if tp_size(self.mesh) == 1:
