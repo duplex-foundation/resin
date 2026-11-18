@@ -257,6 +257,17 @@ class TpuRunner:
         jax.block_until_ready((self._project(self.params, rows), self._arena.caches))
         self.warmup_compilations = self.compilations.count
         self.benchmark_metadata["warmup_seconds"] = time.perf_counter() - start
+        headroom = self._hbm_headroom_bytes()
+        if headroom is not None:
+            self.benchmark_metadata["hbm_headroom_bytes"] = headroom
+
+    def _hbm_headroom_bytes(self) -> int | None:
+        """Smallest per-die ``bytes_limit - peak_bytes_in_use``, or ``None`` off device."""
+
+        stats = [device.memory_stats() for device in self.mesh.devices.flat]
+        if any(not stat or "peak_bytes_in_use" not in stat for stat in stats):
+            return None
+        return min(int(s["bytes_limit"]) - int(s["peak_bytes_in_use"]) for s in stats)
 
     @property
     def compilations_after_warmup(self) -> int:
