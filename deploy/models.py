@@ -1046,6 +1046,7 @@ class _Qwen3ChatRecipe:
             add_generation_prompt=add_prompt,
             enable_thinking=thinking,
             tokenize=True,
+            return_dict=False,
         )
         if hasattr(token_ids, "tolist"):
             token_ids = token_ids.tolist()
