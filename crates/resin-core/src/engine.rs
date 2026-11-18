@@ -1304,14 +1304,28 @@ impl<P: Clone> EngineCore<P> {
         overlap: bool,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
+        // After a capacity miss, waiting requests stay out of this dispatch so
+        // admitting them cannot evict work that already holds KV pages.
+        let mut running_only = false;
         loop {
             self.poll_storage(false)?;
             if self.scheduler.is_empty() {
                 return Ok(None);
             }
 
-            let (scheduled_rows, selection, mut decode_reservation_lookahead) = {
-                let (selected_requests, mut selection) = self.selected_cohort()?;
+            let (
+                scheduled_rows,
+                selection,
+                mut decode_reservation_lookahead,
+                scheduled_has_waiting,
+                has_running,
+            ) = {
+                let has_running = self.scheduler.iter().any(|request| request.is_running());
+                let (selected_requests, mut selection) = if running_only {
+                    self.scheduler.selected_running()
+                } else {
+                    self.selected_cohort()?
+                };
                 if selected_requests.is_empty() {
                     return Ok(None);
                 }
@@ -1341,8 +1355,15 @@ impl<P: Clone> EngineCore<P> {
                 }
                 selection.truncate(scheduled_rows.len());
                 let maximum = u64::from(self.runner_config.max_accepted_per_step);
+                let scheduled_has_waiting = selected_requests[..scheduled_rows.len()]
+                    .iter()
+                    .any(|request| !request.is_running());
+                // `can_continue` rejects any continuation while requests wait,
+                // so a wide lease would only strand one idle page per row.
                 let reserve_continuation = overlap
                     && self.runner_config.cache_layout.is_some()
+                    && scheduled_rows.len() == self.scheduler.len()
+                    && self.storage_waiting.is_empty()
                     && scheduled_rows
                         .iter()
                         .zip(&selected_requests)
@@ -1402,7 +1423,13 @@ impl<P: Clone> EngineCore<P> {
                 } else {
                     self.runner_config.decode_write_lookahead()
                 };
-                (scheduled_rows, selection, lookahead)
+                (
+                    scheduled_rows,
+                    selection,
+                    lookahead,
+                    scheduled_has_waiting,
+                    has_running,
+                )
             };
             let batch_id = self.next_batch_id;
             self.next_batch_id = self
@@ -1447,6 +1474,36 @@ impl<P: Clone> EngineCore<P> {
                         if !resources.can_ensure_contexts(&requests)? {
                             decode_reservation_lookahead =
                                 self.runner_config.decode_write_lookahead();
+                        }
+                    }
+                    // Check the whole cohort before growing any row, so a late
+                    // miss cannot leave pages attached to an earlier row.
+                    let required = scheduled
+                        .iter()
+                        .zip(&scheduled_rows)
+                        .map(|(request, row)| {
+                            let end = row.token_end().expect("validated scheduled range");
+                            let lookahead = if row.phase == Phase::Decode {
+                                decode_reservation_lookahead
+                            } else {
+                                0
+                            };
+                            (
+                                request
+                                    .cache
+                                    .as_ref()
+                                    .expect("managed request has cache state"),
+                                row.token_start(),
+                                end + lookahead,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    while !resources.can_ensure_contexts(&required)? {
+                        if !resources.evict_one_prefix()? {
+                            capacity_miss = true;
+                            return Err(Error::memory(
+                                "cache pool lacks capacity for the scheduled batch",
+                            ));
                         }
                     }
                     for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
@@ -1529,8 +1586,23 @@ impl<P: Clone> EngineCore<P> {
                     if capacity_miss && self.storage_pending() {
                         return Ok(None);
                     }
-                    if capacity_miss && self.retract_one(runner)? {
-                        continue;
+                    if capacity_miss {
+                        if scheduled_has_waiting && has_running {
+                            if self.retract_one_matching(runner, false)? {
+                                continue;
+                            }
+                            // No test reaches this for single-group layouts: `AdmissionEstimate`
+                            // floors at owned pages, so once idle holders are retracted the
+                            // estimate covers the real need. Kept for estimate/allocator divergence.
+                            self.update_new_token_ratio_after_retraction();
+                            running_only = true;
+                            continue;
+                        }
+                        if self.retract_one_matching(runner, true)? {
+                            running_only =
+                                self.scheduler.iter().any(|request| request.is_running());
+                            continue;
+                        }
                     }
                     return Err(error);
                 }
@@ -1994,20 +2066,43 @@ impl<P: Clone> EngineCore<P> {
         Ok(())
     }
 
+    /// Tokens a running request may still write before it can finish a block.
+    fn decode_headroom_tokens(&self) -> usize {
+        let block = self
+            .runner_config
+            .cache_layout
+            .as_ref()
+            .map(|layout| {
+                layout
+                    .groups()
+                    .iter()
+                    .filter(|group| !group.is_recurrent())
+                    .map(|group| group.block_tokens().get() as usize)
+                    .max()
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1);
+        block.saturating_add(self.runner_config.decode_write_lookahead() as usize)
+    }
+
     fn estimated_context(&self, request: &Request<P>) -> u32 {
-        let future_inputs = request.max_output_tokens.saturating_sub(1);
-        let estimated_future = ((future_inputs as f64) * self.new_token_ratio).ceil() as usize;
-        let estimate = request
-            .prompt
-            .len()
+        let prefill_length = request
+            .prefill_length()
+            .expect("active request length is valid") as usize;
+        let remaining_inputs = request
+            .max_output_tokens
+            .saturating_sub(1)
+            .saturating_sub(request.generated.len().saturating_sub(1));
+        let mut estimated_future =
+            ((remaining_inputs as f64) * self.new_token_ratio).ceil() as usize;
+        if request.is_running() && self.new_token_ratio > 0.0 && remaining_inputs > 0 {
+            let max_writes = remaining_inputs
+                .saturating_add(self.runner_config.decode_write_lookahead() as usize);
+            estimated_future = estimated_future.max(self.decode_headroom_tokens().min(max_writes));
+        }
+        prefill_length
             .saturating_add(estimated_future)
-            .max(
-                request
-                    .prefill_length()
-                    .expect("active request length is valid") as usize,
-            )
-            .min(self.context_length.get() as usize);
-        estimate as u32
+            .min(self.context_length.get() as usize) as u32
     }
 
     fn admission_prefix_len(&self, selected: &[&Request<P>]) -> Result<usize> {
@@ -2060,16 +2155,22 @@ impl<P: Clone> EngineCore<P> {
                 )
             },
         );
-        self.new_token_ratio = if count == 0 {
+        let observed = if count == 0 {
             self.scheduler_config.initial_new_token_ratio()
         } else {
             ((generated.saturating_add(RETRACTION_DECODE_HEADROOM * count)) as f64
                 / limits.saturating_add(1) as f64)
                 .min(1.0)
         };
+        // A retraction only ever makes admission more conservative.
+        self.new_token_ratio = self.new_token_ratio.max(observed);
     }
 
-    fn retract_one(&mut self, runner: &mut impl Runner<P>) -> Result<bool> {
+    fn retract_one_matching(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        allow_running: bool,
+    ) -> Result<bool> {
         let running_count = self
             .scheduler
             .iter()
@@ -2082,7 +2183,8 @@ impl<P: Clone> EngineCore<P> {
             .enumerate()
             .filter(|(_, request)| {
                 request.cache.as_ref().is_some_and(|pages| {
-                    resources.reclaimable(pages) && (!request.is_running() || running_count > 1)
+                    resources.reclaimable(pages)
+                        && (!request.is_running() || (allow_running && running_count > 1))
                 })
             })
             // Waiting prefix hits can pin pages outside admission estimates.
@@ -2099,8 +2201,9 @@ impl<P: Clone> EngineCore<P> {
             return Ok(false);
         };
         let mut request = self.scheduler.remove(index);
+        let was_running = request.is_running();
 
-        if request.is_running()
+        if was_running
             && let Err(error) = execution_call("release", || runner.release(&[request.id]))
         {
             self.scheduler.restore(index, request);
@@ -2130,7 +2233,9 @@ impl<P: Clone> EngineCore<P> {
             metrics.retract();
         }
         self.scheduler.requeue_retracted(request);
-        self.update_new_token_ratio_after_retraction();
+        if was_running {
+            self.update_new_token_ratio_after_retraction();
+        }
         Ok(true)
     }
 

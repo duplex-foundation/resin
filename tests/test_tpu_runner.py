@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import closing
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -240,7 +241,30 @@ def tp1():
         yield runner, model, params, engine
 
 
+class _Die:
+    def __init__(self, stats) -> None:
+        self._stats = stats
+
+    def memory_stats(self):
+        return self._stats
+
+
 class TestTpuRunner:
+    def test_hbm_headroom_is_the_smallest_per_die_margin_above_peak(
+        self, tp1, monkeypatch
+    ) -> None:
+        runner = tp1[0]
+        assert "hbm_headroom_bytes" not in runner.benchmark_metadata
+        assert runner._hbm_headroom_bytes() is None
+        dies = [
+            _Die({"bytes_limit": 100, "peak_bytes_in_use": 90}),
+            _Die({"bytes_limit": 100, "peak_bytes_in_use": 97}),
+        ]
+        monkeypatch.setattr(
+            runner, "mesh", SimpleNamespace(devices=np.array(dies, dtype=object))
+        )
+        assert runner._hbm_headroom_bytes() == 3
+
     @pytest.mark.parametrize("overlap", [True, False])
     def test_greedy_generation_matches_dense_forward(self, tp1, overlap) -> None:
         runner, model, params, engine = tp1

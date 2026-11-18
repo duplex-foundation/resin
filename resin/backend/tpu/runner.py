@@ -114,7 +114,9 @@ class TpuRunner:
     """Run a :class:`TpuModel` on a ``tp`` mesh with Engine-owned KV pages.
 
     ``cache_slab_capacity`` caps the slab pool; it is required on platforms
-    that report no device memory, such as the JAX CPU backend. Construction
+    that report no device memory, such as the JAX CPU backend. The pool takes
+    the free HBM left after weights up to ``memory_utilization``; pass
+    ``workspace_bytes`` to hold back more (see ``plan_capacity``). Construction
     compiles every step shape, and any compilation after that fails the step,
     which is how the backend enforces its shape-stability rule. Configure
     JAX's persistent compile cache through its ``JAX_COMPILATION_CACHE_DIR``
@@ -137,7 +139,7 @@ class TpuRunner:
         prefill_chunk_size: int | None = None,
         buckets: ShapeBuckets | None = None,
         memory_utilization: float = 0.9,
-        workspace_bytes: int = 8 * 1024**3,
+        workspace_bytes: int | None = None,
         cache_slab_capacity: int | None = None,
     ) -> None:
         if min(max_seq_len, max_num_seqs, max_batch_tokens) <= 0:
@@ -251,6 +253,17 @@ class TpuRunner:
         jax.block_until_ready((self._project(self.params, rows), self._arena.caches))
         self.warmup_compilations = self.compilations.count
         self.benchmark_metadata["warmup_seconds"] = time.perf_counter() - start
+        headroom = self._hbm_headroom_bytes()
+        if headroom is not None:
+            self.benchmark_metadata["hbm_headroom_bytes"] = headroom
+
+    def _hbm_headroom_bytes(self) -> int | None:
+        """Smallest per-die ``bytes_limit - peak_bytes_in_use``, or ``None`` off device."""
+
+        stats = [device.memory_stats() for device in self.mesh.devices.flat]
+        if any(not stat or "peak_bytes_in_use" not in stat for stat in stats):
+            return None
+        return min(int(s["bytes_limit"]) - int(s["peak_bytes_in_use"]) for s in stats)
 
     @property
     def compilations_after_warmup(self) -> int:

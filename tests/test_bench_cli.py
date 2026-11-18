@@ -202,6 +202,30 @@ def test_tpu_workloads_match_the_inferencex_shapes(name):
     assert workload.prompt + workload.output == workload.max_model_len
 
 
+def test_tpu_workload_accepts_only_decode_batch_overrides():
+    parse = bench.argument_parser().parse_args
+    base = [
+        "--model",
+        "qwen3-32b",
+        "--workload",
+        "8k/1k",
+        "--prompt-source",
+        "synthetic",
+    ]
+    _, cases, _, _ = bench._configuration(
+        parse([*base, "--decode-batch-sizes", "144,160"])
+    )
+    assert [(c["phase"], c["batch_size"]) for c in cases] == [
+        ("prefill", 1),
+        ("decode", 144),
+        ("decode", 160),
+    ]
+    with pytest.raises(ValueError, match="at most 320"):
+        bench._configuration(parse([*base, "--decode-batch-sizes", "321"]))
+    with pytest.raises(ValueError, match="only --decode-batch-sizes"):
+        bench._configuration(parse([*base, "--batch-sizes", "8"]))
+
+
 def test_tpu_workload_is_required_and_cuda_rejects_it(capsys):
     with pytest.raises(SystemExit) as error:
         bench.main(

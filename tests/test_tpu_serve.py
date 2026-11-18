@@ -125,6 +125,11 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert kwargs["prefill_chunk_size"] == 4096
     assert kwargs["draft_tokens"] == 0
     assert seen["engine"]["prefix_cache"] is False
+    assert seen["engine"]["scheduler_config"] == {
+        "max_batch_tokens": 4096,
+        "prefill_chunk_size": 4096,
+        "schedule_conservativeness": 1.0,
+    }
     assert seen["engine"]["context_length"] == 9216
     assert seen["engine"]["max_running_requests"] == 320
     assert seen["serve"] == ("127.0.0.1", 9)
@@ -132,3 +137,57 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert os.environ["JAX_COMPILATION_CACHE_DIR"]
     with pytest.raises(SystemExit):
         tpu_serve.main(["--model", "qwen3-32b", "--checkpoint", str(checkpoint)])
+
+
+def test_serve_flags_override_the_chunk_and_conservativeness(monkeypatch, tmp_path):
+    seen = {}
+
+    def create_runner(*args, **kwargs):
+        seen["runner"] = kwargs
+        return type("Runner", (), {})()
+
+    class Engine:
+        closed = False
+
+        def __init__(self, runner, **kwargs):
+            seen["engine"] = kwargs
+
+        def close(self):
+            self.closed = True
+
+    class Server:
+        def __init__(self, engine, **kwargs):
+            pass
+
+        def serve(self, *, host, port):
+            pass
+
+    monkeypatch.setattr(tpu_serve, "create_runner", create_runner)
+    monkeypatch.setattr(tpu_serve, "create_recipe", lambda *a, **k: object())
+    resin = cast(Any, ModuleType("resin"))
+    resin.Engine = Engine
+    resin.SchedulerConfig = lambda **kwargs: kwargs
+    server = cast(Any, ModuleType("resin.server"))
+    server.HttpServer = Server
+    monkeypatch.setitem(sys.modules, "resin", resin)
+    monkeypatch.setitem(sys.modules, "resin.server", server)
+    tpu_serve.main(
+        [
+            "--model",
+            "qwen3-32b",
+            "--checkpoint",
+            str(tmp_path),
+            "--workload",
+            "8k/1k",
+            "--schedule-conservativeness",
+            "0.15",
+            "--prefill-chunk-size",
+            "8192",
+        ]
+    )
+    assert seen["runner"]["prefill_chunk_size"] == 8192
+    assert seen["engine"]["scheduler_config"] == {
+        "max_batch_tokens": 8192,
+        "prefill_chunk_size": 8192,
+        "schedule_conservativeness": 0.15,
+    }
