@@ -1107,10 +1107,12 @@ def _configuration(args):
             args.decode_context_lengths,
             args.batch_sizes,
             args.prefill_batch_sizes,
-            args.decode_batch_sizes,
         )
     ):
-        raise ValueError("--workload sets the TPU prompt, batch, and context limit")
+        raise ValueError(
+            "--workload sets the TPU prompt and context limit; "
+            "only --decode-batch-sizes may vary the batch"
+        )
     world = spec.world_size if args.world_size is None else args.world_size
     topology = dict(world_size=world, cp=1 if args.cp is None else args.cp)
     for axis in ("attn_dp", "attn_tp", "ep"):
@@ -1130,7 +1132,12 @@ def _configuration(args):
     if args.workload is not None:
         selected = TPU_WORKLOADS[args.workload]
         contexts = {"prefill": [selected.prompt], "decode": [selected.prompt]}
-        batches = {"prefill": [1], "decode": [selected.max_num_seqs]}
+        decode_batches = args.decode_batch_sizes or [selected.max_num_seqs]
+        if max(decode_batches) > selected.max_num_seqs:
+            raise ValueError(
+                f"{args.workload} serves at most {selected.max_num_seqs} sequences"
+            )
+        batches = {"prefill": [1], "decode": decode_batches}
     else:
         contexts = {
             "prefill": args.prefill_context_lengths

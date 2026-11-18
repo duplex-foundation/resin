@@ -42,6 +42,16 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--prefix-cache", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument(
+        "--schedule-conservativeness",
+        type=float,
+        help="admission headroom for future output tokens; defaults to the workload's",
+    )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        help="tokens per prefill step; defaults to the preset's",
+    )
     args = parser.parse_args(argv)
     require_tpu_chip(queued=True)
     export_tpu_compile_cache_env()
@@ -51,6 +61,12 @@ def main(argv=None) -> None:
 
     spec = get_model(args.model)
     workload = TPU_WORKLOADS[args.workload]
+    chunk = args.prefill_chunk_size or spec.prefill_chunk_size
+    conservativeness = (
+        workload.schedule_conservativeness
+        if args.schedule_conservativeness is None
+        else args.schedule_conservativeness
+    )
     started = time.perf_counter()
     runner = create_runner(
         spec,
@@ -58,7 +74,7 @@ def main(argv=None) -> None:
         device="tpu",
         context_length=workload.max_model_len,
         max_batch_size=workload.max_num_seqs,
-        prefill_chunk_size=spec.prefill_chunk_size,
+        prefill_chunk_size=chunk,
         draft_tokens=0,
         gpu_memory_utilization=spec.gpu_memory_utilization,
         workload=args.workload,
@@ -70,8 +86,9 @@ def main(argv=None) -> None:
         context_length=workload.max_model_len,
         prefix_cache=args.prefix_cache,
         scheduler_config=SchedulerConfig(
-            max_batch_tokens=spec.prefill_chunk_size,
-            prefill_chunk_size=spec.prefill_chunk_size,
+            max_batch_tokens=chunk,
+            prefill_chunk_size=chunk,
+            schedule_conservativeness=conservativeness,
         ),
     )
     warmup = getattr(runner, "benchmark_metadata", {}).get("warmup_seconds")

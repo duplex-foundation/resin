@@ -193,11 +193,31 @@ class TestFp8Weights:
             weight = getattr(layer, name)
             assert weight.qvalue.sharding.spec == P(None, "tp")
             assert weight.scale.sharding.is_fully_replicated
-        assert params.embed.sharding.is_fully_replicated
+        assert params.embed.sharding.spec == P(None, "tp")
         assert params.lm_head.sharding.spec == P("tp", None)
         assert params.rope_cache is not None
         assert params.rope_cache[0].sharding.is_fully_replicated
         assert params.rope_cache[1].sharding.is_fully_replicated
+
+    @pytest.mark.parametrize("token_sharded", [False, True])
+    def test_hidden_sharded_embedding_lookup_is_exact(
+        self, checkpoint, token_sharded
+    ) -> None:
+        directory, _ = checkpoint
+        devices = jax.devices("cpu")
+        if len(devices) < 2:
+            pytest.skip("needs 2 host devices")
+        model, params = load_model(
+            directory, make_mesh(2, devices), page_tokens=PAGE_TOKENS
+        )
+        assert params.embed.addressable_shards[0].data.shape == (
+            params.embed.shape[0],
+            params.embed.shape[1] // 2,
+        )
+        ids = np.array([7, 0, 3, 3, 120, 5, 9, 1], np.int32)
+        out = model._embed_tokens(params.embed, ids, token_sharded=token_sharded)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(params.embed)[ids])
+        assert out.sharding.spec == (P("tp", None) if token_sharded else P())
 
     def test_tp2_fp8_matches_tp1_with_per_shard_packing_and_sequence_parallel(
         self, checkpoint, tmp_path
@@ -396,7 +416,7 @@ class TestFp8Weights:
             down=_fp8_sds((5120, 25600), row, rep),
         )
         params = Qwen3Params(
-            embed=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=rep),
+            embed=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=row),
             layers=(lp, lp),
             norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
             lm_head=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=col),

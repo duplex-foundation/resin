@@ -99,6 +99,7 @@ def check_tensor_parallel(config: Qwen3Config, tp: int) -> None:
         ("attention heads", config.num_attention_heads),
         ("intermediate_size", config.intermediate_size),
         ("vocab_size", config.vocab_size),
+        ("hidden_size", config.hidden_size),
     ):
         if size % tp:
             raise ValueError(f"{label} ({size}) do not divide over tp={tp}")
@@ -152,6 +153,41 @@ class Qwen3Model:
                 self.kv_dtype,
             ),
         )
+
+    def _embed_tokens(
+        self, embed: jax.Array, input_ids: jax.Array, *, token_sharded: bool
+    ) -> jax.Array:
+        """Look up rows of the hidden-sharded ``embed`` table (``ROW``).
+
+        Each die gathers its ``H / tp`` columns for every token, then the dies
+        exchange columns: an all-gather for replicated activations, an
+        all-to-all for token-sharded ones. Both are exact copies of the
+        replicated-table lookup.
+        """
+
+        if tp_size(self.mesh) == 1:
+            return embed[input_ids]
+        if token_sharded:
+
+            def _local(ids: jax.Array, emb: jax.Array) -> jax.Array:
+                return jax.lax.all_to_all(
+                    emb[ids], TP_AXIS, split_axis=0, concat_axis=1, tiled=True
+                )
+
+            out_specs = TOKENS_SHARDED
+        else:
+
+            def _local(ids: jax.Array, emb: jax.Array) -> jax.Array:
+                return jax.lax.all_gather(emb[ids], TP_AXIS, axis=1, tiled=True)
+
+            out_specs = P()
+        return jax.shard_map(
+            _local,
+            mesh=self.mesh,
+            in_specs=(P(), ROW),
+            out_specs=out_specs,
+            check_vma=False,
+        )(input_ids, embed)
 
     def _resolve_decode_matmul_mode(self, tokens: int) -> DecodeMatmulMode:
         if self.decode_matmul_mode != "auto":
@@ -387,12 +423,7 @@ class Qwen3Model:
         layers = params.layers
         backend = self._resolve_prefill_matmul_backend(tokens)
 
-        x = jax.shard_map(
-            lambda ids, emb: emb[ids],
-            mesh=self.mesh,
-            in_specs=(P(TP_AXIS), P()),
-            out_specs=TOKENS_SHARDED,
-        )(inputs.input_ids, params.embed)
+        x = self._embed_tokens(params.embed, inputs.input_ids, token_sharded=True)
         act_dtype = x.dtype
 
         def _sharded_norm_quant(
@@ -584,7 +615,7 @@ class Qwen3Model:
                 check_vma=False,
             )(delta, res, norm_w)
 
-        x = params.embed[inputs.input_ids]
+        x = self._embed_tokens(params.embed, inputs.input_ids, token_sharded=False)
         act_dtype = x.dtype
         use_fused_unpack_quant = (
             self.fuse_unpack_attn_quant
@@ -717,7 +748,7 @@ class Qwen3Model:
             return self._hidden_states_fp8_replicated(params, caches, inputs)
 
         q_width = config.num_attention_heads * config.head_dim
-        x = params.embed[inputs.input_ids]
+        x = self._embed_tokens(params.embed, inputs.input_ids, token_sharded=False)
         layer_caches = []
         for weights, kv_cache in zip(params.layers, caches[0], strict=True):
             h = rms_norm(x, weights.input_norm, eps)

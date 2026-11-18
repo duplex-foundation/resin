@@ -114,7 +114,9 @@ class TpuRunner:
     """Run a :class:`TpuModel` on a ``tp`` mesh with Engine-owned KV pages.
 
     ``cache_slab_capacity`` caps the slab pool; it is required on platforms
-    that report no device memory, such as the JAX CPU backend. Construction
+    that report no device memory, such as the JAX CPU backend. The pool takes
+    the free HBM left after weights up to ``memory_utilization``; pass
+    ``workspace_bytes`` to hold back more (see ``plan_capacity``). Construction
     compiles every step shape, and any compilation after that fails the step,
     which is how the backend enforces its shape-stability rule. Configure
     JAX's persistent compile cache through its ``JAX_COMPILATION_CACHE_DIR``
@@ -137,7 +139,7 @@ class TpuRunner:
         prefill_chunk_size: int | None = None,
         buckets: ShapeBuckets | None = None,
         memory_utilization: float = 0.9,
-        workspace_bytes: int = 8 * 1024**3,
+        workspace_bytes: int | None = None,
         cache_slab_capacity: int | None = None,
     ) -> None:
         if min(max_seq_len, max_num_seqs, max_batch_tokens) <= 0:

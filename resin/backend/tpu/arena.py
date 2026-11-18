@@ -39,6 +39,11 @@ LANES = 128
 Caches = tuple[tuple[jax.Array, ...], ...]
 
 
+MIN_HEADROOM_BYTES = 3584 * 1024**2
+"""Free HBM across the mesh that a default budget leaves for activations and
+compiled executables, which are allocated after the cache."""
+
+
 def _align(value: int, multiple: int) -> int:
     return math.ceil(value / multiple) * multiple
 
@@ -136,13 +141,16 @@ def plan_capacity(
     mesh: Mesh,
     *,
     memory_utilization: float,
-    workspace_bytes: int,
+    workspace_bytes: int | None = None,
 ) -> CacheCapacityPlan:
     """Size the slab pool from the mesh's free HBM after weights are resident.
 
-    ``workspace_bytes`` covers activations and compiled temporaries for the
-    whole mesh. Each group's arrays span every slab, so a slab costs the sum of
-    the groups' slab bytes.
+    ``workspace_bytes`` is extra HBM held back for activations and compiled
+    temporaries across the whole mesh, on top of the ``1 - memory_utilization``
+    share the budget already protects. ``None`` holds back only what is needed
+    to keep :data:`MIN_HEADROOM_BYTES` free in total, which is nothing at the
+    default 0.98 utilization. Each group's arrays span every slab, so a slab
+    costs the sum of the groups' slab bytes.
     """
 
     stats = [device.memory_stats() for device in mesh.devices.flat]
@@ -153,6 +161,9 @@ def plan_capacity(
     total = sum(int(stat["bytes_limit"]) for stat in stats)
     used = sum(int(stat.get("bytes_in_use", 0)) for stat in stats)
     tp = tp_size(mesh)
+    if workspace_bytes is None:
+        protected = math.ceil(total * (1.0 - memory_utilization))
+        workspace_bytes = max(0, MIN_HEADROOM_BYTES - protected)
     return plan_cache_capacity(
         total,
         total - used,
@@ -199,6 +210,7 @@ class CacheArena:
 
 __all__ = [
     "KV_PARTITION",
+    "MIN_HEADROOM_BYTES",
     "CacheArena",
     "Caches",
     "KvCacheSpec",

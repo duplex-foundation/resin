@@ -436,6 +436,7 @@ class TpuWorkload:
     decode_buckets: tuple[int, ...]
     max_num_seqs: int = 320
     max_batch_tokens: int = 4096
+    schedule_conservativeness: float = 1.0
 
     def __post_init__(self) -> None:
         if self.prompt + self.output != self.max_model_len:

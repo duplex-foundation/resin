@@ -24,7 +24,13 @@ from resin import (  # noqa: E402
 )
 from resin.backend.plans import PagedCachePlan  # noqa: E402
 from resin.backend.tpu import attention  # noqa: E402
-from resin.backend.tpu.arena import CacheArena, KvCacheSpec, cache_layout  # noqa: E402
+from resin.backend.tpu.arena import (  # noqa: E402
+    MIN_HEADROOM_BYTES,
+    CacheArena,
+    KvCacheSpec,
+    cache_layout,
+    plan_capacity,
+)
 from resin.backend.tpu.attention import paged_attention, quantize_kv  # noqa: E402
 from resin.backend.tpu.buckets import Bucket, ShapeBuckets  # noqa: E402
 from resin.backend.tpu.compilation import CompilationCounter  # noqa: E402
@@ -199,6 +205,50 @@ class TestArena:
         assert group.retention == CacheRetention.WINDOW
         assert group.read_window_tokens == 1024
         assert group.window_tokens == 1024 + 512 - 1
+
+
+class _Die:
+    def __init__(self, limit: int, used: int) -> None:
+        self._stats = {"bytes_limit": limit, "bytes_in_use": used}
+
+    def memory_stats(self) -> dict[str, int]:
+        return self._stats
+
+
+def _chip(used_gib_per_die: float, limit_gib: float = 94.74):
+    gib = 1024**3
+    dies = [_Die(int(limit_gib * gib), int(used_gib_per_die * gib)) for _ in range(2)]
+    return types.SimpleNamespace(devices=np.array(dies, dtype=object), shape={"tp": 2})
+
+
+class TestPlanCapacity:
+    SPEC = KvCacheSpec(layers=64, kv_heads=8, head_dim=128)
+
+    def test_default_reserves_only_the_utilization_margin(self) -> None:
+        plan = plan_capacity(
+            [self.SPEC],
+            _chip(16.7),
+            memory_utilization=0.98,  # ty: ignore[invalid-argument-type]
+        )
+        assert plan.overhead_bytes == 0
+        assert plan.parent_capacity >= 4_800
+
+    def test_default_tops_up_to_the_minimum_headroom(self) -> None:
+        mesh = _chip(16.7)
+        plan = plan_capacity([self.SPEC], mesh, memory_utilization=0.995)  # ty: ignore[invalid-argument-type]
+        assert plan.protected_free_bytes + plan.overhead_bytes == MIN_HEADROOM_BYTES
+
+    def test_explicit_workspace_replaces_the_default(self) -> None:
+        mesh = _chip(16.7)
+        default = plan_capacity([self.SPEC], mesh, memory_utilization=0.98)  # ty: ignore[invalid-argument-type]
+        explicit = plan_capacity(
+            [self.SPEC],
+            mesh,  # ty: ignore[invalid-argument-type]
+            memory_utilization=0.98,
+            workspace_bytes=8 * 1024**3,
+        )
+        assert explicit.overhead_bytes == 8 * 1024**3
+        assert default.parent_capacity - explicit.parent_capacity == 256
 
 
 def _random_kv(seed: int, tokens: int, q_heads: int, kv_heads: int, dim: int):
