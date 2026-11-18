@@ -3009,3 +3009,65 @@ fn mixed_prefill_does_not_starve_behind_more_decode_rows_than_the_token_budget()
         assert_eq!(decoder.take_result().unwrap().len(), 30);
     }
 }
+
+#[test]
+fn a_mixed_cohort_reports_and_dispatches_as_prefill() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    64,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_batch_tokens: NonZeroU32::new(8),
+            prefill_chunk_size: NonZeroU32::new(8),
+            mixed_prefill_decode: true,
+            ..Default::default()
+        },
+        4,
+        64,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(8),
+            prefill_chunk_size: NonZeroU32::new(8).unwrap(),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let decoder = engine.submit(input(vec![10], 30)).unwrap();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    assert_eq!(
+        engine.next_phase().unwrap(),
+        Some(resin_core::Phase::Decode)
+    );
+
+    let late = engine.submit(input(vec![40, 41, 42], 2)).unwrap();
+    assert_eq!(
+        engine.next_phase().unwrap(),
+        Some(resin_core::Phase::Prefill)
+    );
+
+    let dispatched = model.plans.len();
+    let events = engine
+        .step_phase_with(&mut model, Some(resin_core::Phase::Decode), Ok)
+        .unwrap();
+    assert!(events.is_empty());
+    assert_eq!(
+        model.plans.len(),
+        dispatched,
+        "a decode turn must not dispatch the mixed cohort"
+    );
+
+    engine
+        .step_phase_with(&mut model, Some(resin_core::Phase::Prefill), Ok)
+        .unwrap();
+    let plan = &model.plans[dispatched];
+    assert_eq!(plan.phase, resin_core::Phase::Prefill);
+    assert_eq!(plan.sequence_ids, [decoder.id(), late.id()]);
+}

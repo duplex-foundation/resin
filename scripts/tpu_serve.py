@@ -43,6 +43,11 @@ def main(argv=None) -> None:
         "--prefix-cache", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--mixed-prefill-decode",
+        action="store_true",
+        help="batch running decode rows with prefill chunks (off by default)",
+    )
+    parser.add_argument(
         "--schedule-conservativeness",
         type=float,
         default=1.0,
@@ -78,6 +83,7 @@ def main(argv=None) -> None:
         draft_tokens=0,
         gpu_memory_utilization=spec.gpu_memory_utilization,
         workload=args.workload,
+        mixed_prefill_decode=args.mixed_prefill_decode,
     )
     recipe = create_recipe(spec, args.checkpoint.expanduser(), runner=runner)
     engine = Engine(

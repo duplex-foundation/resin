@@ -188,7 +188,7 @@ def _runner(
     *,
     prefill_chunk_size=None,
     cache_slab_capacity=48,
-    mixed_prefill_decode=True,
+    mixed_prefill_decode=None,
     **model_options,
 ):
     devices = jax.devices("cpu")
@@ -207,7 +207,11 @@ def _runner(
         prefill_chunk_size=prefill_chunk_size,
         buckets=BUCKETS,
         cache_slab_capacity=cache_slab_capacity,
-        mixed_prefill_decode=mixed_prefill_decode,
+        **(
+            {}
+            if mixed_prefill_decode is None
+            else dict(mixed_prefill_decode=mixed_prefill_decode)
+        ),
     )
     return runner, model, params
 
@@ -489,16 +493,16 @@ class TestMixedPrefillDecode:
     def test_decoders_share_steps_with_chunked_prefills_and_match_dense(
         self, tp
     ) -> None:
-        runner, model, params = _runner(tp, prefill_chunk_size=4)
+        runner, model, params = _runner(
+            tp, prefill_chunk_size=4, mixed_prefill_decode=True
+        )
         outputs, steps = self._staggered(runner, PROMPTS, mixed=True)
         assert runner.compilations_after_warmup == 0
         assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
         assert any(0 < decode < rows for decode, rows in steps), steps
 
-    def test_opting_out_keeps_decode_and_prefill_in_separate_steps(self) -> None:
-        runner, model, params = _runner(
-            1, prefill_chunk_size=4, mixed_prefill_decode=False
-        )
+    def test_decode_and_prefill_stay_in_separate_steps_by_default(self) -> None:
+        runner, model, params = _runner(1, prefill_chunk_size=4)
         outputs, steps = self._staggered(runner, PROMPTS, mixed=False)
         assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
         assert not any(0 < decode < rows for decode, rows in steps), steps

@@ -133,6 +133,7 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert kwargs["max_batch_size"] == 320
     assert kwargs["prefill_chunk_size"] == 4096
     assert kwargs["draft_tokens"] == 0
+    assert kwargs["mixed_prefill_decode"] is False
     assert seen["engine"]["prefix_cache"] is False
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 4096,
@@ -194,9 +195,11 @@ def test_serve_flags_override_the_chunk_and_conservativeness(monkeypatch, tmp_pa
             "0.15",
             "--prefill-chunk-size",
             "8192",
+            "--mixed-prefill-decode",
         ]
     )
     assert seen["runner"]["prefill_chunk_size"] == 8192
+    assert seen["runner"]["mixed_prefill_decode"] is True
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 8192,
         "prefill_chunk_size": 8192,
