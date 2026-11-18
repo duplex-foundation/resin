@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
@@ -21,6 +22,24 @@ from deploy.models import (  # noqa: E402
     get_model,
     require_tpu_chip,
 )
+
+QWEN3_TOKENIZER_DIR = Path(
+    os.environ.get(
+        "RESIN_QWEN3_TOKENIZER_DIR", "/home/raskin/vllm-repro/models/Qwen3-32B"
+    )
+).expanduser()
+
+_QWEN3_CHAT_TURNS = {
+    "system-user": (
+        ("system", "You are concise."),
+        ("user", "Hello"),
+    ),
+    "multi-turn": (
+        ("user", "What is 2+2?"),
+        ("assistant", "4"),
+        ("user", "And times 3?"),
+    ),
+}
 
 
 def test_workloads_are_the_published_server_shapes():
@@ -216,6 +235,39 @@ def test_qwen3_recipe_uses_the_checkpoint_template(monkeypatch, tmp_path):
         recipe.render([Message(Role.USER, [Thinking("secret")])])
     with pytest.raises(ValueError, match="tools"):
         recipe.render([Message(Role.USER, [Text("Hello")])], tools=(object(),))
+
+
+@pytest.mark.skipif(
+    not (QWEN3_TOKENIZER_DIR / "tokenizer.json").is_file(),
+    reason="Qwen3-32B tokenizer is not at RESIN_QWEN3_TOKENIZER_DIR",
+)
+@pytest.mark.parametrize("name", _QWEN3_CHAT_TURNS)
+@pytest.mark.parametrize("thinking", [True, False])
+def test_qwen3_chat_recipe_matches_the_checkpoint_template(name, thinking):
+    from transformers import AutoTokenizer
+
+    from resin.recipe import Message, RenderOptions, Role, Text
+
+    roles = {
+        "system": Role.SYSTEM,
+        "user": Role.USER,
+        "assistant": Role.ASSISTANT,
+    }
+    turns = _QWEN3_CHAT_TURNS[name]
+    messages = [Message(roles[role], [Text(text)]) for role, text in turns]
+    rows = [{"role": role, "content": text} for role, text in turns]
+    recipe = create_recipe(get_model("qwen3-32b"), QWEN3_TOKENIZER_DIR)
+    prompt = recipe.render(messages, options=RenderOptions(enable_thinking=thinking))
+    reference = AutoTokenizer.from_pretrained(
+        QWEN3_TOKENIZER_DIR, local_files_only=True
+    )
+    expected = reference.apply_chat_template(
+        rows,
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=thinking,
+    )
+    assert list(prompt.token_ids) == list(expected["input_ids"])
 
 
 def test_compile_cache_env_is_exported_and_overridable(monkeypatch):
