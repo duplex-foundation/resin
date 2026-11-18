@@ -1091,14 +1091,7 @@ def create_recipe(
 
     spec = get_model(model)
     path = spec.path if checkpoint is None else Path(checkpoint)
-    if spec.family == "qwen3":
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            path, local_files_only=True, trust_remote_code=False
-        )
-        return _Qwen3ChatRecipe(tokenizer)
-    if spec.family in {"deepseek_v41", "glm5_3_flash"}:
+    if spec.family in {"qwen3", "deepseek_v41", "glm5_3_flash"}:
         from tokenizers import Tokenizer
 
         return get_native_recipe(
