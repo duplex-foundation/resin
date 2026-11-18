@@ -446,7 +446,7 @@ class TestTpuRunner:
 
 class TestMixedPrefillDecode:
     @staticmethod
-    def _staggered(runner, model, params, prompts, *, mixed: bool):
+    def _staggered(runner, prompts, *, mixed: bool):
         decode_rows: list[tuple[int, int]] = []
         forward = runner.forward
 
@@ -490,7 +490,7 @@ class TestMixedPrefillDecode:
         self, tp
     ) -> None:
         runner, model, params = _runner(tp, prefill_chunk_size=4)
-        outputs, steps = self._staggered(runner, model, params, PROMPTS, mixed=True)
+        outputs, steps = self._staggered(runner, PROMPTS, mixed=True)
         assert runner.compilations_after_warmup == 0
         assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
         assert any(0 < decode < rows for decode, rows in steps), steps
@@ -499,6 +499,6 @@ class TestMixedPrefillDecode:
         runner, model, params = _runner(
             1, prefill_chunk_size=4, mixed_prefill_decode=False
         )
-        outputs, steps = self._staggered(runner, model, params, PROMPTS, mixed=False)
+        outputs, steps = self._staggered(runner, PROMPTS, mixed=False)
         assert outputs == [model.dense_greedy(params, prompt, 8) for prompt in PROMPTS]
         assert not any(0 < decode < rows for decode, rows in steps), steps

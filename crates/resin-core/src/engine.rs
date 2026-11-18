@@ -1361,7 +1361,9 @@ impl<P: Clone> EngineCore<P> {
                 if mixed
                     && scheduled_rows.len() < selected_requests.len()
                     && scheduled_rows.iter().all(|row| row.phase == Phase::Decode)
-                    && selected_requests[scheduled_rows.len()].phase() == Phase::Prefill
+                    && selected_requests[scheduled_rows.len()..]
+                        .iter()
+                        .any(|request| request.phase() == Phase::Prefill)
                 {
                     mixed = false;
                     continue;

@@ -3,7 +3,8 @@
 //! [`engine::EngineCore`] owns synchronous execution transactions and request
 //! progress. Runners receive frozen plans carrying opaque frontend payloads.
 //! Its constituent pieces remain available independently:
-//! - [`Scheduler`] chooses a phase-homogeneous, key-homogeneous cohort.
+//! - [`Scheduler`] chooses a key-homogeneous cohort, phase-homogeneous unless
+//!   `RunnerConfig::mixed_prefill_decode` is set.
 //! - [`schedule_ready_prefix`] freezes each row's current token range.
 //! - [`resources`] owns allocator state and just-in-time batch leases.
 //!

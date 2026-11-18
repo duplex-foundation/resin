@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_selection_without_prefill_work_is_the_running_decode_cohort() {
+    fn mixed_selection_full_running_set_excludes_waiting_prefill() {
         let scheduler = scheduler(
             2,
             vec![
@@ -852,10 +852,9 @@ mod tests {
                 running_item(1, None, Phase::Decode),
             ],
         );
-        let (_, mut selection) = scheduler.selected_mixed();
-        selection.truncate(1);
+        let (_, selection) = scheduler.selected_mixed();
         let taken = scheduler.take_selected(selection);
-        assert_eq!(taken.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
-        assert_eq!(ready_ids(&scheduler), [0]);
+        assert_eq!(taken.iter().map(|item| item.id).collect::<Vec<_>>(), [1, 0]);
+        assert!(ready_ids(&scheduler).is_empty());
     }
 }

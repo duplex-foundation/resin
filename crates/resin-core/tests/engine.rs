@@ -2893,8 +2893,13 @@ fn mixed_prefill_decode_runs_decoders_alongside_chunked_prefills() {
 
 #[test]
 fn mixed_prefill_decode_drains_an_oversubscribed_queue_without_livelock() {
-    let stats = drain_long_prompts(OVERSUBSCRIBED, 1.0, true);
-    assert!(stats.retracted <= 24, "{stats:?}");
+    let homogeneous = drain_long_prompts(OVERSUBSCRIBED, 1.0, false);
+    let mixed = drain_long_prompts(OVERSUBSCRIBED, 1.0, true);
+    assert!(mixed.mixed_plans > 0, "{mixed:?}");
+    assert!(
+        mixed.retracted <= homogeneous.retracted,
+        "{homogeneous:?} {mixed:?}"
+    );
 }
 
 #[test]
@@ -2947,6 +2952,59 @@ fn mixed_prefill_falls_back_when_decode_rows_leave_no_room_for_an_atomic_span() 
         engine.step(&mut model).unwrap();
     }
     assert_eq!(atomic.take_result().unwrap().len(), 2);
+    for decoder in decoders {
+        assert_eq!(decoder.take_result().unwrap().len(), 30);
+    }
+}
+
+#[test]
+fn mixed_prefill_does_not_starve_behind_more_decode_rows_than_the_token_budget() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    64,
+                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_batch_tokens: NonZeroU32::new(4),
+            prefill_chunk_size: NonZeroU32::new(4),
+            mixed_prefill_decode: true,
+            ..Default::default()
+        },
+        8,
+        64,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(4),
+            prefill_chunk_size: NonZeroU32::new(4).unwrap(),
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let decoders = (0..6)
+        .map(|index| engine.submit(input(vec![10 + index], 30)).unwrap())
+        .collect::<Vec<_>>();
+    while model
+        .plans
+        .last()
+        .is_none_or(|plan| plan.phase != resin_core::Phase::Decode)
+    {
+        engine.step(&mut model).unwrap();
+    }
+
+    let late = engine.submit(input(vec![40, 41], 2)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = model.plans.last().unwrap();
+    assert_eq!(plan.phase, resin_core::Phase::Prefill);
+    assert!(plan.sequence_ids.contains(&late.id()));
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    assert_eq!(late.take_result().unwrap().len(), 2);
     for decoder in decoders {
         assert_eq!(decoder.take_result().unwrap().len(), 30);
     }

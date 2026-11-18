@@ -324,6 +324,9 @@ drivers stepping together.
 1. Drivers exchange read-only `Engine.next_phase()` proposals. When replicas
    propose different phases, drivers alternate prefill and decode. The proposal shares the native admission
    fallback used by actual dispatch and reserves nothing.
+   A replica that sets `RunnerConfig(mixed_prefill_decode=True)` proposes `prefill`
+   for a cohort that mixes phases, so its decode rows advance only on prefill
+   turns. Leave the option off for distributed runners.
 2. Each driver calls `Engine.step(phase=agreed_phase)`. A mismatched local cohort
    remains queued. Cache pressure and retraction still belong to the native Engine.
 3. Actual plans rendezvous with empty or failed preparation on other drivers.

@@ -222,14 +222,45 @@ class TestMetadata:
             )
 
     def test_mixed_plan_leases_lookahead_pages_for_decode_rows_only(self) -> None:
-        # Row 0 would write beyond its two pages, but the prefill row's table
-        # must stay exact: lookahead applies to the decode rows alone.
+        layout = CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(2)])
+
+        def plan(blocks_per_row: list[int]) -> BatchPlan:
+            indptr = np.concatenate([[0], np.cumsum(blocks_per_row)]).tolist()
+            return BatchPlan(
+                sequence_ids=[10, 11, 12],
+                context_lengths=[3, 1, 0],
+                prefill_lengths=[3, 1, 3],
+                token_ids=[10, 11, 12],
+                token_indptr=[0, 1, 2, 3],
+                sampling_mask=[True, True, False],
+                cache_groups=[
+                    CacheGroupPlan(
+                        group_index=0,
+                        block_indptr=indptr,
+                        block_slab_ids=list(range(1, indptr[-1] + 1)),
+                        block_slotnums=[0] * indptr[-1],
+                        block_table_start_indices=[0, 0, 0],
+                        append_slab_ids=[
+                            indptr[0] + 2,
+                            indptr[1] + 1,
+                            indptr[2] + 1,
+                        ],
+                        append_slotnums=[0, 0, 0],
+                        append_block_offsets=[1, 1, 0],
+                        blocks_per_slab=1,
+                    )
+                ],
+                phase=BatchPhase.PREFILL,
+            )
+
+        # With two lookahead tokens the decode rows need blocks through
+        # positions 5 and 3, while the prefill row keeps its single block.
+        leased = plan([3, 2, 1])
+        assert PagedCachePlan.from_plan(leased, layout, decode_lookahead=2).rows == 3
         with pytest.raises(ValueError, match="row 0 has an invalid active range"):
-            PagedCachePlan.from_plan(_mixed_plan(), _MIXED_LAYOUT, decode_lookahead=2)
-        without_decode_lookahead = PagedCachePlan.from_plan(
-            _mixed_plan(), _MIXED_LAYOUT
-        )
-        assert without_decode_lookahead.rows == 3
+            PagedCachePlan.from_plan(plan([2, 2, 1]), layout, decode_lookahead=2)
+        with pytest.raises(ValueError, match="row 2 has an invalid active range"):
+            PagedCachePlan.from_plan(plan([3, 2, 2]), layout, decode_lookahead=2)
 
     def test_page_table_packs_slab_slots_after_the_window_start(self) -> None:
         table = build_inputs(_decode_plan(), Bucket(4, 4), (4,)).attention
