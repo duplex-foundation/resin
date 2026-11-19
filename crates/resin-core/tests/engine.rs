@@ -3232,3 +3232,95 @@ fn capacity_failure_is_reported_by_the_cohort_preflight_without_partial_growth()
     );
     assert!(!request.done());
 }
+
+/// Prints how many decode steps overlap for a saturated 8k-prompt, 1k-output
+/// workload shaped like the TPU benchmark: 320 requests, 256-token pages, about
+/// 150 rows at once. Run with `cargo test --release --test engine
+/// saturated_overlap_report -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn saturated_overlap_report() {
+    const SATURATED_ROWS: usize = 145;
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    4900,
+                    vec![KvGroupLayout::new(256, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 1,
+            ..Default::default()
+        },
+        320,
+        9216,
+        SchedulerConfig {
+            max_batch_tokens: Some(NonZeroU32::new(4096).unwrap()),
+            prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
+            schedule_conservativeness: 1.0,
+        },
+        false,
+    )
+    .unwrap();
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let mut seed = 12345u64;
+    let mut draw = |low: u64, high: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        low + (seed >> 33) % (high - low + 1)
+    };
+    for _ in 0..320 {
+        let prompt = draw(6554, 8192) as usize;
+        let output = draw(819, 1024) as usize;
+        engine.submit(input(vec![1; prompt], output)).unwrap();
+    }
+    let (mut synchronous, mut overlapped, mut prefill) = (0u64, 0u64, 0u64);
+    let (mut saturated_synchronous, mut saturated_overlapped) = (0u64, 0u64);
+    while engine.has_work() {
+        let Some(plan) = engine.prepare_overlap_step(&mut model, None).unwrap() else {
+            break;
+        };
+        let decode = plan.phase == resin_core::Phase::Decode;
+        if !decode {
+            prefill += 1;
+        } else {
+            synchronous += 1;
+            saturated_synchronous += u64::from(plan.sequence_ids.len() >= SATURATED_ROWS);
+        }
+        let chained = engine.retain_continuation(&plan);
+        let mut output = model.forward(plan).unwrap();
+        while chained && engine.has_continuation() {
+            let mut next = engine.continuation_plan().unwrap().unwrap();
+            overlapped += 1;
+            saturated_overlapped += u64::from(next.sequence_ids.len() >= SATURATED_ROWS);
+            next.token_ids = (0..output.view().len())
+                .map(|row| *output.view().row(row).last().unwrap())
+                .collect();
+            let following = model.forward(next).unwrap();
+            engine
+                .complete_continuing_step_with(&mut model, Ok(output.view()), Ok)
+                .unwrap();
+            output = following;
+        }
+        engine
+            .complete_step_with(&mut model, Ok(output.view()), Ok)
+            .unwrap();
+    }
+    let saturated = saturated_synchronous + saturated_overlapped;
+    println!(
+        "prefill steps {prefill}; decode steps {synchronous} synchronous, {overlapped} overlapped"
+    );
+    println!(
+        "saturated decode steps ({SATURATED_ROWS}+ rows): {saturated_synchronous} synchronous, \
+         {saturated_overlapped} overlapped ({:.1}% overlapped)",
+        100.0 * saturated_overlapped as f64 / saturated as f64
+    );
+    println!(
+        "retractions {}",
+        engine.metrics_snapshot().unwrap().retracted_requests
+    );
+}
