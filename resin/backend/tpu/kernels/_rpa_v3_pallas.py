@@ -766,6 +766,7 @@ def _ragged_paged_attention_kernel_loop(
 _BATCHED_NUM_INPUT_SLOTS = 3
 _BATCHED_NUM_OUTPUT_SLOTS = 2
 _DMA_CHUNK_BYTES = _TPU_NUM_LANES * 4
+_LOG2_E = math.log2(math.e)
 
 
 def _unpack_kv_words(
@@ -785,9 +786,9 @@ def _unpack_kv_words(
     ) + _unpack_kv_words(right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype)
 
 
-@dataclass(frozen=True, eq=True)
-class BatchedDecodeConfig:
-    """Static configuration for the triple-buffered batched decode RPA kernel."""
+@dataclass(frozen=True, eq=True, kw_only=True)
+class _BatchedRpaConfigMixin:
+    """Shared geometry and memory-sizing helpers for batched decode and mixed RPA."""
 
     batch_size: int
     bkv_sz: int
@@ -812,6 +813,14 @@ class BatchedDecodeConfig:
     disable_bounds_checks: bool = True
     disable_semaphore_checks: bool = True
     interpret_mode: bool = False
+
+    @property
+    def bq_tokens_per_block(self) -> int:
+        return 1
+
+    @property
+    def scratch_dtype(self) -> jnp.dtype:
+        return jnp.float32
 
     @property
     def dtype_q(self) -> jnp.dtype:
@@ -879,6 +888,61 @@ class BatchedDecodeConfig:
         )
 
     @property
+    def q_vmem_shape(self) -> tuple[int, int, int, int, int, int]:
+        return (
+            self.batch_size,
+            self.num_kv_heads,
+            self.bq_tokens_per_block,
+            self.aligned_num_q_heads_per_kv_head // self.packing_q,
+            self.packing_q,
+            self.aligned_head_dim,
+        )
+
+    @property
+    def kv_vmem_shape(self) -> tuple[int, int, int, int, int]:
+        return (
+            self.batch_size,
+            self.bkv_sz,
+            self.bkv_stride,
+            self.packing_kv,
+            self.aligned_head_dim,
+        )
+
+    @property
+    def lm_scratch_shape(self) -> tuple[int, int, int]:
+        return (
+            self.num_kv_heads,
+            self.bq_tokens_per_block * self.aligned_num_q_heads_per_kv_head,
+            _TPU_NUM_LANES,
+        )
+
+    @property
+    def acc_scratch_shape(self) -> tuple[int, int, int]:
+        return (
+            self.num_kv_heads,
+            self.bq_tokens_per_block * self.aligned_num_q_heads_per_kv_head,
+            self.aligned_head_dim,
+        )
+
+
+@dataclass(frozen=True, eq=True, kw_only=True)
+class BatchedDecodeConfig(_BatchedRpaConfigMixin):
+    """Static configuration for the triple-buffered batched decode RPA kernel."""
+
+    bf16_qk_softmax: bool = True
+    bf16_online_scratch: bool = False
+
+    @property
+    def use_bf16_qk_softmax(self) -> bool:
+        return self.bf16_qk_softmax and self.dtype_q == jnp.bfloat16
+
+    @property
+    def scratch_dtype(self) -> jnp.dtype:
+        if self.use_bf16_qk_softmax and self.bf16_online_scratch:
+            return jnp.bfloat16
+        return jnp.float32
+
+    @property
     def max_steps_ub(self) -> int:
         fixed_words = (
             self.max_num_seqs + (self.max_num_seqs + 1) + self.num_page_indices + 3 + 1
@@ -903,45 +967,12 @@ class BatchedDecodeConfig:
         return max(self.max_steps_ub, align_to(max_total_steps, self.max_steps_ub))
 
     @property
-    def q_vmem_shape(self) -> tuple[int, int, int, int, int, int]:
-        return (
-            self.batch_size,
-            self.num_kv_heads,
-            1,
-            self.aligned_num_q_heads_per_kv_head // self.packing_q,
-            self.packing_q,
-            self.aligned_head_dim,
-        )
-
-    @property
-    def kv_vmem_shape(self) -> tuple[int, int, int, int, int]:
-        return (
-            self.batch_size,
-            self.bkv_sz,
-            self.bkv_stride,
-            self.packing_kv,
-            self.aligned_head_dim,
-        )
-
-    @property
-    def lm_scratch_shape(self) -> tuple[int, int, int]:
-        return (
-            self.num_kv_heads,
-            self.aligned_num_q_heads_per_kv_head,
-            _TPU_NUM_LANES,
-        )
-
-    @property
-    def acc_scratch_shape(self) -> tuple[int, int, int]:
-        return (
-            self.num_kv_heads,
-            self.aligned_num_q_heads_per_kv_head,
-            self.aligned_head_dim,
-        )
-
-    @property
     def kernel_name(self) -> str:
         name = f"RPAd-snh-p{self.page_size}-b{self.batch_size}-q1-k{self.bkv_sz}"
+        if not self.use_bf16_qk_softmax:
+            name += "-f32p"
+        elif self.bf16_online_scratch:
+            name += "-bf16s"
         if self.sliding_window is not None:
             name += f"-sw{self.sliding_window}"
         return name
@@ -1373,7 +1404,8 @@ def _batched_decode_rpa_body(
     start_next_fetch()
 
     tq = cfgs.aligned_num_q_heads_per_kv_head
-    kv_iota = lax.broadcasted_iota(jnp.int32, (cfgs.num_kv_heads, tq, cfgs.bkv_sz), 2)
+    tot_q = cfgs.num_kv_heads * tq
+    kv_iota = lax.broadcasted_iota(jnp.int32, (tot_q, cfgs.bkv_sz), 1)
     kv_vpu_iota = (
         lax.broadcasted_iota(
             jnp.int32,
@@ -1520,76 +1552,116 @@ def _batched_decode_rpa_body(
         k.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
         dimension_numbers=(([2], [2]), ([0], [0])),
         preferred_element_type=jnp.float32,
-    ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq, cfgs.bkv_sz)
+    ).reshape(cfgs.batch_size, tot_q, cfgs.bkv_sz)
 
     s_scale = cfgs.sm_scale
     if cfgs.q_scale is not None:
         s_scale *= cfgs.q_scale
     if cfgs.k_scale is not None:
         s_scale *= cfgs.k_scale
-    qk = qk * s_scale
 
+    use_bf16_qkp = cfgs.use_bf16_qk_softmax
+    acc_dt = cfgs.scratch_dtype
     if cfgs.soft_cap is not None:
-        qk = cfgs.soft_cap * jnp.tanh(qk / cfgs.soft_cap)
+        qk = cfgs.soft_cap * jnp.tanh(qk * (s_scale / cfgs.soft_cap))
+        if use_bf16_qkp:
+            qk = (qk * _LOG2_E).astype(jnp.bfloat16)
+    elif use_bf16_qkp:
+        qk = (qk * (s_scale * _LOG2_E)).astype(jnp.bfloat16)
+    else:
+        qk = qk * s_scale
+
+    if use_bf16_qkp:
+        bf16_floor = -0.7 * float(jnp.finfo(jnp.bfloat16).max)
+        mask_val = (
+            max(cfgs.mask_value * _LOG2_E, bf16_floor)
+            if math.isfinite(cfgs.mask_value)
+            else bf16_floor
+        )
+        mask_fill: Any = jnp.asarray(mask_val, dtype=jnp.bfloat16)
+        exp_fn = lax.exp2
+    else:
+        mask_fill = cfgs.mask_value
+        exp_fn = jnp.exp
+
+    # Finite mask_fill guarantees finite m_next even on all-masked tiles; on the
+    # first tile after is_last_k == 1, m_prev == -inf gives alpha == 0.0 and
+    # zeros carried-over finite l_prev / o_prev without extra vselect ops.
+    skip_lo_reset = use_bf16_qkp
 
     qk = jnp.stack(
         [
-            jnp.where(masks[b_idx], qk[b_idx], cfgs.mask_value)
+            jnp.where(masks[b_idx], qk[b_idx], mask_fill)
             for b_idx in range(cfgs.batch_size)
         ],
         axis=0,
     )
 
-    m_prev = m_scratch_ref[...]
-    l_prev = l_scratch_ref[...]
-    o_prev = acc_scratch_ref[...]
+    m_reset = jnp.asarray(-jnp.inf, dtype=acc_dt)
+    zero_acc = jnp.asarray(0.0, dtype=acc_dt)
+    m_prev = m_scratch_ref[...].reshape(tot_q, _TPU_NUM_LANES)
+    l_prev = l_scratch_ref[...].reshape(tot_q, _TPU_NUM_LANES)
+    o_prev = acc_scratch_ref[...].reshape(tot_q, cfgs.aligned_head_dim)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
     alpha_list: list[jax.Array] = []
     m_next_list: list[jax.Array] = []
     for b_idx in range(cfgs.batch_size):
-        m_next_b = jnp.maximum(m_prev, m_curr[b_idx])
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        m_next_b = jnp.maximum(m_prev, m_curr[b_idx].astype(acc_dt))
+        alpha_b = exp_fn(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
-        m_prev = jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, -jnp.inf, m_next_b)
-    m_scratch_ref[...] = m_prev
+        m_prev = jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, m_reset, m_next_b)
+    m_scratch_ref[...] = m_prev.reshape(cfgs.lm_scratch_shape)
 
-    m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - _broadcast_minor(m_next, qk.shape))
-    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=jnp.float32)
+    m_next = jnp.stack(m_next_list, axis=0).astype(qk.dtype)
+    p = exp_fn(qk - _broadcast_minor(m_next, qk.shape))
+    p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=acc_dt)
 
     l_next_list: list[jax.Array] = []
     for b_idx in range(cfgs.batch_size):
         l_next_b = alpha_list[b_idx] * l_prev + p_rowsum[b_idx]
         l_next_list.append(l_next_b)
-        l_prev = jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, 0.0, l_next_b)
-    l_scratch_ref[...] = l_prev
+        l_prev = (
+            l_next_b
+            if skip_lo_reset
+            else jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, zero_acc, l_next_b)
+        )
+    l_scratch_ref[...] = l_prev.reshape(cfgs.lm_scratch_shape)
 
     pv = lax.dot_general(
         p.reshape(-1, tq, cfgs.bkv_sz),
         v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
         dimension_numbers=(([2], [1]), ([0], [0])),
         preferred_element_type=jnp.float32,
-    ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq, cfgs.aligned_head_dim)
+    ).reshape(cfgs.batch_size, tot_q, cfgs.aligned_head_dim)
     if cfgs.v_scale is not None:
         pv = pv * cfgs.v_scale
+    pv = pv.astype(acc_dt)
 
     o_next_list: list[jax.Array] = []
     for b_idx in range(cfgs.batch_size):
         alpha_full = _broadcast_minor(alpha_list[b_idx], o_prev.shape)
         o_next_b = alpha_full * o_prev + pv[b_idx]
         o_next_list.append(o_next_b)
-        o_prev = jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, 0.0, o_next_b)
-    acc_scratch_ref[...] = o_prev
+        o_prev = (
+            o_next_b
+            if skip_lo_reset
+            else jnp.where(schedule_ref.is_last_k[step, b_idx] == 1, zero_acc, o_next_b)
+        )
+    acc_scratch_ref[...] = o_prev.reshape(cfgs.acc_scratch_shape)
 
     for b_idx in range(cfgs.batch_size):
         batch_acc = o_next_list[b_idx]
         batch_l = _broadcast_minor(l_next_list[b_idx], batch_acc.shape)
-        if not cfgs.interpret_mode and cfgs.dtype_q != jnp.float32:
-            res = batch_acc * pltpu.reciprocal(batch_l, approx=True)
-        else:
+        if (
+            cfgs.interpret_mode
+            or cfgs.dtype_q == jnp.float32
+            or cfgs.dtype_q == batch_l.dtype == jnp.bfloat16
+        ):
             res = lax.div(batch_acc, batch_l)
+        else:
+            res = batch_acc * pltpu.reciprocal(batch_l, approx=True)
         out_b = res.astype(cfgs.dtype_q)
         if cfgs.interpret_mode:
             o_vref[b_idx] = out_b.reshape(o_vref.shape[1:])
@@ -1969,9 +2041,9 @@ def run_batched_decode_rpa(
                 pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
                 pltpu.SemaphoreType.DMA((_BATCHED_NUM_OUTPUT_SLOTS,)),
                 pltpu.SemaphoreType.DMA((1,)),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.acc_scratch_shape, jnp.float32),
+                pltpu.VMEM(cfgs.lm_scratch_shape, cfgs.scratch_dtype),
+                pltpu.VMEM(cfgs.lm_scratch_shape, cfgs.scratch_dtype),
+                pltpu.VMEM(cfgs.acc_scratch_shape, cfgs.scratch_dtype),
             ],
         ),
         compiler_params=pltpu.CompilerParams(

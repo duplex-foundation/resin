@@ -3759,6 +3759,197 @@ class TestBatchedDecodeAttention:
                 interpret=True,
             )
 
+    def test_batched_decode_vmem_estimate_and_bf16_softmax_variants(self) -> None:
+        from resin.backend.tpu.kernels.ragged_paged_attention import (
+            _batched_decode_vmem_estimate_bytes,
+            _get_batched_decode_block_sizes,
+        )
+
+        vmem_64m = 64 * 1024 * 1024
+
+        # Qwen3-32B tp=2 FP8 (32 Q, 4 KV, hd=128, bkv=1280, bsz=8): 2*kv + qk_f32
+        # dominates softmax temporaries; bf16 online scratch halves (m, l, acc).
+        est_4a = _batched_decode_vmem_estimate_bytes(
+            4,
+            8,
+            128,
+            8,
+            1280,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            bf16_qk_softmax=True,
+            bf16_online_scratch=False,
+        )
+        est_4b = _batched_decode_vmem_estimate_bytes(
+            4,
+            8,
+            128,
+            8,
+            1280,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            bf16_qk_softmax=True,
+            bf16_online_scratch=True,
+        )
+        assert est_4a == 59_424_768
+        assert est_4a - est_4b == (2 * 32 * 128 + 32 * 128) * 2
+
+        # High-GQA shapes step down below 64 MiB and bf16 softmax unlocks larger bkv_sz.
+        for q_h, kv_h in ((64, 1), (128, 2)):
+            bkv_bf16, bsz_bf16 = _get_batched_decode_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                q_h,
+                kv_h,
+                128,
+                256,
+                37,
+                tpu_version=7,
+                vmem_limit_bytes=vmem_64m,
+                bf16_qk_softmax=True,
+            )
+            bkv_f32, bsz_f32 = _get_batched_decode_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                q_h,
+                kv_h,
+                128,
+                256,
+                37,
+                tpu_version=7,
+                vmem_limit_bytes=vmem_64m,
+                bf16_qk_softmax=False,
+            )
+            assert bkv_bf16 > bkv_f32
+            assert (
+                _batched_decode_vmem_estimate_bytes(
+                    kv_h,
+                    q_h // kv_h,
+                    128,
+                    bsz_f32,
+                    bkv_f32,
+                    jnp.bfloat16,
+                    jnp.float8_e4m3fn,
+                    bf16_qk_softmax=False,
+                )
+                < vmem_64m
+            )
+
+        # Kernel naming and Pallas interpret numerical parity across f32, 4A, and 4B.
+        rng = np.random.default_rng(2026)
+        page_size, pages_per_seq, num_seqs, total_pages = 8, 5, 10, 56
+        q_heads, kv_heads, head_dim = 16, 2, 128
+        sm_scale = head_dim**-0.5
+        kv_lens_np = np.array([1, 7, 8, 9, 16, 17, 24, 31, 32, 39], dtype=np.int32)
+        pages = np.full((num_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        next_page = 1
+        for s, kv_l in enumerate(kv_lens_np):
+            used = (int(kv_l) + page_size - 1) // page_size
+            pages[s, :used] = np.arange(next_page, next_page + used, dtype=np.int32)
+            next_page += used
+        cu_q_np = np.arange(num_seqs + 1, dtype=np.int32)
+        dist_np = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
+
+        q = jnp.asarray(
+            rng.standard_normal((num_seqs, q_heads, head_dim)), jnp.bfloat16
+        )
+        k = jnp.asarray(
+            rng.standard_normal((num_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        v = jnp.asarray(
+            rng.standard_normal((num_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+
+        for kv_dtype in (jnp.float8_e4m3fn, jnp.bfloat16):
+            fp8 = kv_dtype == jnp.float8_e4m3fn
+            k_scale = 0.5 if fp8 else None
+            v_scale = 0.25 if fp8 else None
+            cache_shape = get_kv_cache_shape(
+                total_pages, page_size, kv_heads, head_dim, kv_dtype
+            )
+            clean_cache = np.array(
+                quantize_kv(
+                    jnp.asarray(rng.standard_normal(cache_shape) * 0.25, jnp.float32),
+                    kv_dtype,
+                ),
+                copy=True,
+            )
+            poisoned_cache = clean_cache.copy()
+            nan_val = np.asarray(jnp.full((), jnp.nan, dtype=kv_dtype))
+            poisoned_cache[-1] = nan_val
+            for s, kv_l in enumerate(kv_lens_np):
+                rem = int(kv_l) % page_size
+                if rem != 0:
+                    used = (int(kv_l) + page_size - 1) // page_size
+                    poisoned_cache[pages[s, used - 1], rem:] = nan_val
+
+            ref_out, _ = _reference_rpa(
+                np.asarray(q),
+                np.asarray(k),
+                np.asarray(v),
+                clean_cache,
+                kv_lens_np,
+                pages.reshape(-1),
+                cu_q_np,
+                dist_np,
+                sm_scale=sm_scale,
+                sliding_window=20,
+                soft_cap=30.0,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
+            for bf16_qkp, bf16_sc, sfx, atol in (
+                (False, False, "-f32p", 3e-2 if fp8 else 2e-2),
+                (True, False, "", 3e-2 if fp8 else 2e-2),
+                (True, True, "-bf16s", 4e-2 if fp8 else 3e-2),
+            ):
+
+                def _call(
+                    qi: jax.Array,
+                    ki: jax.Array,
+                    vi: jax.Array,
+                    ci: jax.Array,
+                    _qkp: bool = bf16_qkp,
+                    _sc: bool = bf16_sc,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return ragged_paged_attention(
+                        qi,
+                        ki,
+                        vi,
+                        ci,
+                        jnp.asarray(kv_lens_np),
+                        jnp.asarray(pages.reshape(-1)),
+                        jnp.asarray(cu_q_np),
+                        jnp.asarray(dist_np),
+                        sm_scale=sm_scale,
+                        sliding_window=20,
+                        soft_cap=30.0,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        d_block_sizes=(1, 16, 1, 16),
+                        use_batched_decode=True,
+                        bf16_qk_softmax=_qkp,
+                        bf16_online_scratch=_sc,
+                        disable_bounds_checks=False,
+                        disable_semaphore_checks=False,
+                        interpret=True,
+                    )
+
+                jaxpr_str = str(
+                    jax.make_jaxpr(_call)(q, k, v, jnp.asarray(poisoned_cache))
+                )
+                assert f"RPAd-snh-p8-b8-q1-k16{sfx}-sw20" in jaxpr_str
+                out, _ = _call(q, k, v, jnp.asarray(poisoned_cache))
+                out_f32 = np.asarray(out, np.float32)
+                assert not np.any(np.isnan(out_f32))
+                np.testing.assert_allclose(
+                    out_f32,
+                    np.asarray(ref_out, np.float32),
+                    rtol=2e-2,
+                    atol=atol,
+                )
+
     @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
     def test_pallas_interpret_batched_decode_ragged_batches_and_page_boundaries(
         self, kv_dtype: jnp.dtype
