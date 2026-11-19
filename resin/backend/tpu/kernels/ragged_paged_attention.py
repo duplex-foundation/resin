@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged Paged Attention v3 kernel for the Resin TPU backend.
+"""Ragged Paged Attention v3 and batched decode kernel for the Resin TPU backend.
 
-Adapted from vllm-project/tpu-inference (Apache-2.0) at revision
-d9c7e19da8c497ec63b9381bb0bc9b2a5e0d4bb2:
-tpu_inference/kernels/ragged_paged_attention/v3/kernel.py.
+Adapted from vllm-project/tpu-inference (Apache-2.0):
+- Stock RPA v3 at revision d9c7e19da8c497ec63b9381bb0bc9b2a5e0d4bb2:
+  tpu_inference/kernels/ragged_paged_attention/v3/kernel.py.
+- Batched decode RPA at revision da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:
+  tpu_inference/kernels/experimental/batched_rpa/{tuned_params,wrapper}.py.
 """
 
 from __future__ import annotations
@@ -31,17 +33,21 @@ from jax.experimental.pallas import tpu as pltpu
 
 from resin.backend.tpu import reference
 from resin.backend.tpu.kernels._rpa_v3_pallas import (
+    BatchedDecodeConfig,
     RpaCase,
     _ragged_paged_attention_kernel,
     align_to,
     cdiv,
+    generate_batched_decode_schedule,
     get_dtype_packing,
     get_tpu_version,
     has_bank_conflicts,
     next_power_of_2,
+    run_batched_decode_rpa,
 )
 
 DEFAULT_INTERPRET_VMEM_BYTES = 64 * 1024 * 1024
+_DEFAULT_SMEM_BYTES = 1024 * 1024
 _TPU7X_VMEM_BYTES = 64 * 1024 * 1024
 _DEVICE_VMEM_BYTES = {
     4: 16 * 1024 * 1024,
@@ -53,6 +59,9 @@ _DEVICE_VMEM_BYTES = {
 _DECODE_VMEM_SCRATCH_FRACTION = 0.375
 _MIXED_VMEM_SCRATCH_FRACTION = 0.45
 _TUNED_VMEM_CAP_FRACTION = 0.75
+_BATCHED_DECODE_VMEM_FRACTION = 0.80
+_BATCHED_DECODE_DEFAULT_BATCH_SIZE = 8
+_BATCHED_DECODE_MIN_SEQS = 16
 
 
 class RpaBlockSizes(NamedTuple):
@@ -887,6 +896,117 @@ def _cpu_ragged_paged_attention(
 _DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
 
 
+def _batched_decode_vmem_estimate_bytes(
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    batch_size: int,
+    bkv_sz: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+) -> int:
+    q_packing = get_dtype_packing(q_dtype)
+    kv_packing = get_dtype_packing(kv_dtype)
+    aligned_q_per_kv = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    aligned_q_heads = aligned_q_per_kv * actual_num_kv_heads
+    actual_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    bkv_stride = int(cdiv(actual_num_kv_heads * 2, kv_packing))
+    if has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
+    aligned_kv_heads_x2 = bkv_stride * kv_packing
+    aligned_hd = align_to(actual_head_dim, 128)
+    q_bytes = jnp.dtype(q_dtype).itemsize
+    kv_bytes = jnp.dtype(kv_dtype).itemsize
+
+    bq_bo_buf_bytes = 5 * aligned_q_heads * aligned_hd * q_bytes
+    bkv_buf_bytes = 3 * bkv_sz * aligned_kv_heads_x2 * aligned_hd * kv_bytes
+    compute_bytes = (
+        actual_q_heads * aligned_hd * q_bytes
+        + bkv_sz * actual_num_kv_heads * aligned_hd * kv_bytes
+        + bkv_sz * actual_q_heads * q_bytes
+    )
+    scratch_bytes = (2 * aligned_q_heads * 128 + aligned_q_heads * aligned_hd) * 4
+    return (
+        batch_size * (bq_bo_buf_bytes + bkv_buf_bytes + compute_bytes) + scratch_bytes
+    )
+
+
+def _get_batched_decode_block_sizes(
+    q_dtype: Any,
+    kv_dtype: Any,
+    actual_num_q_heads: int,
+    actual_num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pages_per_seq: int,
+    *,
+    tpu_version: int | None = None,
+    sliding_window: int | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[int, int]:
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+    capped_vmem = int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
+
+    mxu_col = 256 if (version >= 6 or version < 0) else 128
+    table_kv = pages_per_seq * page_size
+    horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+    max_bkv = min(4096, horizon_kv, table_kv)
+    bkv_step = align_to(mxu_col, page_size)
+    if bkv_step > max_bkv:
+        bkv_step = page_size
+
+    q_per_kv = actual_num_q_heads // actual_num_kv_heads
+    batch_size = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
+    while (
+        batch_size > 1
+        and _batched_decode_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bkv_step,
+            q_dtype,
+            kv_dtype,
+        )
+        > capped_vmem
+    ):
+        batch_size -= 1
+
+    bkv_sz = bkv_step
+    while (
+        bkv_sz > page_size
+        and _batched_decode_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > capped_vmem
+    ):
+        bkv_sz = max(page_size, (bkv_sz // 2 // page_size) * page_size)
+
+    while (
+        bkv_sz + bkv_step <= max_bkv
+        and _batched_decode_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bkv_sz + bkv_step,
+            q_dtype,
+            kv_dtype,
+        )
+        < capped_vmem
+    ):
+        bkv_sz += bkv_step
+
+    return bkv_sz, batch_size
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -906,6 +1026,7 @@ _DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
         "d_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "use_batched_decode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
         "interpret",
@@ -937,6 +1058,7 @@ def ragged_paged_attention(
     d_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    use_batched_decode: bool | None = None,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
     interpret: bool = False,
@@ -1190,19 +1312,105 @@ def ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
         ).as_dict()
 
-    d_blocks = _blocks_for(d_block_sizes, RpaCase.DECODE)
-    q, kv_cache = jax.lax.cond(
-        distribution[0] > 0,
-        lambda args: run_rpa_case(
-            args[0],
-            args[1],
-            **d_blocks,
-            static_q_len=1,
-            case=RpaCase.DECODE,
-        ),
-        lambda args: args,
-        (q, kv_cache),
+    dispatch_batched_decode = (
+        (
+            tpu_version >= 7
+            and d_block_sizes is None
+            and max_num_seqs >= _BATCHED_DECODE_MIN_SEQS
+        )
+        if use_batched_decode is None
+        else use_batched_decode
     )
+
+    if dispatch_batched_decode:
+        assert vmem_limit_bytes is not None
+        if d_block_sizes is not None:
+            if d_block_sizes[0] != 1 or d_block_sizes[2] != 1:
+                raise ValueError(
+                    f"batched decode requires bq_sz == bq_csz == 1, got {d_block_sizes=}"
+                )
+            batched_bkv_sz = d_block_sizes[1]
+            batched_bsz = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
+        else:
+            batched_bkv_sz, batched_bsz = _get_batched_decode_block_sizes(
+                q.dtype,
+                kv_cache.dtype,
+                eff_q_heads,
+                actual_num_kv_heads,
+                eff_head_dim,
+                page_size,
+                pages_per_seq,
+                tpu_version=tpu_version,
+                sliding_window=sliding_window,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+        smem_bytes = (
+            pltpu.get_tpu_info().smem_capacity_bytes
+            if tpu_version >= 4
+            else _DEFAULT_SMEM_BYTES
+        )
+        batched_cfgs = BatchedDecodeConfig(
+            batch_size=batched_bsz,
+            bkv_sz=batched_bkv_sz,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            max_num_seqs=max_num_seqs,
+            num_q_heads=eff_q_heads,
+            num_kv_heads=actual_num_kv_heads,
+            head_dim=eff_head_dim,
+            q_dtype_name=jnp.dtype(q.dtype).name,
+            kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
+            sm_scale=sm_scale,
+            mask_value=mask_value,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=update_kv_cache,
+            vmem_limit_bytes=vmem_limit_bytes,
+            smem_capacity_bytes=smem_bytes,
+            disable_bounds_checks=disable_bounds_checks,
+            disable_semaphore_checks=disable_semaphore_checks,
+            interpret_mode=interpret,
+        )
+        # Emit schedule generation outside lax.cond so XLA CSE shares one
+        # schedule call across all layers of the forward step.
+        decode_schedule = generate_batched_decode_schedule(
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            cfgs=batched_cfgs,
+        )
+        q, kv_cache = jax.lax.cond(
+            distribution[0] > 0,
+            lambda args: run_batched_decode_rpa(
+                kv_lens,
+                page_indices,
+                decode_schedule,
+                args[0],
+                kv,
+                args[1],
+                cfgs=batched_cfgs,
+                tpu_version=tpu_version,
+            ),
+            lambda args: args,
+            (q, kv_cache),
+        )
+    else:
+        d_blocks = _blocks_for(d_block_sizes, RpaCase.DECODE)
+        q, kv_cache = jax.lax.cond(
+            distribution[0] > 0,
+            lambda args: run_rpa_case(
+                args[0],
+                args[1],
+                **d_blocks,
+                static_q_len=1,
+                case=RpaCase.DECODE,
+            ),
+            lambda args: args,
+            (q, kv_cache),
+        )
     m_blocks = _blocks_for(m_block_sizes, RpaCase.MIXED)
     q, kv_cache = jax.lax.cond(
         distribution[2] > distribution[1],
