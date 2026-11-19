@@ -3527,6 +3527,7 @@ class TestTpuHardwareMosaic:
             dtype=kv_dtype,
         )
         cache_sharding = NamedSharding(mesh, KV_PARTITION)
+        head_sharding = NamedSharding(mesh, P(None, "tp", None))
         q_packed_sharding = NamedSharding(mesh, P("tp", None, None, None, None))
         kv_merged_sharding = NamedSharding(mesh, P(None, "tp", None, None))
         rep_sharding = NamedSharding(mesh, P())
@@ -3578,10 +3579,10 @@ class TestTpuHardwareMosaic:
         @functools.partial(
             jax.jit,
             donate_argnums=(2,),
-            out_shardings=(q_packed_sharding, cache_sharding),
+            out_shardings=(head_sharding, cache_sharding),
         )
         def mosaic_batched_decode(q_p, kv_m, kv_c, meta):
-            return paged_attention(
+            att_p, kv_out = paged_attention(
                 q_p,
                 kv_m,
                 None,
@@ -3596,6 +3597,13 @@ class TestTpuHardwareMosaic:
                 actual_num_q_heads=64,
                 actual_head_dim=128,
             )
+            out_3d = jax.shard_map(
+                lambda x: prepare_outputs(x, 8, 128),
+                mesh=mesh,
+                in_specs=P("tp", None, None, None, None),
+                out_specs=P(None, "tp", None),
+            )(att_p)
+            return out_3d, kv_out
 
         def ref_batched_decode(q_p, kv_m, kv_c, meta):
             return paged_attention(
@@ -3663,9 +3671,8 @@ class TestTpuHardwareMosaic:
         finally:
             counter.close()
 
-        for b_live, step_kv, q_p, kv_m, meta, out_p in step_records:
+        for b_live, step_kv, q_p, kv_m, meta, out_unpacked in step_records:
             ref_p, ref_cache = ref_batched_decode(q_p, kv_m, ref_cache, meta)
-            out_unpacked = prepare_outputs(out_p, 8, 128)
             ref_unpacked = prepare_outputs(ref_p, 8, 128)
             out_f32 = np.asarray(out_unpacked[:b_live], np.float32)
             assert not np.any(np.isnan(out_f32))
