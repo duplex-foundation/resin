@@ -167,7 +167,7 @@ def test_a_new_arrival_with_a_free_slot_drains_the_overlap_chain():
 
 
 @pytest.mark.parametrize("output_count", [16, 32])
-def test_eight_token_verification_requires_output_headroom(output_count):
+def test_eight_token_verification_overlaps_up_to_the_output_limit(output_count):
     runner = AsyncRunner()
     runner.runner_config = RunnerConfig(
         cache_layout=runner.runner_config.cache_layout,
@@ -181,10 +181,7 @@ def test_eight_token_verification_requires_output_headroom(output_count):
         while engine.has_work():
             engine.step()
         assert request.take_result() == list(range(2, output_count + 2))
-        if output_count == 16:
-            assert engine.overlap_stats == (0, 0)
-        else:
-            assert engine.overlap_stats[1] > 0
+        assert engine.overlap_stats[1] > 0
     finally:
         engine.close()
         runner.shutdown()
@@ -322,15 +319,17 @@ def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
     runner.shutdown()
 
 
-def test_short_budgets_use_synchronous_reference():
+def test_a_short_budget_overlaps_and_discards_the_finished_successor():
     runner = AsyncRunner()
     engine = Engine(runner)
     request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=4))
-    engine.step()
-    assert engine.step()
-    assert not runner.pending and not engine.overlap_pending
+    while engine.has_work():
+        engine.step()
+    assert request.take_result() == [2, 3, 4, 5]
+    assert engine.overlap_stats[1] > 0
+    assert runner.released == [request.id]
+    assert engine.cache_free_parent_count == 16
     engine.close()
-    assert request.done
     runner.shutdown()
 
 

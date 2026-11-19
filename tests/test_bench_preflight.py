@@ -165,7 +165,7 @@ def test_cache_preflight_credits_only_the_configured_shared_history():
         )
 
 
-@pytest.mark.parametrize("drafts,lookahead,output_budget", [(0, 0, 22), (3, 4, 82)])
+@pytest.mark.parametrize("drafts,lookahead,output_budget", [(0, 0, 21), (3, 4, 81)])
 def test_trace_cache_preflight_covers_actual_continuation_reservation(
     capsys, drafts, lookahead, output_budget
 ):
@@ -197,8 +197,8 @@ def test_trace_cache_preflight_covers_actual_continuation_reservation(
         enqueue=lambda plan: None,
     )
     case = BenchCase(phase="decode", context_length=context, batch_size=1)
-    # Explicit independent budgets include the strict two-output-step guard:
-    # K0: 19 generated +3; K3: 73 generated +9 (maximum output4).
+    # Explicit independent budgets reserve two maximum-size steps:
+    # K0: 19 generated +2; K3: 73 generated +8 (maximum output 4).
     assert bench._decode_budget(options, raw) == output_budget
     assert bench._context_capacity([case], options) == context + output_budget
     with pytest.raises(ValueError, match=f"needs {required} cache parents"):

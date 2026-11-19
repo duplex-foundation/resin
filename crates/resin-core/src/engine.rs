@@ -1141,11 +1141,6 @@ impl<P: Clone> EngineCore<P> {
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
                 !row.terminal
-                    && row
-                        .request
-                        .max_output_tokens
-                        .saturating_sub(row.request.generated.len()) as u64
-                        > 2 * maximum
                     && u64::from(row.scheduled.token_start()) + two_step_writes
                         <= u64::from(self.context_length.get())
             })
@@ -1441,14 +1436,7 @@ impl<P: Clone> EngineCore<P> {
                     && scheduled_rows
                         .iter()
                         .zip(&selected_requests)
-                        .all(|(row, request)| {
-                            row.phase == Phase::Decode
-                                && request
-                                    .max_output_tokens
-                                    .saturating_sub(request.generated.len())
-                                    as u64
-                                    > 2 * maximum
-                        });
+                        .all(|(row, _)| row.phase == Phase::Decode);
                 let lookahead = if reserve_continuation {
                     let layout = self.runner_config.cache_layout.as_ref().unwrap();
                     let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
@@ -1477,7 +1465,7 @@ impl<P: Clone> EngineCore<P> {
                             .min(u64::from(
                                 self.context_length.get().saturating_sub(row.token_start()),
                             ))
-                            .min(remaining - 1 + writes);
+                            .min(remaining.saturating_sub(1) + maximum + writes);
                         for group in layout.groups() {
                             if let Some(limit) = group.max_write_tokens() {
                                 let start = u64::from(row.token_start());
