@@ -194,8 +194,10 @@ continue to work through `forward()`.
 Overlap requires a stable decode cohort, enough remaining output and context
 budget, and both steps' write spans inside the same owned blocks in every cache
 group. The Engine retains the requests and a single writer lease across
-continuations. New arrivals, cancellation, close, and cache
-page boundaries drain pending work before changing ownership. Other steps,
+continuations. A waiting request does not stop overlap while the scheduler
+cannot admit it, because the running limit or the KV admission estimate leaves
+no room. A request that becomes admissible, a stop token, cancellation, close,
+and cache page boundaries drain pending work before changing ownership. Other steps,
 including prefill, use the synchronous path. `enable_overlap=False` disables
 overlap for the Engine; `step(allow_overlap=False)` drains pending work or runs
 the next batch synchronously.

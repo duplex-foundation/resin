@@ -88,8 +88,10 @@ inputs and cache views; they do not track pending batches or schedule continuati
 The Engine keeps one batch in flight. Exact accepted tokens, positions and
 sampling offsets feed the next graph on the GPU; CPU progress and events commit
 from the completed output. A single writer lease transfers between safe decode
-continuations. Arrivals, cancellation, close and page boundaries drain before
-changing ownership. Failures after enqueue retain owners in quarantine.
+continuations. Waiting requests that the running limit or the KV admission
+estimate keeps out do not stop overlap. A request that becomes admissible, a
+stop token, cancellation, close and page boundaries drain before changing
+ownership. Failures after enqueue retain owners in quarantine.
 
 The fast path requires a stable decode cohort, sufficient remaining budget, and
 both write spans inside the same owned blocks in every cache group. Stop tokens,

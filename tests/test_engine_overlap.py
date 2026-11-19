@@ -126,6 +126,46 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
     runner.shutdown()
 
 
+def test_a_waiting_request_the_running_limit_blocks_does_not_stop_overlap():
+    runner = AsyncRunner()
+    engine = Engine(runner, max_running_requests=1)
+    first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
+    second = engine.submit([10], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    assert [event.token_id for event in engine.step()] == [3, 4]
+    assert engine.ready_request_count == 1
+    assert engine.overlap_stats == (2, 1)
+    while engine.has_work():
+        engine.step()
+    assert first.take_result() == list(range(2, 26))
+    assert second.take_result() == list(range(11, 35))
+    assert engine.overlap_stats[1] > 1
+    engine.close()
+    runner.shutdown()
+
+
+def test_a_new_arrival_with_a_free_slot_drains_the_overlap_chain():
+    runner = AsyncRunner()
+    engine = Engine(runner, max_running_requests=2)
+    first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    second = engine.submit([10], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [(event.request_id, event.token_id) for event in engine.step()] == [
+        (first.id, 3),
+        (first.id, 4),
+    ]
+    assert engine.overlap_stats == (1, 0)
+    assert not engine.overlap_pending
+    while engine.has_work():
+        engine.step()
+    assert first.take_result() == list(range(2, 26))
+    assert second.take_result() == list(range(11, 35))
+    engine.close()
+    runner.shutdown()
+
+
 @pytest.mark.parametrize("output_count", [16, 32])
 def test_eight_token_verification_requires_output_headroom(output_count):
     runner = AsyncRunner()

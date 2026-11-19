@@ -1081,7 +1081,7 @@ impl<P: Clone> EngineCore<P> {
     }
 
     pub fn has_continuation(&self) -> bool {
-        self.continuation.is_some() && self.scheduler.is_empty()
+        self.continuation.is_some() && self.admission_blocked()
     }
 
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
@@ -1137,8 +1137,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        self.scheduler.is_empty()
-            && plan.phase == Phase::Decode
+        plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
                 !row.terminal
@@ -1189,13 +1188,72 @@ impl<P: Clone> EngineCore<P> {
                             })
                     })
                 })
+            && self.admission_blocked()
+    }
+
+    /// True when no waiting request can join the next step, so a decode batch
+    /// may stay ahead of its harvest. Every running request must already be in
+    /// the in-flight batch; otherwise the next step would dispatch the rest.
+    ///
+    /// The scheduler applies the same estimate when it admits work. A request
+    /// the estimate rejects stays out until a row finishes or the estimate
+    /// shrinks, and neither happens between enqueue and harvest: finished rows
+    /// keep their pages until the following step completes, and a retraction
+    /// only happens while preparing a step. A new arrival, a stop token, a
+    /// storage hit or the decaying `new_token_ratio` makes this return false,
+    /// which drains the chain before the next admission.
+    fn admission_blocked(&self) -> bool {
+        if self.scheduler.is_empty() {
+            return true;
+        }
+        let Some(batch) = &self.in_flight else {
+            return false;
+        };
+        let Some(resources) = &self.kv_resources else {
+            return false;
+        };
+        if self.scheduler.iter().any(Schedulable::is_running) {
+            return false;
+        }
+        let running = || {
+            batch
+                .rows
+                .iter()
+                .filter(|row| !row.terminal)
+                .map(|row| &row.request)
+        };
+        let running_count = running().count();
+        if running_count == 0 {
+            return false;
+        }
+        if running_count >= self.scheduler.max_running_requests() {
+            return true;
+        }
+        let running_key = running().next().and_then(Schedulable::batch_key);
+        let Some(candidate) = self.scheduler.first_waiting(|request| {
+            request.phase() == Phase::Prefill && request.batch_key() == running_key
+        }) else {
+            return true;
+        };
+        let mut estimate = resources.admission_estimate();
+        for request in running() {
+            if estimate
+                .include(request.cache.as_ref(), self.estimated_context(request))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        estimate
+            .include(candidate.cache.as_ref(), self.estimated_context(candidate))
+            .is_ok_and(|parents| parents > u64::from(resources.parent_capacity()))
     }
 
     /// A conservative host plan reserves the longest possible previous output;
     /// the runtime substitutes exact GPU token/position feedback before launch.
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
-        if !self.scheduler.is_empty() {
+        if !self.admission_blocked() {
             return Ok(None);
         }
         let Some(template) = &self.continuation else {
@@ -1320,7 +1378,12 @@ impl<P: Clone> EngineCore<P> {
                 scheduled_has_waiting,
                 has_running,
             ) = {
-                let has_running = self.scheduler.iter().any(|request| request.is_running());
+                let running_count = self
+                    .scheduler
+                    .iter()
+                    .filter(|request| request.is_running())
+                    .count();
+                let has_running = running_count > 0;
                 let (selected_requests, mut selection) = if running_only {
                     self.scheduler.selected_running()
                 } else {
@@ -1358,11 +1421,22 @@ impl<P: Clone> EngineCore<P> {
                 let scheduled_has_waiting = selected_requests[..scheduled_rows.len()]
                     .iter()
                     .any(|request| !request.is_running());
-                // `can_continue` rejects any continuation while requests wait,
-                // so a wide lease would only strand one idle page per row.
+                // A continuation needs every running row in this cohort and
+                // nothing admissible waiting. A cohort that holds all running
+                // rows and no waiting request got here because admission found
+                // no room, so the waiting requests are blocked. Otherwise a
+                // wide lease would only strand one idle page per row. After a
+                // capacity miss the retry cohort holds only running rows, so
+                // admissible waiting requests may remain; `can_continue`
+                // rechecks, and the extra lease then idles for one step.
+                let leaves_only_blocked_waiting = if scheduled_has_waiting {
+                    scheduled_rows.len() == self.scheduler.len()
+                } else {
+                    scheduled_rows.len() == running_count
+                };
                 let reserve_continuation = overlap
                     && self.runner_config.cache_layout.is_some()
-                    && scheduled_rows.len() == self.scheduler.len()
+                    && leaves_only_blocked_waiting
                     && self.storage_waiting.is_empty()
                     && scheduled_rows
                         .iter()
