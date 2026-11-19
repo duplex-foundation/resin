@@ -3698,6 +3698,7 @@ class TestTpuHardwareMosaic:
             dtype=kv_dtype,
         )
         cache_sharding = NamedSharding(mesh, KV_PARTITION)
+        head_sharding = NamedSharding(mesh, P(None, "tp", None))
         q_packed_sharding = NamedSharding(mesh, P("tp", None, None, None, None))
         kv_merged_sharding = NamedSharding(mesh, P(None, "tp", None, None))
         rep_sharding = NamedSharding(mesh, P())
@@ -3729,10 +3730,10 @@ class TestTpuHardwareMosaic:
         @functools.partial(
             jax.jit,
             donate_argnums=(2,),
-            out_shardings=(q_packed_sharding, cache_sharding),
+            out_shardings=(head_sharding, cache_sharding),
         )
         def mosaic_mixed(q_p, kv_m, kv_c, meta):
-            return paged_attention(
+            att_p, kv_out = paged_attention(
                 q_p,
                 kv_m,
                 None,
@@ -3747,6 +3748,13 @@ class TestTpuHardwareMosaic:
                 actual_num_q_heads=64,
                 actual_head_dim=128,
             )
+            out_3d = jax.shard_map(
+                lambda x: prepare_outputs(x, 8, 128),
+                mesh=mesh,
+                in_specs=P("tp", None, None, None, None),
+                out_specs=P(None, "tp", None),
+            )(att_p)
+            return out_3d, kv_out
 
         def ref_mixed(q_p, kv_m, kv_c, meta):
             return paged_attention(
@@ -3821,15 +3829,14 @@ class TestTpuHardwareMosaic:
                     jax.device_put(cu_q, rep_sharding),
                     jax.device_put(np.array(dist_step, dtype=np.int32), rep_sharding),
                 )
-                out_p, cache = mosaic_mixed(q_p, kv_m, cache, meta)
-                out_p.block_until_ready()
+                out_unpacked, cache = mosaic_mixed(q_p, kv_m, cache, meta)
+                out_unpacked.block_until_ready()
                 if warm is None:
                     warm = counter.count
                 else:
                     assert counter.count == warm
 
                 ref_p, ref_cache = ref_mixed(q_p, kv_m, ref_cache, meta)
-                out_unpacked = prepare_outputs(out_p, 8, 128)
                 ref_unpacked = prepare_outputs(ref_p, 8, 128)
                 out_f32 = np.asarray(out_unpacked[:cur], np.float32)
                 assert not np.any(np.isnan(out_f32))
