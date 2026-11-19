@@ -1374,6 +1374,15 @@ def _batched_decode_rpa_body(
 
     tq = cfgs.aligned_num_q_heads_per_kv_head
     kv_iota = lax.broadcasted_iota(jnp.int32, (cfgs.num_kv_heads, tq, cfgs.bkv_sz), 2)
+    kv_vpu_iota = (
+        lax.broadcasted_iota(
+            jnp.int32,
+            (cfgs.num_kv_heads, cfgs.bkv_sz, cfgs.aligned_head_dim),
+            1,
+        )
+        if cfgs.sliding_window is not None
+        else None
+    )
 
     masks: list[jax.Array] = []
     valid_kv_masks: list[jax.Array] = []
@@ -1384,15 +1393,21 @@ def _batched_decode_rpa_body(
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
         kv_len_val = jnp.where(is_valid, kv_lens_ref[safe_s], 0)
-        mask_b = kv_iota < (kv_len_val - k_id)
+        # Keep column 0 unmasked on unused tail lanes (kv_limit = 1) using scalar
+        # int32 select so Mosaic never emits an i1 vector select_n.
+        kv_limit = jnp.where(is_valid, kv_len_val - k_id, 1)
+        mask_b = kv_iota < kv_limit
         if cfgs.sliding_window is not None:
-            mask_b = jnp.logical_and(
-                mask_b,
-                (kv_len_val - 1 - k_id) < kv_iota + cfgs.sliding_window,
+            assert kv_vpu_iota is not None
+            sw_low = jnp.where(
+                is_valid, kv_len_val - 1 - k_id - cfgs.sliding_window, -1
             )
-            valid_kv_masks.append(jnp.where(is_valid, mask_b[:, 0, :], False))
-        # Keep column 0 unmasked on unused tail lanes so softmax row-sums stay >= 1.
-        masks.append(jnp.where(is_valid, mask_b, kv_iota == 0))
+            mask_b = jnp.logical_and(mask_b, kv_iota > sw_low)
+            vpu_limit = jnp.where(is_valid, kv_len_val - k_id, 0)
+            valid_kv_masks.append(
+                jnp.logical_and(kv_vpu_iota < vpu_limit, kv_vpu_iota > sw_low)
+            )
+        masks.append(mask_b)
 
     if cfgs.interpret_mode:
         q = q_vref[...].reshape(
@@ -1487,7 +1502,7 @@ def _batched_decode_rpa_body(
     v = jnp.stack(v_b, axis=0)
 
     if cfgs.sliding_window is not None:
-        valid_kv = jnp.stack(valid_kv_masks, axis=0)[..., None]
+        valid_kv = jnp.stack(valid_kv_masks, axis=0)
         k = jnp.where(valid_kv, k, jnp.zeros_like(k))
         v = jnp.where(valid_kv, v, jnp.zeros_like(v))
 
