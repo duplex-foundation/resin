@@ -196,8 +196,11 @@ write spans inside the same owned blocks in every cache group. The Engine retain
 the requests and a single writer lease across continuations. A waiting request
 does not stop overlap while the scheduler cannot admit it, because the running
 limit or the KV admission estimate leaves no room. A request that becomes
-admissible, a stop token or output limit, cancellation, close, and cache page
-boundaries drain pending work before changing ownership. A request that reaches
+admissible, a stop token or output limit, cancellation, close, and the end of the
+continuation lease drain pending work before changing ownership. The lease
+covers a full history page of progress plus the write envelope, rounded up to
+whole pages. If the pool cannot reserve that for every row, the lease covers 32
+tokens, then only the write envelope. A request that reaches
 `max_output_tokens` finishes like a stop token: its successor step still runs and
 the Engine discards that step's output. Other steps, including prefill, use the
 synchronous path. `enable_overlap=False` disables

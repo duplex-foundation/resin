@@ -127,6 +127,11 @@ const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
 const MIN_NEW_TOKEN_RATIO_FACTOR: f64 = 0.14;
 const NEW_TOKEN_RATIO_DECAY_STEPS: f64 = 600.0;
 const RETRACTION_DECODE_HEADROOM: usize = 20;
+/// Decode steps of progress in the fallback continuation lease. The first
+/// choice is a full history page per row. A saturated pool lacks a free page
+/// for nearly every row then, so the lease shrinks to this span, which only
+/// needs a page for rows within this many tokens of a page boundary.
+const CONTINUATION_LEASE_TOKENS: u64 = 32;
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -1370,6 +1375,7 @@ impl<P: Clone> EngineCore<P> {
                 scheduled_rows,
                 selection,
                 mut decode_reservation_lookahead,
+                bounded_lookahead,
                 scheduled_has_waiting,
                 has_running,
             ) = {
@@ -1437,7 +1443,8 @@ impl<P: Clone> EngineCore<P> {
                         .iter()
                         .zip(&selected_requests)
                         .all(|(row, _)| row.phase == Phase::Decode);
-                let lookahead = if reserve_continuation {
+                let narrow = self.runner_config.decode_write_lookahead();
+                let (lookahead, bounded_lookahead) = if reserve_continuation {
                     let layout = self.runner_config.cache_layout.as_ref().unwrap();
                     let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
                     let page = layout
@@ -1447,13 +1454,13 @@ impl<P: Clone> EngineCore<P> {
                         .map(|group| u64::from(group.block_tokens().get()))
                         .max()
                         .unwrap_or(0);
-                    // Reserve one history page of progress plus the two-step
-                    // physical write envelope. The plan's actual CSR, rather than
-                    // a second runner setting, authenticates the resulting lease.
-                    let mut span = page + maximum + writes;
+                    // The widest lease any row and cache group can use. The
+                    // plan's actual CSR, rather than a second runner setting,
+                    // authenticates the resulting lease.
+                    let mut cap = u64::MAX;
                     for group in layout.groups() {
                         if let Some(limit) = group.max_write_tokens() {
-                            span = span.min(u64::from(limit.get()));
+                            cap = cap.min(u64::from(limit.get()));
                         }
                     }
                     for (row, request) in scheduled_rows.iter().zip(&selected_requests) {
@@ -1461,7 +1468,7 @@ impl<P: Clone> EngineCore<P> {
                             .max_output_tokens
                             .saturating_sub(request.generated.len())
                             as u64;
-                        span = span
+                        cap = cap
                             .min(u64::from(
                                 self.context_length.get().saturating_sub(row.token_start()),
                             ))
@@ -1473,22 +1480,30 @@ impl<P: Clone> EngineCore<P> {
                                 // Every advertised page is pinned in full. Keep
                                 // its rounded tail inside the WINDOW write guard.
                                 let end = (start + u64::from(limit.get())) / block * block;
-                                span = span.min(end.saturating_sub(start));
+                                cap = cap.min(end.saturating_sub(start));
                             }
                         }
                     }
-                    if span >= maximum + writes {
-                        (span - 1) as u32
-                    } else {
-                        self.runner_config.decode_write_lookahead()
-                    }
+                    // Progress covered by the lease, plus the two-step write
+                    // envelope.
+                    let lease = |progress: u64| {
+                        let span = (progress + maximum + writes).min(cap);
+                        (span >= maximum + writes).then(|| (span - 1) as u32)
+                    };
+                    // Prefer a full history page. A saturated pool cannot give
+                    // every row a spare page, so a shorter span is the fallback.
+                    let full = lease(page).unwrap_or(narrow);
+                    let bounded = lease(page.min(CONTINUATION_LEASE_TOKENS))
+                        .filter(|&bounded| bounded < full);
+                    (full, bounded)
                 } else {
-                    self.runner_config.decode_write_lookahead()
+                    (narrow, None)
                 };
                 (
                     scheduled_rows,
                     selection,
                     lookahead,
+                    bounded_lookahead,
                     scheduled_has_waiting,
                     has_running,
                 )
@@ -1517,25 +1532,32 @@ impl<P: Clone> EngineCore<P> {
             let mut capacity_miss = false;
             let plan = (|| {
                 if let Some(resources) = self.kv_resources.as_mut() {
-                    if decode_reservation_lookahead > self.runner_config.decode_write_lookahead() {
-                        let requests = scheduled
-                            .iter()
-                            .zip(&scheduled_rows)
-                            .map(|(request, row)| {
-                                (
-                                    request
-                                        .cache
-                                        .as_ref()
-                                        .expect("managed request has cache state"),
-                                    row.token_start(),
-                                    row.token_end().expect("validated scheduled range")
-                                        + decode_reservation_lookahead,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        if !resources.can_ensure_contexts(&requests)? {
-                            decode_reservation_lookahead =
-                                self.runner_config.decode_write_lookahead();
+                    let narrow = self.runner_config.decode_write_lookahead();
+                    if decode_reservation_lookahead > narrow {
+                        let covers = |resources: &mut PagedKvResources, lookahead: u32| {
+                            let requests = scheduled
+                                .iter()
+                                .zip(&scheduled_rows)
+                                .map(|(request, row)| {
+                                    (
+                                        request
+                                            .cache
+                                            .as_ref()
+                                            .expect("managed request has cache state"),
+                                        row.token_start(),
+                                        row.token_end().expect("validated scheduled range")
+                                            + lookahead,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            resources.can_ensure_contexts(&requests)
+                        };
+                        // Full page, then the bounded span, then the narrow lease.
+                        if !covers(resources, decode_reservation_lookahead)? {
+                            decode_reservation_lookahead = match bounded_lookahead {
+                                Some(bounded) if covers(resources, bounded)? => bounded,
+                                _ => narrow,
+                            };
                         }
                     }
                     // Check the whole cohort before growing any row, so a late

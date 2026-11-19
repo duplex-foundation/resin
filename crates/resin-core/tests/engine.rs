@@ -2876,6 +2876,138 @@ fn blocked_overlap_with_retractions_matches_synchronous_output() {
     assert_eq!(overlapped, run(false).0);
 }
 
+fn paged_overlap_engine(block: u32, capacity: u32, max_running: usize) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![KvGroupLayout::new(block, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 1,
+            ..Default::default()
+        },
+        max_running,
+        4096,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_continuation_lease_ends_at_its_owned_pages_and_the_chain_drains() {
+    let mut engine = paged_overlap_engine(128, 64, 4);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1; 100], 400)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 2]);
+    assert!(engine.retain_continuation(&plan));
+    let mut output = model.forward(plan).unwrap();
+    let mut chain = 0;
+    while engine.has_continuation() {
+        let mut next = engine.continuation_plan().unwrap().unwrap();
+        next.token_ids = vec![*output.view().row(0).last().unwrap()];
+        let following = model.forward(next).unwrap();
+        engine
+            .complete_continuing_step_with(&mut model, Ok(output.view()), Ok)
+            .unwrap();
+        output = following;
+        chain += 1;
+    }
+    // The lease ends at its last owned page boundary, 256 tokens in. Decoding
+    // starts near token 101, so the chain runs about 155 steps; 60 is the
+    // smallest span.
+    assert!(
+        (60..=156).contains(&chain),
+        "the chain ran {chain} continuations"
+    );
+    assert!(engine.continuation_plan().unwrap().is_none());
+    engine
+        .complete_step_with(&mut model, Ok(output.view()), Ok)
+        .unwrap();
+    // The next step leases again and a second chain follows.
+    assert!(run_overlapped(&mut engine, &mut model) > chain);
+    assert_eq!(request.take_result().unwrap().len(), 400);
+    assert_eq!(engine.cache_free_parent_count(), Some(64));
+}
+
+#[test]
+fn a_continuation_lease_steps_down_from_a_full_page_as_the_pool_tightens() {
+    // Pages leased to the first overlapped decode step, by prompt length and
+    // pool size, with 128-token pages.
+    for (prompt, capacity, pages) in [
+        // A spare page is available: a full page of look-ahead crosses two
+        // boundaries from the last position of a page.
+        (127, 64, 3),
+        // No spare page: the 32-token span still crosses one boundary.
+        (127, 2, 2),
+        (100, 2, 2),
+        // Nothing spare: the narrow lease stays inside the owned page.
+        (100, 1, 1),
+    ] {
+        let mut engine = paged_overlap_engine(128, capacity, 4);
+        let mut model = Model::default();
+        engine.submit(input(vec![1; prompt], 400)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine
+            .prepare_overlap_step(&mut model, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.cache_groups[0].block_indptr,
+            [0, pages],
+            "prompt {prompt}, {capacity} pages"
+        );
+    }
+}
+
+#[test]
+fn retraction_between_bounded_leases_matches_synchronous_output() {
+    let run = |overlap: bool| {
+        let mut engine = paged_overlap_engine(16, 30, 8);
+        engine.enable_metrics().unwrap();
+        let mut model = Model::default();
+        let requests: Vec<_> = (0..6u32)
+            .map(|index| {
+                engine
+                    .submit(input(vec![10 * (index + 1); 20 + index as usize], 150))
+                    .unwrap()
+            })
+            .collect();
+        let continued = if overlap {
+            run_overlapped(&mut engine, &mut model)
+        } else {
+            while engine.has_work() {
+                engine.step(&mut model).unwrap();
+            }
+            0
+        };
+        assert_eq!(engine.cache_free_parent_count(), Some(30));
+        let retracted = engine.metrics_snapshot().unwrap().retracted_requests;
+        engine.close(&mut model).unwrap();
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, retracted, continued)
+    };
+    let (overlapped, retracted, continued) = run(true);
+    assert!(retracted > 0, "the workload never retracted");
+    assert!(continued > 0, "the workload never overlapped");
+    assert_eq!(overlapped, run(false).0);
+}
+
 fn pressure_engine(
     capacity: u32,
     max_running: usize,
