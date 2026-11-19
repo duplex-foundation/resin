@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas Mosaic kernel bodies for Ragged Paged Attention v3 and batched decode.
+"""Pallas Mosaic kernel bodies for Ragged Paged Attention v3 and batched RPA.
 
 Adapted from vllm-project/tpu-inference (Apache-2.0):
 - Stock RPA v3 at revision d9c7e19da8c497ec63b9381bb0bc9b2a5e0d4bb2:
   tpu_inference/kernels/ragged_paged_attention/v3/{kernel.py,util.py}.
-- Batched decode RPA at revision da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:
+- Batched decode and mixed RPA at revision da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:
   tpu_inference/kernels/experimental/batched_rpa/{bref_override,configs,flash_attention,kernel,pipeline,schedule,utils}.py.
 """
 
@@ -785,9 +785,9 @@ def _unpack_kv_words(
     ) + _unpack_kv_words(right, target_bitwidth=target_bitwidth, kv_dtype=kv_dtype)
 
 
-@dataclass(frozen=True, eq=True)
-class BatchedDecodeConfig:
-    """Static configuration for the triple-buffered batched decode RPA kernel."""
+@dataclass(frozen=True, eq=True, kw_only=True)
+class _BatchedRpaConfigMixin:
+    """Shared geometry and memory-sizing helpers for batched decode and mixed RPA."""
 
     batch_size: int
     bkv_sz: int
@@ -812,6 +812,10 @@ class BatchedDecodeConfig:
     disable_bounds_checks: bool = True
     disable_semaphore_checks: bool = True
     interpret_mode: bool = False
+
+    @property
+    def bq_tokens_per_block(self) -> int:
+        return 1
 
     @property
     def dtype_q(self) -> jnp.dtype:
@@ -879,6 +883,48 @@ class BatchedDecodeConfig:
         )
 
     @property
+    def q_vmem_shape(self) -> tuple[int, int, int, int, int, int]:
+        return (
+            self.batch_size,
+            self.num_kv_heads,
+            self.bq_tokens_per_block,
+            self.aligned_num_q_heads_per_kv_head // self.packing_q,
+            self.packing_q,
+            self.aligned_head_dim,
+        )
+
+    @property
+    def kv_vmem_shape(self) -> tuple[int, int, int, int, int]:
+        return (
+            self.batch_size,
+            self.bkv_sz,
+            self.bkv_stride,
+            self.packing_kv,
+            self.aligned_head_dim,
+        )
+
+    @property
+    def lm_scratch_shape(self) -> tuple[int, int, int]:
+        return (
+            self.num_kv_heads,
+            self.bq_tokens_per_block * self.aligned_num_q_heads_per_kv_head,
+            _TPU_NUM_LANES,
+        )
+
+    @property
+    def acc_scratch_shape(self) -> tuple[int, int, int]:
+        return (
+            self.num_kv_heads,
+            self.bq_tokens_per_block * self.aligned_num_q_heads_per_kv_head,
+            self.aligned_head_dim,
+        )
+
+
+@dataclass(frozen=True, eq=True, kw_only=True)
+class BatchedDecodeConfig(_BatchedRpaConfigMixin):
+    """Static configuration for the triple-buffered batched decode RPA kernel."""
+
+    @property
     def max_steps_ub(self) -> int:
         fixed_words = (
             self.max_num_seqs + (self.max_num_seqs + 1) + self.num_page_indices + 3 + 1
@@ -903,48 +949,29 @@ class BatchedDecodeConfig:
         return max(self.max_steps_ub, align_to(max_total_steps, self.max_steps_ub))
 
     @property
-    def q_vmem_shape(self) -> tuple[int, int, int, int, int, int]:
-        return (
-            self.batch_size,
-            self.num_kv_heads,
-            1,
-            self.aligned_num_q_heads_per_kv_head // self.packing_q,
-            self.packing_q,
-            self.aligned_head_dim,
-        )
-
-    @property
-    def kv_vmem_shape(self) -> tuple[int, int, int, int, int]:
-        return (
-            self.batch_size,
-            self.bkv_sz,
-            self.bkv_stride,
-            self.packing_kv,
-            self.aligned_head_dim,
-        )
-
-    @property
-    def lm_scratch_shape(self) -> tuple[int, int, int]:
-        return (
-            self.num_kv_heads,
-            self.aligned_num_q_heads_per_kv_head,
-            _TPU_NUM_LANES,
-        )
-
-    @property
-    def acc_scratch_shape(self) -> tuple[int, int, int]:
-        return (
-            self.num_kv_heads,
-            self.aligned_num_q_heads_per_kv_head,
-            self.aligned_head_dim,
-        )
-
-    @property
     def kernel_name(self) -> str:
         name = f"RPAd-snh-p{self.page_size}-b{self.batch_size}-q1-k{self.bkv_sz}"
         if self.sliding_window is not None:
             name += f"-sw{self.sliding_window}"
         return name
+
+
+class _ScheduleSpecMixin:
+    def scratch_shapes(self) -> Any:
+        return jax.tree.map(lambda x: pltpu.SMEM(x.shape, x.dtype), self)
+
+    def in_specs(self) -> Any:
+        return jax.tree.map(
+            lambda x: (
+                pl.BlockSpec(memory_space=pltpu.SMEM)
+                if x.size == 1
+                else pl.BlockSpec(memory_space=pltpu.HBM)
+            ),
+            self,
+        )
+
+    def out_specs(self) -> Any:
+        return jax.tree.map(lambda _: pl.BlockSpec(memory_space=pltpu.HBM), self)
 
 
 @jax.tree_util.register_dataclass
@@ -971,13 +998,13 @@ class _SmemArray:
     def __getitem__(self, indices: Any) -> Any:
         return self.data[self._pos(indices)]
 
-    def __setitem__(self, indices: Any, value: Any) -> None:
+    def __setitem__(self, indices, value: Any) -> None:
         self.data[self._pos(indices)] = value
 
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class BatchedDecodeSchedule:
+class BatchedDecodeSchedule(_ScheduleSpecMixin):
     """Flat SMEM/HBM schedule for batched decode RPA."""
 
     s_idx: _SmemArray  # [steps, B]
@@ -1017,22 +1044,6 @@ class BatchedDecodeSchedule:
             total_wait_o_out=step_arr,
             actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
         )
-
-    def scratch_shapes(self) -> Any:
-        return jax.tree.map(lambda x: pltpu.SMEM(x.shape, x.dtype), self)
-
-    def in_specs(self) -> Any:
-        return jax.tree.map(
-            lambda x: (
-                pl.BlockSpec(memory_space=pltpu.SMEM)
-                if x.size == 1
-                else pl.BlockSpec(memory_space=pltpu.HBM)
-            ),
-            self,
-        )
-
-    def out_specs(self) -> Any:
-        return jax.tree.map(lambda _: pl.BlockSpec(memory_space=pltpu.HBM), self)
 
 
 @jax.tree_util.register_dataclass
@@ -1345,6 +1356,124 @@ def _run_manual_triple_buffer(
             )
 
 
+def _load_batched_q(
+    q_vref: Any,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    bq_sz: int,
+    tq_per_tok: int,
+    packing_q: int,
+    dtype_q: Any,
+    aligned_head_dim: int,
+    interpret_mode: bool,
+) -> jax.Array:
+    total_tq = bq_sz * tq_per_tok
+    if interpret_mode:
+        return q_vref[...].reshape(
+            batch_size,
+            num_kv_heads,
+            total_tq,
+            aligned_head_dim,
+        )
+    q_p = tq_per_tok // packing_q
+    q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, aligned_head_dim)
+    q_loaded = _strided_load(
+        q_ref,
+        0,
+        batch_size * num_kv_heads * bq_sz * q_p,
+        1,
+        dtype=dtype_q,
+    )
+    return q_loaded.reshape(
+        batch_size,
+        num_kv_heads,
+        total_tq,
+        aligned_head_dim,
+    )
+
+
+def _load_batched_kv(
+    kv_in_vref: Any,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    bkv_sz: int,
+    kv_hbm_stride: int,
+    bkv_stride: int,
+    packing_kv: int,
+    dtype_kv: Any,
+    aligned_head_dim: int,
+    interpret_mode: bool,
+) -> tuple[jax.Array, jax.Array]:
+    k_b: list[jax.Array] = []
+    v_b: list[jax.Array] = []
+    if interpret_mode:
+        for b_idx in range(batch_size):
+            raw = kv_in_vref[b_idx, :, :kv_hbm_stride].reshape(
+                bkv_sz,
+                kv_hbm_stride * packing_kv,
+                aligned_head_dim,
+            )
+            k_heads = raw[:, 0 : 2 * num_kv_heads : 2, :].swapaxes(0, 1)
+            v_heads = raw[:, 1 : 2 * num_kv_heads : 2, :].swapaxes(0, 1)
+            k_b.append(k_heads)
+            v_b.append(v_heads)
+    else:
+        heads_per_load = max(1, packing_kv // 2)
+        bitwidth = get_dtype_bitwidth(dtype_kv)
+        for b_idx in range(batch_size):
+            kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
+            kv_ref = pltpu.annotate(
+                kv_u32_ref.reshape(-1, aligned_head_dim),
+                no_hazard_no_deps=True,
+            )
+            ks: list[jax.Array] = []
+            vs: list[jax.Array] = []
+            for kv_head_start in range(0, num_kv_heads, heads_per_load):
+                word_start = (kv_head_start * 2) // packing_kv
+                if packing_kv == 1:
+                    k_h = _strided_load(
+                        kv_ref,
+                        word_start,
+                        bkv_sz * bkv_stride,
+                        bkv_stride,
+                        dtype=dtype_kv,
+                    )
+                    v_h = _strided_load(
+                        kv_ref,
+                        word_start + 1,
+                        bkv_sz * bkv_stride,
+                        bkv_stride,
+                        dtype=dtype_kv,
+                    )
+                    pairs = [(k_h, v_h)]
+                else:
+                    kv_words = _strided_load(
+                        kv_ref,
+                        word_start,
+                        bkv_sz * bkv_stride,
+                        bkv_stride,
+                    )
+                    pairs = _unpack_kv_words(
+                        kv_words,
+                        target_bitwidth=bitwidth,
+                        kv_dtype=dtype_kv,
+                    )
+                ks.append(jnp.stack([p_k for p_k, _ in pairs], axis=0))
+                vs.append(jnp.stack([p_v for _, p_v in pairs], axis=0))
+            k_cat = jnp.concat(ks, axis=0).reshape(-1, bkv_sz, aligned_head_dim)[
+                :num_kv_heads
+            ]
+            v_cat = jnp.concat(vs, axis=0).reshape(-1, bkv_sz, aligned_head_dim)[
+                :num_kv_heads
+            ]
+            k_b.append(k_cat)
+            v_b.append(v_cat)
+
+    return jnp.stack(k_b, axis=0), jnp.stack(v_b, axis=0)
+
+
 def _batched_decode_rpa_body(
     step: jax.Array,
     q_vref: Any,
@@ -1409,97 +1538,29 @@ def _batched_decode_rpa_body(
             )
         masks.append(mask_b)
 
-    if cfgs.interpret_mode:
-        q = q_vref[...].reshape(
-            cfgs.batch_size,
-            cfgs.num_kv_heads,
-            tq,
-            cfgs.aligned_head_dim,
-        )
-    else:
-        q_p = tq // cfgs.packing_q
-        q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_head_dim)
-        q_loaded = _strided_load(
-            q_ref,
-            0,
-            cfgs.batch_size * cfgs.num_kv_heads * q_p,
-            1,
-            dtype=cfgs.dtype_q,
-        )
-        q = q_loaded.reshape(
-            cfgs.batch_size,
-            cfgs.num_kv_heads,
-            tq,
-            cfgs.aligned_head_dim,
-        )
-
-    k_b: list[jax.Array] = []
-    v_b: list[jax.Array] = []
-    if cfgs.interpret_mode:
-        for b_idx in range(cfgs.batch_size):
-            raw = kv_in_vref[b_idx, :, : cfgs.kv_hbm_stride].reshape(
-                cfgs.bkv_sz,
-                cfgs.kv_hbm_stride * cfgs.packing_kv,
-                cfgs.aligned_head_dim,
-            )
-            k_heads = raw[:, 0 : 2 * cfgs.num_kv_heads : 2, :].swapaxes(0, 1)
-            v_heads = raw[:, 1 : 2 * cfgs.num_kv_heads : 2, :].swapaxes(0, 1)
-            k_b.append(k_heads)
-            v_b.append(v_heads)
-    else:
-        heads_per_load = max(1, cfgs.packing_kv // 2)
-        bitwidth = get_dtype_bitwidth(cfgs.dtype_kv)
-        for b_idx in range(cfgs.batch_size):
-            kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
-            kv_ref = pltpu.annotate(
-                kv_u32_ref.reshape(-1, cfgs.aligned_head_dim),
-                no_hazard_no_deps=True,
-            )
-            ks: list[jax.Array] = []
-            vs: list[jax.Array] = []
-            for kv_head_start in range(0, cfgs.num_kv_heads, heads_per_load):
-                word_start = (kv_head_start * 2) // cfgs.packing_kv
-                if cfgs.packing_kv == 1:
-                    k_h = _strided_load(
-                        kv_ref,
-                        word_start,
-                        cfgs.bkv_sz * cfgs.bkv_stride,
-                        cfgs.bkv_stride,
-                        dtype=cfgs.dtype_kv,
-                    )
-                    v_h = _strided_load(
-                        kv_ref,
-                        word_start + 1,
-                        cfgs.bkv_sz * cfgs.bkv_stride,
-                        cfgs.bkv_stride,
-                        dtype=cfgs.dtype_kv,
-                    )
-                    pairs = [(k_h, v_h)]
-                else:
-                    kv_words = _strided_load(
-                        kv_ref,
-                        word_start,
-                        cfgs.bkv_sz * cfgs.bkv_stride,
-                        cfgs.bkv_stride,
-                    )
-                    pairs = _unpack_kv_words(
-                        kv_words,
-                        target_bitwidth=bitwidth,
-                        kv_dtype=cfgs.dtype_kv,
-                    )
-                ks.append(jnp.stack([p_k for p_k, _ in pairs], axis=0))
-                vs.append(jnp.stack([p_v for _, p_v in pairs], axis=0))
-            k_cat = jnp.concat(ks, axis=0).reshape(
-                -1, cfgs.bkv_sz, cfgs.aligned_head_dim
-            )[: cfgs.num_kv_heads]
-            v_cat = jnp.concat(vs, axis=0).reshape(
-                -1, cfgs.bkv_sz, cfgs.aligned_head_dim
-            )[: cfgs.num_kv_heads]
-            k_b.append(k_cat)
-            v_b.append(v_cat)
-
-    k = jnp.stack(k_b, axis=0)
-    v = jnp.stack(v_b, axis=0)
+    q = _load_batched_q(
+        q_vref,
+        batch_size=cfgs.batch_size,
+        num_kv_heads=cfgs.num_kv_heads,
+        bq_sz=1,
+        tq_per_tok=tq,
+        packing_q=cfgs.packing_q,
+        dtype_q=cfgs.dtype_q,
+        aligned_head_dim=cfgs.aligned_head_dim,
+        interpret_mode=cfgs.interpret_mode,
+    )
+    k, v = _load_batched_kv(
+        kv_in_vref,
+        batch_size=cfgs.batch_size,
+        num_kv_heads=cfgs.num_kv_heads,
+        bkv_sz=cfgs.bkv_sz,
+        kv_hbm_stride=cfgs.kv_hbm_stride,
+        bkv_stride=cfgs.bkv_stride,
+        packing_kv=cfgs.packing_kv,
+        dtype_kv=cfgs.dtype_kv,
+        aligned_head_dim=cfgs.aligned_head_dim,
+        interpret_mode=cfgs.interpret_mode,
+    )
 
     if cfgs.sliding_window is not None:
         valid_kv = jnp.stack(valid_kv_masks, axis=0)
@@ -1601,6 +1662,285 @@ def _batched_decode_rpa_body(
             _strided_store(out_ref, 0, out_ref.shape[0], 1, out_u32)
 
 
+def _init_batched_scratches(
+    m_scratch_ref: Any,
+    l_scratch_ref: Any,
+    acc_scratch_ref: Any,
+    bq_x3_ref: Any,
+    bkv_x3_ref: Any,
+    *,
+    interpret_mode: bool,
+) -> None:
+    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
+    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
+    if interpret_mode:
+        bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
+        bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
+    else:
+        q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+        kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+        q_flat[...] = jnp.zeros_like(q_flat)
+        kv_flat[...] = jnp.zeros_like(kv_flat)
+
+
+def _make_batched_q_o_dma(
+    q_hbm_ref: Any,
+    o_hbm_ref: Any,
+    bq_x3_ref: Any,
+    bo_x2_ref: Any,
+    schedule_ref: Any,
+    q_recv_sem: Any,
+    o_send_sem: Any,
+    *,
+    batch_size: int,
+    interpret_mode: bool,
+) -> tuple[
+    Callable[[Any, Any, Any], None],
+    Callable[[Any, Any, Any], None],
+    Callable[[Any, Any, Any], None],
+    Callable[[Any, Any, Any], None],
+]:
+    def copy_in_q(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = q_recv_sem.at[slot]
+        vmem_dst = bq_x3_ref.at[slot]
+        for b in range(batch_size):
+            q_sz = jnp.where(is_noop, 0, schedule_ref.dma_q[blk, b, 1])
+            q_src = jnp.where(q_sz > 0, schedule_ref.dma_q[blk, b, 0], 0)
+            pltpu.make_async_copy(
+                q_hbm_ref.at[:, pl.ds(q_src, q_sz)],
+                vmem_dst.at[b, :, pl.ds(0, q_sz)],
+                sem,
+            ).start()
+
+    def wait_in_q(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = q_recv_sem.at[slot]
+        if interpret_mode:
+            for b in range(batch_size):
+                q_sz = jnp.where(is_noop, 0, schedule_ref.dma_q[blk, b, 1])
+                pltpu.make_async_copy(
+                    bq_x3_ref.at[slot, b, :, pl.ds(0, q_sz)],
+                    bq_x3_ref.at[slot, b, :, pl.ds(0, q_sz)],
+                    sem,
+                ).wait()
+            return
+        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_q_in[blk])
+        flat = bq_x3_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
+        pltpu.make_async_copy(
+            flat.at[pl.ds(0, wait_lanes), :],
+            flat.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
+
+    def copy_out_o(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = o_send_sem.at[slot]
+        vmem_src = bo_x2_ref.at[slot]
+        for b in range(batch_size):
+            is_last = schedule_ref.is_last_k[blk, b] == 1
+            q_sz = schedule_ref.dma_q[blk, b, 1]
+            sz = jnp.where(jnp.logical_or(is_noop, jnp.logical_not(is_last)), 0, q_sz)
+            q_src = jnp.where(sz > 0, schedule_ref.dma_q[blk, b, 0], 0)
+            pltpu.make_async_copy(
+                vmem_src.at[b, :, pl.ds(0, sz)],
+                o_hbm_ref.at[:, pl.ds(q_src, sz)],
+                sem,
+            ).start()
+
+    def wait_out_o(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = o_send_sem.at[slot]
+        if interpret_mode:
+            vmem_src = bo_x2_ref.at[slot]
+            for b in range(batch_size):
+                is_last = schedule_ref.is_last_k[blk, b] == 1
+                q_sz = schedule_ref.dma_q[blk, b, 1]
+                sz = jnp.where(
+                    jnp.logical_or(is_noop, jnp.logical_not(is_last)), 0, q_sz
+                )
+                pltpu.make_async_copy(
+                    vmem_src.at[b, :, pl.ds(0, sz)],
+                    vmem_src.at[b, :, pl.ds(0, sz)],
+                    sem,
+                ).wait()
+            return
+        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_o_out[blk])
+        flat = bo_x2_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
+        pltpu.make_async_copy(
+            flat.at[pl.ds(0, wait_lanes), :],
+            flat.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
+
+    return copy_in_q, wait_in_q, copy_out_o, wait_out_o
+
+
+def _run_batched_schedule_chunks(
+    schedule_hbm_ref: Any,
+    schedule_ref: Any,
+    sched_dma_sem: Any,
+    compute_fn: Callable[..., None],
+    *,
+    max_steps_ub: int,
+    copy_in_q: Callable[[Any, Any, Any], None],
+    wait_in_q: Callable[[Any, Any, Any], None],
+    copy_in_kv: Callable[[Any, Any, Any], None],
+    wait_in_kv: Callable[[Any, Any, Any], None],
+    copy_out_kv: Callable[[Any, Any, Any], None],
+    wait_out_kv: Callable[[Any, Any, Any], None],
+    copy_out_o: Callable[[Any, Any, Any], None],
+    wait_out_o: Callable[[Any, Any, Any], None],
+) -> None:
+    def execute_schedule_chunk(start_step: jax.Array, total_steps: jax.Array) -> None:
+        flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+        flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+        copies = []
+        for h, s in zip(flat_hbm, flat_smem, strict=True):
+            if s.shape[0] > 1:
+                elem_sz = s.shape[0] // max_steps_ub
+                read_sz = jnp.minimum(align_to(elem_sz * total_steps, 1024), s.shape[0])
+                src_off = pl.multiple_of(elem_sz * start_step, _TPU_NUM_LANES)
+                cp = pltpu.make_async_copy(
+                    h.at[pl.ds(src_off, read_sz)],
+                    s.at[pl.ds(0, read_sz)],
+                    sched_dma_sem.at[0],
+                )
+                cp.start()
+                copies.append(cp)
+        for cp in copies:
+            cp.wait()
+
+        _run_manual_triple_buffer(
+            total_steps,
+            compute_fn,
+            copy_in_q=copy_in_q,
+            wait_in_q=wait_in_q,
+            copy_in_kv=copy_in_kv,
+            wait_in_kv=wait_in_kv,
+            copy_out_kv=copy_out_kv,
+            wait_out_kv=wait_out_kv,
+            copy_out_o=copy_out_o,
+            wait_out_o=wait_out_o,
+        )
+
+    actual_steps = schedule_hbm_ref.actual_steps[0]
+    num_chunks = cdiv(actual_steps, max_steps_ub)
+
+    @pl.loop(0, num_chunks)
+    def _chunk_loop(chunk_idx: jax.Array) -> None:
+        start = chunk_idx * max_steps_ub
+        execute_schedule_chunk(start, jnp.minimum(actual_steps - start, max_steps_ub))
+
+
+def _invoke_batched_rpa_pallas(
+    pipeline_fn: Callable[..., None],
+    scalar_prefetches: tuple[jax.Array, ...],
+    schedule_hbm: Any,
+    sched_smem_struct: Any,
+    q_hbm: jax.Array,
+    new_kv_hbm: jax.Array,
+    kv_cache_hbm: jax.Array,
+    *,
+    cfgs: Any,
+    tpu_version: int,
+) -> tuple[jax.Array, jax.Array]:
+    num_scalar_prefetch = len(scalar_prefetches)
+    schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
+    input_output_aliases = {
+        num_scalar_prefetch + schedule_leaves: 0,
+        num_scalar_prefetch + schedule_leaves + 2: 1,
+    }
+    pin_hbm = tpu_version >= 7 and not cfgs.interpret_mode
+    interpret_params = pltpu.InterpretParams() if cfgs.interpret_mode else False
+    compiler_flags: dict[str, bool | int | float | str] = (
+        {"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True}
+        if not cfgs.interpret_mode
+        else {}
+    )
+
+    kernel = pl.pallas_call(
+        functools.partial(pipeline_fn, cfgs=cfgs),
+        out_shape=(
+            [
+                pltpu.HBM(shape=q_hbm.shape, dtype=q_hbm.dtype),
+                pltpu.HBM(shape=kv_cache_hbm.shape, dtype=kv_cache_hbm.dtype),
+            ]
+            if pin_hbm
+            else [
+                jax.ShapeDtypeStruct(shape=q_hbm.shape, dtype=q_hbm.dtype),
+                jax.ShapeDtypeStruct(
+                    shape=kv_cache_hbm.shape, dtype=kv_cache_hbm.dtype
+                ),
+            ]
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=num_scalar_prefetch,
+            in_specs=[
+                schedule_hbm.in_specs(),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.VMEM(
+                    (_BATCHED_NUM_INPUT_SLOTS, *cfgs.kv_vmem_shape),
+                    cfgs.dtype_kv,
+                ),
+                pltpu.VMEM(
+                    (_BATCHED_NUM_INPUT_SLOTS, *cfgs.q_vmem_shape),
+                    cfgs.dtype_q,
+                ),
+                pltpu.VMEM(
+                    (_BATCHED_NUM_OUTPUT_SLOTS, *cfgs.q_vmem_shape),
+                    cfgs.dtype_q,
+                ),
+                sched_smem_struct.scratch_shapes(),
+                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
+                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
+                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
+                pltpu.SemaphoreType.DMA((_BATCHED_NUM_OUTPUT_SLOTS,)),
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
+                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
+                pltpu.VMEM(cfgs.acc_scratch_shape, jnp.float32),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=cfgs.vmem_limit_bytes,
+            disable_bounds_checks=cfgs.disable_bounds_checks,
+            disable_semaphore_checks=cfgs.disable_semaphore_checks,
+            flags=compiler_flags,
+        ),
+        input_output_aliases=input_output_aliases,
+        interpret=interpret_params,
+        name=cfgs.kernel_name,
+    )
+
+    if pin_hbm:
+        return kernel(
+            *scalar_prefetches,
+            schedule_hbm,
+            pltpu.with_memory_space_constraint(q_hbm, pltpu.HBM),
+            pltpu.with_memory_space_constraint(new_kv_hbm, pltpu.HBM),
+            pltpu.with_memory_space_constraint(kv_cache_hbm, pltpu.HBM),
+        )
+    return kernel(
+        *scalar_prefetches,
+        schedule_hbm,
+        q_hbm,
+        new_kv_hbm,
+        kv_cache_hbm,
+    )
+
+
 def _batched_decode_rpa_pipeline(
     # Scalar prefetch (SMEM)
     kv_lens_ref: Any,
@@ -1630,51 +1970,25 @@ def _batched_decode_rpa_pipeline(
     cfgs: BatchedDecodeConfig,
 ) -> None:
     del updated_kv_cache_hbm_ref
-
-    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
-    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-    acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
-    if cfgs.interpret_mode:
-        bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
-        bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
-    else:
-        q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        q_flat[...] = jnp.zeros_like(q_flat)
-        kv_flat[...] = jnp.zeros_like(kv_flat)
-
-    def copy_in_q(step: Any, slot: Any, total_steps: Any) -> None:
-        is_noop, blk = _step_guard(step, total_steps)
-        sem = q_recv_sem.at[slot]
-        vmem_dst = bq_x3_ref.at[slot]
-        for b in range(cfgs.batch_size):
-            q_sz = jnp.where(is_noop, 0, schedule_ref.dma_q[blk, b, 1])
-            q_src = jnp.where(q_sz > 0, schedule_ref.dma_q[blk, b, 0], 0)
-            pltpu.make_async_copy(
-                q_hbm_ref.at[:, pl.ds(q_src, q_sz)],
-                vmem_dst.at[b, :, pl.ds(0, q_sz)],
-                sem,
-            ).start()
-
-    def wait_in_q(step: Any, slot: Any, total_steps: Any) -> None:
-        is_noop, blk = _step_guard(step, total_steps)
-        sem = q_recv_sem.at[slot]
-        if cfgs.interpret_mode:
-            for b in range(cfgs.batch_size):
-                q_sz = jnp.where(is_noop, 0, schedule_ref.dma_q[blk, b, 1])
-                pltpu.make_async_copy(
-                    bq_x3_ref.at[slot, b, :, pl.ds(0, q_sz)],
-                    bq_x3_ref.at[slot, b, :, pl.ds(0, q_sz)],
-                    sem,
-                ).wait()
-            return
-        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_q_in[blk])
-        flat = bq_x3_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
-        pltpu.make_async_copy(
-            flat.at[pl.ds(0, wait_lanes), :],
-            flat.at[pl.ds(0, wait_lanes), :],
-            sem,
-        ).wait()
+    _init_batched_scratches(
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        bq_x3_ref,
+        bkv_x3_ref,
+        interpret_mode=cfgs.interpret_mode,
+    )
+    copy_in_q, wait_in_q, copy_out_o, wait_out_o = _make_batched_q_o_dma(
+        q_hbm_ref,
+        o_hbm_ref,
+        bq_x3_ref,
+        bo_x2_ref,
+        schedule_ref,
+        q_recv_sem,
+        o_send_sem,
+        batch_size=cfgs.batch_size,
+        interpret_mode=cfgs.interpret_mode,
+    )
 
     def copy_in_kv(step: Any, slot: Any, total_steps: Any) -> None:
         is_noop, blk = _step_guard(step, total_steps)
@@ -1787,109 +2101,43 @@ def _batched_decode_rpa_pipeline(
             sem,
         ).wait()
 
-    def copy_out_o(step: Any, slot: Any, total_steps: Any) -> None:
-        is_noop, blk = _step_guard(step, total_steps)
-        sem = o_send_sem.at[slot]
-        vmem_src = bo_x2_ref.at[slot]
-        for b in range(cfgs.batch_size):
-            is_last = schedule_ref.is_last_k[blk, b] == 1
-            q_sz = schedule_ref.dma_q[blk, b, 1]
-            sz = jnp.where(jnp.logical_or(is_noop, jnp.logical_not(is_last)), 0, q_sz)
-            q_src = jnp.where(sz > 0, schedule_ref.dma_q[blk, b, 0], 0)
-            pltpu.make_async_copy(
-                vmem_src.at[b, :, pl.ds(0, sz)],
-                o_hbm_ref.at[:, pl.ds(q_src, sz)],
-                sem,
-            ).start()
-
-    def wait_out_o(step: Any, slot: Any, total_steps: Any) -> None:
-        is_noop, blk = _step_guard(step, total_steps)
-        sem = o_send_sem.at[slot]
-        if cfgs.interpret_mode:
-            vmem_src = bo_x2_ref.at[slot]
-            for b in range(cfgs.batch_size):
-                is_last = schedule_ref.is_last_k[blk, b] == 1
-                q_sz = schedule_ref.dma_q[blk, b, 1]
-                sz = jnp.where(
-                    jnp.logical_or(is_noop, jnp.logical_not(is_last)), 0, q_sz
-                )
-                pltpu.make_async_copy(
-                    vmem_src.at[b, :, pl.ds(0, sz)],
-                    vmem_src.at[b, :, pl.ds(0, sz)],
-                    sem,
-                ).wait()
-            return
-        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_o_out[blk])
-        flat = bo_x2_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
-        pltpu.make_async_copy(
-            flat.at[pl.ds(0, wait_lanes), :],
-            flat.at[pl.ds(0, wait_lanes), :],
-            sem,
-        ).wait()
-
-    def execute_schedule_chunk(start_step: jax.Array, total_steps: jax.Array) -> None:
-        flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-        flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-        copies = []
-        for h, s in zip(flat_hbm, flat_smem, strict=True):
-            if s.shape[0] > 1:
-                elem_sz = s.shape[0] // cfgs.max_steps_ub
-                read_sz = jnp.minimum(align_to(elem_sz * total_steps, 1024), s.shape[0])
-                src_off = pl.multiple_of(elem_sz * start_step, _TPU_NUM_LANES)
-                cp = pltpu.make_async_copy(
-                    h.at[pl.ds(src_off, read_sz)],
-                    s.at[pl.ds(0, read_sz)],
-                    sched_dma_sem.at[0],
-                )
-                cp.start()
-                copies.append(cp)
-        for cp in copies:
-            cp.wait()
-
-        def compute_fn(
-            step: jax.Array,
-            comp_slot: jax.Array,
-            out_slot: jax.Array,
-            start_next_fetch: Callable[[], None],
-            start_kv_writeback: Callable[[], None],
-        ) -> None:
-            _batched_decode_rpa_body(
-                step,
-                bq_x3_ref.at[comp_slot],
-                bkv_x3_ref.at[comp_slot],
-                bo_x2_ref.at[out_slot],
-                schedule_ref,
-                m_scratch_ref,
-                l_scratch_ref,
-                acc_scratch_ref,
-                kv_lens_ref=kv_lens_ref,
-                cfgs=cfgs,
-                start_next_fetch=start_next_fetch,
-                start_kv_writeback=start_kv_writeback,
-            )
-
-        _run_manual_triple_buffer(
-            total_steps,
-            compute_fn,
-            copy_in_q=copy_in_q,
-            wait_in_q=wait_in_q,
-            copy_in_kv=copy_in_kv,
-            wait_in_kv=wait_in_kv,
-            copy_out_kv=copy_out_kv,
-            wait_out_kv=wait_out_kv,
-            copy_out_o=copy_out_o,
-            wait_out_o=wait_out_o,
+    def compute_fn(
+        step: jax.Array,
+        comp_slot: jax.Array,
+        out_slot: jax.Array,
+        start_next_fetch: Callable[[], None],
+        start_kv_writeback: Callable[[], None],
+    ) -> None:
+        _batched_decode_rpa_body(
+            step,
+            bq_x3_ref.at[comp_slot],
+            bkv_x3_ref.at[comp_slot],
+            bo_x2_ref.at[out_slot],
+            schedule_ref,
+            m_scratch_ref,
+            l_scratch_ref,
+            acc_scratch_ref,
+            kv_lens_ref=kv_lens_ref,
+            cfgs=cfgs,
+            start_next_fetch=start_next_fetch,
+            start_kv_writeback=start_kv_writeback,
         )
 
-    actual_steps = schedule_hbm_ref.actual_steps[0]
-    num_chunks = cdiv(actual_steps, cfgs.max_steps_ub)
-
-    @pl.loop(0, num_chunks)
-    def _chunk_loop(chunk_idx: jax.Array) -> None:
-        start = chunk_idx * cfgs.max_steps_ub
-        execute_schedule_chunk(
-            start, jnp.minimum(actual_steps - start, cfgs.max_steps_ub)
-        )
+    _run_batched_schedule_chunks(
+        schedule_hbm_ref,
+        schedule_ref,
+        sched_dma_sem,
+        compute_fn,
+        max_steps_ub=cfgs.max_steps_ub,
+        copy_in_q=copy_in_q,
+        wait_in_q=wait_in_q,
+        copy_in_kv=copy_in_kv,
+        wait_in_kv=wait_in_kv,
+        copy_out_kv=copy_out_kv,
+        wait_out_kv=wait_out_kv,
+        copy_out_o=copy_out_o,
+        wait_out_o=wait_out_o,
+    )
 
 
 def run_batched_decode_rpa(
@@ -1904,100 +2152,901 @@ def run_batched_decode_rpa(
     tpu_version: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Execute the triple-buffered batched decode attention Pallas kernel."""
-    sched_smem_struct = BatchedDecodeSchedule.create_shape_dtype(
-        cfgs, steps=cfgs.max_steps_ub
-    )
-    scalar_prefetches = (kv_lens, page_indices)
-    num_scalar_prefetch = len(scalar_prefetches)
-    schedule_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
-    input_output_aliases = {
-        num_scalar_prefetch + schedule_leaves: 0,
-        num_scalar_prefetch + schedule_leaves + 2: 1,
-    }
-    pin_hbm = tpu_version >= 7 and not cfgs.interpret_mode
-    interpret_params = pltpu.InterpretParams() if cfgs.interpret_mode else False
-    compiler_flags: dict[str, bool | int | float | str] = (
-        {"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True}
-        if not cfgs.interpret_mode
-        else {}
-    )
-
-    kernel = pl.pallas_call(
-        functools.partial(_batched_decode_rpa_pipeline, cfgs=cfgs),
-        out_shape=(
-            [
-                pltpu.HBM(shape=q_hbm.shape, dtype=q_hbm.dtype),
-                pltpu.HBM(shape=kv_cache_hbm.shape, dtype=kv_cache_hbm.dtype),
-            ]
-            if pin_hbm
-            else [
-                jax.ShapeDtypeStruct(shape=q_hbm.shape, dtype=q_hbm.dtype),
-                jax.ShapeDtypeStruct(
-                    shape=kv_cache_hbm.shape, dtype=kv_cache_hbm.dtype
-                ),
-            ]
-        ),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=num_scalar_prefetch,
-            in_specs=[
-                schedule_hbm.in_specs(),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
-            out_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
-            grid=(1,),
-            scratch_shapes=[
-                pltpu.VMEM(
-                    (_BATCHED_NUM_INPUT_SLOTS, *cfgs.kv_vmem_shape),
-                    cfgs.dtype_kv,
-                ),
-                pltpu.VMEM(
-                    (_BATCHED_NUM_INPUT_SLOTS, *cfgs.q_vmem_shape),
-                    cfgs.dtype_q,
-                ),
-                pltpu.VMEM(
-                    (_BATCHED_NUM_OUTPUT_SLOTS, *cfgs.q_vmem_shape),
-                    cfgs.dtype_q,
-                ),
-                sched_smem_struct.scratch_shapes(),
-                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
-                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
-                pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
-                pltpu.SemaphoreType.DMA((_BATCHED_NUM_OUTPUT_SLOTS,)),
-                pltpu.SemaphoreType.DMA((1,)),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.acc_scratch_shape, jnp.float32),
-            ],
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=cfgs.vmem_limit_bytes,
-            disable_bounds_checks=cfgs.disable_bounds_checks,
-            disable_semaphore_checks=cfgs.disable_semaphore_checks,
-            flags=compiler_flags,
-        ),
-        input_output_aliases=input_output_aliases,
-        interpret=interpret_params,
-        name=cfgs.kernel_name,
-    )
-
-    if pin_hbm:
-        return kernel(
-            *scalar_prefetches,
-            schedule_hbm,
-            pltpu.with_memory_space_constraint(q_hbm, pltpu.HBM),
-            pltpu.with_memory_space_constraint(new_kv_hbm, pltpu.HBM),
-            pltpu.with_memory_space_constraint(kv_cache_hbm, pltpu.HBM),
-        )
-    return kernel(
-        *scalar_prefetches,
+    return _invoke_batched_rpa_pallas(
+        _batched_decode_rpa_pipeline,
+        (kv_lens, page_indices),
         schedule_hbm,
+        BatchedDecodeSchedule.create_shape_dtype(cfgs, steps=cfgs.max_steps_ub),
         q_hbm,
         new_kv_hbm,
         kv_cache_hbm,
+        cfgs=cfgs,
+        tpu_version=tpu_version,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batched RPA mixed / prefill (triple-buffered manual DMA + SMEM task schedule)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=True, kw_only=True)
+class BatchedMixedConfig(_BatchedRpaConfigMixin):
+    """Static configuration for the triple-buffered batched mixed/prefill RPA kernel."""
+
+    bq_sz: int
+    bq_csz: int
+    max_num_tokens: int
+    use_causal_mask: bool = True
+    bf16_qk_softmax: bool = False
+
+    @property
+    def bq_tokens_per_block(self) -> int:
+        return self.bq_sz
+
+    @property
+    def max_steps_ub(self) -> int:
+        fixed_words = (
+            self.max_num_seqs + (self.max_num_seqs + 1) + self.num_page_indices + 3 + 1
+        )
+        available_bytes = (
+            int((self.smem_capacity_bytes - 32 * 1024) * 0.33) - fixed_words * 4
+        )
+        # Per step per batch item: s_idx, q_idx, k_idx, is_last_k (4), dma_q (2),
+        # dma_kv_cache (3 * bkv_p), dma_kv_new_in (3), dma_kv_wb (4 * bkv_p);
+        # plus 4 1D wait words per step.
+        bytes_per_step = ((9 + 7 * self.bkv_p) * self.batch_size + 4) * 4
+        raw_steps = max(_TPU_NUM_LANES, available_bytes // bytes_per_step)
+        return max(_TPU_NUM_LANES, (raw_steps // _TPU_NUM_LANES) * _TPU_NUM_LANES)
+
+    @property
+    def schedule_hbm_steps(self) -> int:
+        max_q_blocks = max(
+            1,
+            self.max_num_tokens // self.bq_sz
+            + min(self.max_num_seqs, self.max_num_tokens),
+        )
+        max_k_per_q = max(
+            1, int(cdiv(self.pages_per_seq * self.page_size, self.bkv_sz))
+        )
+        max_total_steps = max(1, int(cdiv(max_q_blocks * max_k_per_q, self.batch_size)))
+        return max(self.max_steps_ub, align_to(max_total_steps, self.max_steps_ub))
+
+    @property
+    def kernel_name(self) -> str:
+        name = (
+            f"RPAm-snh-p{self.page_size}-b{self.batch_size}"
+            f"-q{self.bq_sz}_{self.bq_csz}-k{self.bkv_sz}"
+        )
+        if self.bf16_qk_softmax:
+            name += "-bf16p"
+        if self.sliding_window is not None:
+            name += f"-sw{self.sliding_window}"
+        return name
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class BatchedMixedSchedule(_ScheduleSpecMixin):
+    """Flat SMEM/HBM schedule for batched mixed/prefill RPA."""
+
+    s_idx: _SmemArray  # [steps, B]
+    q_idx: _SmemArray  # [steps, B]
+    k_idx: _SmemArray  # [steps, B]
+    is_last_k: _SmemArray  # [steps, B]
+    dma_q: _SmemArray  # [steps, B, 2] -> (q_src, q_sz)
+    dma_kv_cache: _SmemArray  # [steps, B, bkv_p, 3] -> (p_slot, dst_vmem, sz)
+    dma_kv_new_in: _SmemArray  # [steps, B, 3] -> (fetch_hbm, vmem_off, new_sz)
+    dma_kv_wb: _SmemArray  # [steps, B, bkv_p, 4] -> (wb_p_slot, p_off, wb_vmem, wb_sz)
+    total_wait_kv_in: _SmemArray  # [steps]
+    total_wait_kv_out: _SmemArray  # [steps]
+    total_wait_q_in: _SmemArray  # [steps]
+    total_wait_o_out: _SmemArray  # [steps]
+    actual_steps: Any  # [1]
+
+    @classmethod
+    def create_shape_dtype(
+        cls, cfgs: BatchedMixedConfig, *, steps: int
+    ) -> BatchedMixedSchedule:
+        idx_arr = _SmemArray.create_shape_dtype((steps, cfgs.batch_size))
+        step_arr = _SmemArray.create_shape_dtype((steps,))
+        return cls(
+            s_idx=idx_arr,
+            q_idx=idx_arr,
+            k_idx=idx_arr,
+            is_last_k=idx_arr,
+            dma_q=_SmemArray.create_shape_dtype((steps, cfgs.batch_size, 2)),
+            dma_kv_cache=_SmemArray.create_shape_dtype(
+                (steps, cfgs.batch_size, cfgs.bkv_p, 3)
+            ),
+            dma_kv_new_in=_SmemArray.create_shape_dtype((steps, cfgs.batch_size, 3)),
+            dma_kv_wb=_SmemArray.create_shape_dtype(
+                (steps, cfgs.batch_size, cfgs.bkv_p, 4)
+            ),
+            total_wait_kv_in=step_arr,
+            total_wait_kv_out=step_arr,
+            total_wait_q_in=step_arr,
+            total_wait_o_out=step_arr,
+            actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
+        )
+
+
+def _batched_mixed_schedule_kernel(
+    kv_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    distribution_ref: Any,
+    schedule_hbm_ref: BatchedMixedSchedule,
+    schedule_ref: BatchedMixedSchedule,
+    dma_sem: Any,
+    *,
+    cfgs: BatchedMixedConfig,
+) -> None:
+    schedule_ref.actual_steps[0] = 0
+
+    def _mask_entry(step: Any, b_idx: Any) -> None:
+        schedule_ref.s_idx[step, b_idx] = -1
+        schedule_ref.q_idx[step, b_idx] = 0
+        schedule_ref.k_idx[step, b_idx] = 0
+        schedule_ref.is_last_k[step, b_idx] = 0
+        schedule_ref.dma_q[step, b_idx, 0] = 0
+        schedule_ref.dma_q[step, b_idx, 1] = 0
+        for i in range(cfgs.bkv_p):
+            schedule_ref.dma_kv_cache[step, b_idx, i, 0] = 0
+            schedule_ref.dma_kv_cache[step, b_idx, i, 1] = 0
+            schedule_ref.dma_kv_cache[step, b_idx, i, 2] = 0
+            for f in range(4):
+                schedule_ref.dma_kv_wb[step, b_idx, i, f] = 0
+        for f in range(3):
+            schedule_ref.dma_kv_new_in[step, b_idx, f] = 0
+        schedule_ref.total_wait_kv_in[step] = 0
+        schedule_ref.total_wait_kv_out[step] = 0
+        schedule_ref.total_wait_q_in[step] = 0
+        schedule_ref.total_wait_o_out[step] = 0
+
+    def _flush(count: Any, hbm_offset: Any) -> _SchedCarry:
+        last_task = align_to(count, cfgs.batch_size)
+
+        @pl.loop(count, last_task)
+        def _mask_tail(idx: Any) -> None:
+            step, b_idx = divmod(idx, cfgs.batch_size)
+            _mask_entry(step, b_idx)
+
+        def _compute_step_waits(step: Any, _: None) -> None:
+            kv_in_tokens: Any = 0
+            kv_out_tokens: Any = 0
+            q_in_tokens: Any = 0
+            o_out_tokens: Any = 0
+            for b in range(cfgs.batch_size):
+                for i in range(cfgs.bkv_p):
+                    kv_in_tokens = (
+                        kv_in_tokens + schedule_ref.dma_kv_cache[step, b, i, 2]
+                    )
+                    kv_out_tokens = (
+                        kv_out_tokens + schedule_ref.dma_kv_wb[step, b, i, 3]
+                    )
+                kv_in_tokens = kv_in_tokens + schedule_ref.dma_kv_new_in[step, b, 2]
+                q_sz = schedule_ref.dma_q[step, b, 1]
+                q_in_tokens = q_in_tokens + q_sz
+                is_last = schedule_ref.is_last_k[step, b] == 1
+                o_out_tokens = o_out_tokens + jnp.where(is_last, q_sz, 0)
+
+            schedule_ref.total_wait_kv_in[step] = (
+                kv_in_tokens * cfgs.kv_bytes_per_token
+            ) // _DMA_CHUNK_BYTES
+            schedule_ref.total_wait_kv_out[step] = (
+                kv_out_tokens * cfgs.kv_bytes_per_token
+            ) // _DMA_CHUNK_BYTES
+            schedule_ref.total_wait_q_in[step] = (
+                q_in_tokens * cfgs.q_bytes_per_token
+            ) // _DMA_CHUNK_BYTES
+            schedule_ref.total_wait_o_out[step] = (
+                o_out_tokens * cfgs.q_bytes_per_token
+            ) // _DMA_CHUNK_BYTES
+
+        lax.fori_loop(0, last_task // cfgs.batch_size, _compute_step_waits, None)
+
+        hbm_offset_aligned = pl.multiple_of(hbm_offset, _TPU_NUM_LANES)
+        flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+        flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+        copies = []
+        for h, s in zip(flat_hbm, flat_smem, strict=True):
+            if h.shape[0] > 1:
+                elem_sz = s.shape[0] // cfgs.max_steps_ub
+                write_sz = cfgs.max_steps_ub * elem_sz
+                out_off = hbm_offset_aligned * elem_sz
+                copies.append(
+                    pltpu.make_async_copy(
+                        s.at[pl.ds(0, write_sz)],
+                        h.at[pl.ds(out_off, write_sz)],
+                        dma_sem.at[0],
+                    )
+                )
+        for cp in copies:
+            cp.start()
+        for cp in copies:
+            cp.wait()
+        return _SchedCarry(hbm_offset + cfgs.max_steps_ub, 0)
+
+    def _seq_body(s_idx: Any, carry: _SchedCarry) -> _SchedCarry:
+        q_start = cu_q_lens_ref[s_idx]
+        q_end = cu_q_lens_ref[s_idx + 1]
+        q_len = jnp.maximum(q_end - q_start, 0)
+        kv_len = kv_lens_ref[s_idx]
+        q_offset = jnp.maximum(kv_len - q_len, 0)
+        kv_cache_len = q_offset if cfgs.update_kv_cache else kv_len
+
+        has_work = jnp.logical_and(q_len > 0, kv_len > 0)
+        num_q = jnp.where(has_work, cdiv(q_len, cfgs.bq_sz), 0)
+        num_k = jnp.where(has_work, cdiv(kv_len, cfgs.bkv_sz), 0)
+
+        def _q_body(q_idx: Any, q_carry: _SchedCarry) -> _SchedCarry:
+            q_src = q_start + q_idx * cfgs.bq_sz
+            q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
+            start_k_idx: Any = 0
+            if cfgs.sliding_window is not None:
+                sw_start = jnp.maximum(
+                    0, q_offset + q_idx * cfgs.bq_sz - cfgs.sliding_window + 1
+                )
+                start_k_idx = sw_start // cfgs.bkv_sz
+
+            if cfgs.use_causal_mask:
+                end_k_causal = (
+                    q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+                ) // cfgs.bkv_sz + 1
+                end_k_idx = jnp.minimum(num_k, end_k_causal)
+            else:
+                end_k_idx = num_k
+
+            def _k_body(k_idx: Any, k_carry: _SchedCarry) -> _SchedCarry:
+                count = k_carry.count
+                step, lane = divmod(count, cfgs.batch_size)
+                schedule_ref.s_idx[step, lane] = s_idx
+                schedule_ref.q_idx[step, lane] = q_idx
+                schedule_ref.k_idx[step, lane] = k_idx
+                schedule_ref.is_last_k[step, lane] = jnp.where(
+                    k_idx == end_k_idx - 1, 1, 0
+                )
+                schedule_ref.dma_q[step, lane, 0] = q_src
+                schedule_ref.dma_q[step, lane, 1] = q_sz_task
+
+                kv_len_start = k_idx * cfgs.bkv_sz
+                kv_p_start = k_idx * cfgs.bkv_p
+                kv_left = kv_len - kv_len_start
+                kv_left_cache = (
+                    jnp.maximum(kv_cache_len - kv_len_start, 0)
+                    if cfgs.update_kv_cache
+                    else kv_left
+                )
+                p_base = s_idx * cfgs.pages_per_seq + kv_p_start
+
+                for i in range(cfgs.bkv_p):
+                    dst_vmem = i * cfgs.page_size
+                    dma_sz = jnp.clip(kv_left_cache - dst_vmem, 0, cfgs.page_size)
+                    p_slot = jnp.minimum(p_base + i, cfgs.num_page_indices - 1)
+                    schedule_ref.dma_kv_cache[step, lane, i, 0] = p_slot
+                    schedule_ref.dma_kv_cache[step, lane, i, 1] = dst_vmem
+                    schedule_ref.dma_kv_cache[step, lane, i, 2] = dma_sz
+
+                bkv_sz_cache = jnp.minimum(kv_left_cache, cfgs.bkv_sz)
+                kv_left_new = kv_left - kv_left_cache
+                new_sz = jnp.minimum(cfgs.bkv_sz - bkv_sz_cache, kv_left_new)
+                fetch_hbm = jnp.maximum(q_end - kv_left_new, 0)
+                schedule_ref.dma_kv_new_in[step, lane, 0] = fetch_hbm
+                schedule_ref.dma_kv_new_in[step, lane, 1] = bkv_sz_cache
+                schedule_ref.dma_kv_new_in[step, lane, 2] = new_sz
+
+                q_wb = jnp.maximum(0, kv_len_start - kv_cache_len) // cfgs.bq_sz
+                do_wb = jnp.logical_and(new_sz > 0, q_idx == q_wb)
+                for i in range(cfgs.bkv_p):
+                    slot_start = i * cfgs.page_size
+                    slot_end = slot_start + cfgs.page_size
+                    wb_vmem = jnp.maximum(slot_start, bkv_sz_cache)
+                    end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
+                    wb_sz = jnp.where(do_wb, jnp.maximum(0, end_in_slot - wb_vmem), 0)
+                    tok_idx = kv_len_start + wb_vmem
+                    p_idx = jnp.minimum(
+                        tok_idx // cfgs.page_size, cfgs.pages_per_seq - 1
+                    )
+                    p_off = tok_idx % cfgs.page_size
+                    wb_p_slot = jnp.minimum(
+                        s_idx * cfgs.pages_per_seq + p_idx,
+                        cfgs.num_page_indices - 1,
+                    )
+                    schedule_ref.dma_kv_wb[step, lane, i, 0] = wb_p_slot
+                    schedule_ref.dma_kv_wb[step, lane, i, 1] = p_off
+                    schedule_ref.dma_kv_wb[step, lane, i, 2] = wb_vmem
+                    schedule_ref.dma_kv_wb[step, lane, i, 3] = wb_sz
+
+                next_count = count + 1
+                return lax.cond(
+                    next_count < cfgs.max_steps_ub * cfgs.batch_size,
+                    lambda c: c,
+                    lambda c: _flush(c.count, c.hbm_offset),
+                    _SchedCarry(k_carry.hbm_offset, next_count),
+                )
+
+            return lax.fori_loop(start_k_idx, end_k_idx, _k_body, q_carry)
+
+        return lax.fori_loop(0, num_q, _q_body, carry)
+
+    start_seq = distribution_ref[1]
+    end_seq = distribution_ref[2]
+    final_carry = lax.fori_loop(start_seq, end_seq, _seq_body, _SchedCarry(0, 0))
+    total_steps = cdiv(final_carry.count, cfgs.batch_size) + final_carry.hbm_offset
+    schedule_ref.actual_steps[0] = total_steps
+
+    @pl.when(final_carry.count > 0)
+    def _flush_remainder() -> None:
+        _flush(final_carry.count, final_carry.hbm_offset)
+
+    steps_cp = pltpu.make_async_copy(
+        schedule_ref.actual_steps.at[pl.ds(0, 1)],
+        schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
+        dma_sem.at[0],
+    )
+    steps_cp.start()
+    steps_cp.wait()
+
+
+def generate_batched_mixed_schedule(
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    cfgs: BatchedMixedConfig,
+) -> BatchedMixedSchedule:
+    """Build the SMEM/HBM work schedule for batched mixed/prefill attention."""
+    sched_smem_struct = BatchedMixedSchedule.create_shape_dtype(
+        cfgs, steps=cfgs.max_steps_ub
+    )
+    sched_hbm_struct = BatchedMixedSchedule.create_shape_dtype(
+        cfgs, steps=cfgs.schedule_hbm_steps
+    )
+    interpret_params = pltpu.InterpretParams() if cfgs.interpret_mode else False
+    return pl.pallas_call(
+        functools.partial(_batched_mixed_schedule_kernel, cfgs=cfgs),
+        out_shape=sched_hbm_struct,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[],
+            out_specs=sched_hbm_struct.out_specs(),
+            scratch_shapes=[
+                sched_smem_struct.scratch_shapes(),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            grid=(1,),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=cfgs.disable_bounds_checks,
+            disable_semaphore_checks=cfgs.disable_semaphore_checks,
+        ),
+        interpret=interpret_params,
+        name="rpa_mixed_schedule",
+    )(kv_lens, cu_q_lens, distribution)
+
+
+def _batched_mixed_rpa_body(
+    step: jax.Array,
+    q_vref: Any,
+    kv_in_vref: Any,
+    o_vref: Any,
+    schedule_ref: BatchedMixedSchedule,
+    m_scratch_ref: Any,
+    l_scratch_ref: Any,
+    acc_scratch_ref: Any,
+    *,
+    kv_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    cfgs: BatchedMixedConfig,
+    start_next_fetch: Callable[[], None],
+    start_kv_writeback: Callable[[], None],
+) -> None:
+    if not cfgs.interpret_mode:
+        kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
+
+    always_true = kv_lens_ref[0] >= 0
+
+    @pl.when(always_true)
+    @jax.named_scope("stitch_and_issue_writeback")
+    def _kv_store_fence() -> None:
+        start_kv_writeback()
+
+    start_next_fetch()
+
+    tq_per_tok = cfgs.aligned_num_q_heads_per_kv_head
+    tq_c = cfgs.bq_csz * tq_per_tok
+    kv_vpu_iota = (
+        lax.broadcasted_iota(
+            jnp.int32,
+            (cfgs.num_kv_heads, cfgs.bkv_sz, cfgs.aligned_head_dim),
+            1,
+        )
+        if cfgs.sliding_window is not None
+        else None
+    )
+
+    is_valids: list[jax.Array] = []
+    kv_limits: list[jax.Array] = []
+    causal_offs: list[jax.Array] = []
+    is_lasts: list[jax.Array] = []
+    valid_kv_masks: list[jax.Array] = []
+    for b_idx in range(cfgs.batch_size):
+        s_idx = schedule_ref.s_idx[step, b_idx]
+        is_valid = s_idx != -1
+        safe_s = jnp.maximum(s_idx, 0)
+        q_idx = schedule_ref.q_idx[step, b_idx]
+        k_idx = schedule_ref.k_idx[step, b_idx]
+        k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
+        kv_len_val = jnp.where(is_valid, kv_lens_ref[safe_s], 0)
+        q_start_s = jnp.where(is_valid, cu_q_lens_ref[safe_s], 0)
+        q_end_s = jnp.where(is_valid, cu_q_lens_ref[safe_s + 1], 0)
+        q_offset = jnp.maximum(kv_len_val - (q_end_s - q_start_s), 0)
+        q_base = jnp.where(is_valid, q_offset + q_idx * cfgs.bq_sz, 0)
+
+        is_valids.append(is_valid)
+        kv_limits.append(jnp.where(is_valid, kv_len_val - k_id, 1))
+        causal_offs.append(k_id - q_base)
+        is_lasts.append(schedule_ref.is_last_k[step, b_idx] == 1)
+
+        if cfgs.sliding_window is not None:
+            assert kv_vpu_iota is not None
+            sw_low = jnp.where(is_valid, q_base - k_id - cfgs.sliding_window, -1)
+            vpu_limit = jnp.where(is_valid, kv_len_val - k_id, 0)
+            valid_kv_masks.append(
+                jnp.logical_and(kv_vpu_iota < vpu_limit, kv_vpu_iota > sw_low)
+            )
+
+    q = _load_batched_q(
+        q_vref,
+        batch_size=cfgs.batch_size,
+        num_kv_heads=cfgs.num_kv_heads,
+        bq_sz=cfgs.bq_sz,
+        tq_per_tok=tq_per_tok,
+        packing_q=cfgs.packing_q,
+        dtype_q=cfgs.dtype_q,
+        aligned_head_dim=cfgs.aligned_head_dim,
+        interpret_mode=cfgs.interpret_mode,
+    )
+    k, v = _load_batched_kv(
+        kv_in_vref,
+        batch_size=cfgs.batch_size,
+        num_kv_heads=cfgs.num_kv_heads,
+        bkv_sz=cfgs.bkv_sz,
+        kv_hbm_stride=cfgs.kv_hbm_stride,
+        bkv_stride=cfgs.bkv_stride,
+        packing_kv=cfgs.packing_kv,
+        dtype_kv=cfgs.dtype_kv,
+        aligned_head_dim=cfgs.aligned_head_dim,
+        interpret_mode=cfgs.interpret_mode,
+    )
+
+    if cfgs.sliding_window is not None:
+        valid_kv = jnp.stack(valid_kv_masks, axis=0)
+        k = jnp.where(valid_kv, k, jnp.zeros_like(k))
+        v = jnp.where(valid_kv, v, jnp.zeros_like(v))
+
+    kv_iota = lax.broadcasted_iota(jnp.int32, (cfgs.num_kv_heads, tq_c, cfgs.bkv_sz), 2)
+    q_iota = (
+        lax.broadcasted_iota(jnp.int32, (cfgs.num_kv_heads, tq_c, cfgs.bkv_sz), 1)
+        // tq_per_tok
+    )
+    q_kv_diff = q_iota - kv_iota
+
+    s_scale = cfgs.sm_scale
+    if cfgs.q_scale is not None:
+        s_scale *= cfgs.q_scale
+    if cfgs.k_scale is not None:
+        s_scale *= cfgs.k_scale
+    use_bf16_p = cfgs.bf16_qk_softmax and cfgs.dtype_q == jnp.bfloat16
+    mask_fill = (
+        jnp.asarray(cfgs.mask_value, dtype=jnp.bfloat16)
+        if use_bf16_p
+        else cfgs.mask_value
+    )
+
+    def _run_pv_stage(
+        p_chunk: jax.Array,
+        alphas: list[jax.Array],
+        row_start: int,
+    ) -> jax.Array:
+        pv = lax.dot_general(
+            p_chunk.reshape(-1, tq_c, cfgs.bkv_sz),
+            v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
+            dimension_numbers=(([2], [1]), ([0], [0])),
+            preferred_element_type=jnp.float32,
+        ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq_c, cfgs.aligned_head_dim)
+        if cfgs.v_scale is not None:
+            pv = pv * cfgs.v_scale
+
+        o_prev_c = (
+            acc_scratch_ref[...]
+            if cfgs.bq_csz == cfgs.bq_sz
+            else acc_scratch_ref[:, pl.ds(row_start, tq_c), :]
+        )
+        o_next_list: list[jax.Array] = []
+        for b_idx in range(cfgs.batch_size):
+            alpha_full = _broadcast_minor(alphas[b_idx], o_prev_c.shape)
+            o_next_b = alpha_full * o_prev_c + pv[b_idx]
+            o_next_list.append(o_next_b)
+            o_prev_c = jnp.where(is_lasts[b_idx], 0.0, o_next_b)
+        if cfgs.bq_csz == cfgs.bq_sz:
+            acc_scratch_ref[...] = o_prev_c
+        else:
+            acc_scratch_ref[:, pl.ds(row_start, tq_c), :] = o_prev_c
+        return jnp.stack(o_next_list, axis=0)
+
+    l_new_chunks: list[jax.Array] = []
+    acc_new_chunks: list[jax.Array] = []
+    prev_p: jax.Array | None = None
+    prev_alphas: list[jax.Array] | None = None
+    prev_row_start = 0
+
+    for bq_start in range(0, cfgs.bq_sz, cfgs.bq_csz):
+        row_start = bq_start * tq_per_tok
+        q_chunk = (
+            q if cfgs.bq_csz == cfgs.bq_sz else q[:, :, row_start : row_start + tq_c, :]
+        )
+        if cfgs.q_scale is not None:
+            q_scaled = q_chunk / cfgs.q_scale
+            if jnp.issubdtype(k.dtype, jnp.floating):
+                finfo = jnp.finfo(k.dtype)
+                q_scaled = jnp.clip(
+                    q_scaled, min=float(finfo.min), max=float(finfo.max)
+                )
+            q_dot = q_scaled.astype(k.dtype)
+        else:
+            q_dot = q_chunk
+
+        qk = lax.dot_general(
+            q_dot.reshape(-1, tq_c, cfgs.aligned_head_dim),
+            k.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
+            dimension_numbers=(([2], [2]), ([0], [0])),
+            preferred_element_type=jnp.float32,
+        ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq_c, cfgs.bkv_sz)
+        qk = qk * s_scale
+        if cfgs.soft_cap is not None:
+            qk = cfgs.soft_cap * jnp.tanh(qk / cfgs.soft_cap)
+        if use_bf16_p:
+            qk = qk.astype(jnp.bfloat16)
+
+        masked_list: list[jax.Array] = []
+        for b_idx in range(cfgs.batch_size):
+            mask_b = kv_iota < kv_limits[b_idx]
+            if cfgs.use_causal_mask:
+                c_off = jnp.where(
+                    is_valids[b_idx], causal_offs[b_idx] - bq_start, -cfgs.bq_sz
+                )
+                mask_b = jnp.logical_and(mask_b, q_kv_diff >= c_off)
+            if cfgs.sliding_window is not None:
+                sw_off = jnp.where(
+                    is_valids[b_idx],
+                    cfgs.sliding_window + causal_offs[b_idx] - bq_start,
+                    cfgs.bq_sz + 1,
+                )
+                mask_b = jnp.logical_and(mask_b, q_kv_diff < sw_off)
+            masked_list.append(jnp.where(mask_b, qk[b_idx], mask_fill))
+        qk_masked = jnp.stack(masked_list, axis=0)
+
+        m_curr = jnp.max(qk_masked, axis=-1, keepdims=True).astype(jnp.float32)
+        m_prev_c = (
+            m_scratch_ref[...]
+            if cfgs.bq_csz == cfgs.bq_sz
+            else m_scratch_ref[:, pl.ds(row_start, tq_c), :]
+        )
+        l_prev_c = (
+            l_scratch_ref[...]
+            if cfgs.bq_csz == cfgs.bq_sz
+            else l_scratch_ref[:, pl.ds(row_start, tq_c), :]
+        )
+        alpha_list: list[jax.Array] = []
+        m_next_list: list[jax.Array] = []
+        for b_idx in range(cfgs.batch_size):
+            m_next_b = jnp.maximum(m_prev_c, m_curr[b_idx])
+            alpha_b = jnp.exp(m_prev_c - m_next_b)
+            alpha_list.append(alpha_b)
+            m_next_list.append(m_next_b)
+            m_prev_c = jnp.where(is_lasts[b_idx], -jnp.inf, m_next_b)
+        if cfgs.bq_csz == cfgs.bq_sz:
+            m_scratch_ref[...] = m_prev_c
+        else:
+            m_scratch_ref[:, pl.ds(row_start, tq_c), :] = m_prev_c
+
+        m_next_stack = jnp.stack(m_next_list, axis=0)
+        if use_bf16_p:
+            p = jnp.exp(
+                qk_masked
+                - _broadcast_minor(m_next_stack.astype(jnp.bfloat16), qk_masked.shape)
+            )
+        else:
+            p = jnp.exp(qk_masked - _broadcast_minor(m_next_stack, qk_masked.shape))
+        p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=jnp.float32)
+
+        l_next_list: list[jax.Array] = []
+        for b_idx in range(cfgs.batch_size):
+            l_next_b = alpha_list[b_idx] * l_prev_c + p_rowsum[b_idx]
+            l_next_list.append(l_next_b)
+            l_prev_c = jnp.where(is_lasts[b_idx], 0.0, l_next_b)
+        if cfgs.bq_csz == cfgs.bq_sz:
+            l_scratch_ref[...] = l_prev_c
+        else:
+            l_scratch_ref[:, pl.ds(row_start, tq_c), :] = l_prev_c
+        l_new_chunks.append(jnp.stack(l_next_list, axis=0))
+
+        if prev_p is not None:
+            assert prev_alphas is not None
+            acc_new_chunks.append(_run_pv_stage(prev_p, prev_alphas, prev_row_start))
+        prev_p = p
+        prev_alphas = alpha_list
+        prev_row_start = row_start
+
+    assert prev_p is not None and prev_alphas is not None
+    acc_new_chunks.append(_run_pv_stage(prev_p, prev_alphas, prev_row_start))
+
+    l_all = (
+        l_new_chunks[0]
+        if len(l_new_chunks) == 1
+        else jnp.concatenate(l_new_chunks, axis=2)
+    )
+    acc_all = (
+        acc_new_chunks[0]
+        if len(acc_new_chunks) == 1
+        else jnp.concatenate(acc_new_chunks, axis=2)
+    )
+
+    for b_idx in range(cfgs.batch_size):
+
+        def _store_out(
+            batch_acc: jax.Array, batch_l: jax.Array, _b: int = b_idx
+        ) -> None:
+            l_full = _broadcast_minor(batch_l, batch_acc.shape)
+            if not cfgs.interpret_mode and cfgs.dtype_q != jnp.float32:
+                res = batch_acc * pltpu.reciprocal(l_full, approx=True)
+            else:
+                res = lax.div(batch_acc, l_full)
+            out_b = res.astype(cfgs.dtype_q)
+            if cfgs.interpret_mode:
+                o_vref[_b] = out_b.reshape(o_vref.shape[1:])
+            else:
+                out_ref = (
+                    o_vref.at[_b].bitcast(jnp.uint32).reshape(-1, cfgs.aligned_head_dim)
+                )
+                out_u32 = pltpu.bitcast(out_b, jnp.uint32).reshape(out_ref.shape)
+                _strided_store(out_ref, 0, out_ref.shape[0], 1, out_u32)
+
+        lax.cond(
+            is_lasts[b_idx],
+            _store_out,
+            lambda _a, _l: None,
+            acc_all[b_idx],
+            l_all[b_idx],
+        )
+
+
+def _batched_mixed_rpa_pipeline(
+    # Scalar prefetch (SMEM)
+    kv_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    page_indices_ref: Any,
+    # Inputs (HBM + SMEM actual_steps)
+    schedule_hbm_ref: BatchedMixedSchedule,
+    q_hbm_ref: Any,
+    new_kv_hbm_ref: Any,
+    kv_cache_hbm_ref: Any,
+    # Outputs (HBM, aliased to q_hbm_ref and kv_cache_hbm_ref)
+    o_hbm_ref: Any,
+    updated_kv_cache_hbm_ref: Any,
+    # Scratch (VMEM + SMEM + DMA semaphores)
+    bkv_x3_ref: Any,
+    bq_x3_ref: Any,
+    bo_x2_ref: Any,
+    schedule_ref: BatchedMixedSchedule,
+    q_recv_sem: Any,
+    kv_recv_sem: Any,
+    kv_send_sem: Any,
+    o_send_sem: Any,
+    sched_dma_sem: Any,
+    m_scratch_ref: Any,
+    l_scratch_ref: Any,
+    acc_scratch_ref: Any,
+    *,
+    cfgs: BatchedMixedConfig,
+) -> None:
+    del updated_kv_cache_hbm_ref
+    _init_batched_scratches(
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        bq_x3_ref,
+        bkv_x3_ref,
+        interpret_mode=cfgs.interpret_mode,
+    )
+    copy_in_q, wait_in_q, copy_out_o, wait_out_o = _make_batched_q_o_dma(
+        q_hbm_ref,
+        o_hbm_ref,
+        bq_x3_ref,
+        bo_x2_ref,
+        schedule_ref,
+        q_recv_sem,
+        o_send_sem,
+        batch_size=cfgs.batch_size,
+        interpret_mode=cfgs.interpret_mode,
+    )
+
+    def copy_in_kv(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = kv_recv_sem.at[slot]
+        vmem_dst = bkv_x3_ref.at[slot, :, :, : cfgs.kv_hbm_stride]
+        kv_hbm_flat = (
+            None
+            if cfgs.interpret_mode
+            else kv_cache_hbm_ref.reshape(-1, *kv_cache_hbm_ref.shape[2:])
+        )
+        for b in range(cfgs.batch_size):
+            for i in range(cfgs.bkv_p):
+                sz = jnp.where(is_noop, 0, schedule_ref.dma_kv_cache[blk, b, i, 2])
+                p_slot = jnp.where(sz > 0, schedule_ref.dma_kv_cache[blk, b, i, 0], 0)
+                dst_off = jnp.where(sz > 0, schedule_ref.dma_kv_cache[blk, b, i, 1], 0)
+                page_id = jnp.where(sz > 0, page_indices_ref[p_slot], 0)
+                if cfgs.interpret_mode:
+                    src = kv_cache_hbm_ref.at[page_id, pl.ds(0, sz)]
+                else:
+                    assert kv_hbm_flat is not None
+                    src = kv_hbm_flat.at[pl.ds(page_id * cfgs.page_size, sz)]
+                pltpu.make_async_copy(
+                    src,
+                    vmem_dst.at[b, pl.ds(dst_off, sz)],
+                    sem,
+                ).start()
+            new_sz = jnp.where(is_noop, 0, schedule_ref.dma_kv_new_in[blk, b, 2])
+            fetch_hbm = jnp.where(new_sz > 0, schedule_ref.dma_kv_new_in[blk, b, 0], 0)
+            dst_vmem_off = jnp.where(
+                new_sz > 0, schedule_ref.dma_kv_new_in[blk, b, 1], 0
+            )
+            pltpu.make_async_copy(
+                new_kv_hbm_ref.at[pl.ds(fetch_hbm, new_sz)],
+                vmem_dst.at[b, pl.ds(dst_vmem_off, new_sz)],
+                sem,
+            ).start()
+
+    def wait_in_kv(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = kv_recv_sem.at[slot]
+        if cfgs.interpret_mode:
+            vmem_dst = bkv_x3_ref.at[slot, :, :, : cfgs.kv_hbm_stride]
+            for b in range(cfgs.batch_size):
+                lane_sz: Any = schedule_ref.dma_kv_new_in[blk, b, 2]
+                for i in range(cfgs.bkv_p):
+                    lane_sz = lane_sz + schedule_ref.dma_kv_cache[blk, b, i, 2]
+                lane_sz = jnp.where(is_noop, 0, lane_sz)
+                pltpu.make_async_copy(
+                    vmem_dst.at[b, pl.ds(0, lane_sz)],
+                    vmem_dst.at[b, pl.ds(0, lane_sz)],
+                    sem,
+                ).wait()
+            return
+        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_kv_in[blk])
+        flat = bkv_x3_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
+        pltpu.make_async_copy(
+            flat.at[pl.ds(0, wait_lanes), :],
+            flat.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
+
+    def copy_out_kv(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = kv_send_sem.at[slot]
+        vmem_src = bkv_x3_ref.at[slot, :, :, : cfgs.kv_hbm_stride]
+        kv_hbm_flat = (
+            None
+            if cfgs.interpret_mode
+            else kv_cache_hbm_ref.reshape(-1, *kv_cache_hbm_ref.shape[2:])
+        )
+        for b in range(cfgs.batch_size):
+            for i in range(cfgs.bkv_p):
+                sz = jnp.where(is_noop, 0, schedule_ref.dma_kv_wb[blk, b, i, 3])
+                wb_p_slot = jnp.where(sz > 0, schedule_ref.dma_kv_wb[blk, b, i, 0], 0)
+                wb_p_off = jnp.where(sz > 0, schedule_ref.dma_kv_wb[blk, b, i, 1], 0)
+                src_vmem_off = jnp.where(
+                    sz > 0, schedule_ref.dma_kv_wb[blk, b, i, 2], 0
+                )
+                page_id = jnp.where(sz > 0, page_indices_ref[wb_p_slot], 0)
+                if cfgs.interpret_mode:
+                    dst = kv_cache_hbm_ref.at[page_id, pl.ds(wb_p_off, sz)]
+                else:
+                    assert kv_hbm_flat is not None
+                    dst = kv_hbm_flat.at[pl.ds(page_id * cfgs.page_size + wb_p_off, sz)]
+                pltpu.make_async_copy(
+                    vmem_src.at[b, pl.ds(src_vmem_off, sz)],
+                    dst,
+                    sem,
+                ).start()
+
+    def wait_out_kv(step: Any, slot: Any, total_steps: Any) -> None:
+        is_noop, blk = _step_guard(step, total_steps)
+        sem = kv_send_sem.at[slot]
+        if cfgs.interpret_mode:
+            vmem_src = bkv_x3_ref.at[slot, :, :, : cfgs.kv_hbm_stride]
+            for b in range(cfgs.batch_size):
+                wb_lane_sz: Any = 0
+                for i in range(cfgs.bkv_p):
+                    wb_lane_sz = wb_lane_sz + schedule_ref.dma_kv_wb[blk, b, i, 3]
+                wb_lane_sz = jnp.where(is_noop, 0, wb_lane_sz)
+                pltpu.make_async_copy(
+                    vmem_src.at[b, pl.ds(0, wb_lane_sz)],
+                    vmem_src.at[b, pl.ds(0, wb_lane_sz)],
+                    sem,
+                ).wait()
+            return
+        wait_lanes = jnp.where(is_noop, 0, schedule_ref.total_wait_kv_out[blk])
+        flat = bkv_x3_ref.at[slot].bitcast(jnp.uint32).reshape((-1, _TPU_NUM_LANES))
+        pltpu.make_async_copy(
+            flat.at[pl.ds(0, wait_lanes), :],
+            flat.at[pl.ds(0, wait_lanes), :],
+            sem,
+        ).wait()
+
+    def compute_fn(
+        step: jax.Array,
+        comp_slot: jax.Array,
+        out_slot: jax.Array,
+        start_next_fetch: Callable[[], None],
+        start_kv_writeback: Callable[[], None],
+    ) -> None:
+        _batched_mixed_rpa_body(
+            step,
+            bq_x3_ref.at[comp_slot],
+            bkv_x3_ref.at[comp_slot],
+            bo_x2_ref.at[out_slot],
+            schedule_ref,
+            m_scratch_ref,
+            l_scratch_ref,
+            acc_scratch_ref,
+            kv_lens_ref=kv_lens_ref,
+            cu_q_lens_ref=cu_q_lens_ref,
+            cfgs=cfgs,
+            start_next_fetch=start_next_fetch,
+            start_kv_writeback=start_kv_writeback,
+        )
+
+    _run_batched_schedule_chunks(
+        schedule_hbm_ref,
+        schedule_ref,
+        sched_dma_sem,
+        compute_fn,
+        max_steps_ub=cfgs.max_steps_ub,
+        copy_in_q=copy_in_q,
+        wait_in_q=wait_in_q,
+        copy_in_kv=copy_in_kv,
+        wait_in_kv=wait_in_kv,
+        copy_out_kv=copy_out_kv,
+        wait_out_kv=wait_out_kv,
+        copy_out_o=copy_out_o,
+        wait_out_o=wait_out_o,
+    )
+
+
+def run_batched_mixed_rpa(
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    page_indices: jax.Array,
+    schedule_hbm: BatchedMixedSchedule,
+    q_hbm: jax.Array,
+    new_kv_hbm: jax.Array,
+    kv_cache_hbm: jax.Array,
+    *,
+    cfgs: BatchedMixedConfig,
+    tpu_version: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Execute the triple-buffered batched mixed/prefill attention Pallas kernel."""
+    return _invoke_batched_rpa_pallas(
+        _batched_mixed_rpa_pipeline,
+        (kv_lens, cu_q_lens, page_indices),
+        schedule_hbm,
+        BatchedMixedSchedule.create_shape_dtype(cfgs, steps=cfgs.max_steps_ub),
+        q_hbm,
+        new_kv_hbm,
+        kv_cache_hbm,
+        cfgs=cfgs,
+        tpu_version=tpu_version,
     )
