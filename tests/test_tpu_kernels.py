@@ -43,6 +43,8 @@ from resin.backend.tpu.kernels.ragged_paged_attention import (  # noqa: E402
     RpaCase,
     get_default_block_sizes,
     get_kv_cache_shape,
+    prepare_inputs,
+    prepare_outputs,
     quantize_kv,
     ragged_paged_attention,
 )
@@ -3510,3 +3512,577 @@ class TestTpuHardwareMosaic:
             / (np.linalg.norm(p_dec_flat) * np.linalg.norm(x_dec_flat))
         )
         assert dec_cos > 0.999
+
+    @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
+    def test_qwen3_tp2_mosaic_batched_decode_parity_and_zero_recompile(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        mesh = make_mesh(min(len(jax.devices()), 2))
+        tp = int(mesh.shape["tp"])
+        spec = KvCacheSpec(
+            layers=1,
+            kv_heads=8,
+            head_dim=128,
+            page_tokens=256,
+            dtype=kv_dtype,
+        )
+        cache_sharding = NamedSharding(mesh, KV_PARTITION)
+        q_packed_sharding = NamedSharding(mesh, P("tp", None, None, None, None))
+        kv_merged_sharding = NamedSharding(mesh, P(None, "tp", None, None))
+        rep_sharding = NamedSharding(mesh, P())
+        is_fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale = 0.5 if is_fp8 else None
+        v_scale = 0.25 if is_fp8 else None
+        rtol = 3e-2 if is_fp8 else 1e-2
+        atol = 5e-2 if is_fp8 else 2e-2
+
+        max_seqs = 160
+        pages_per_seq = 18  # up to 4608 tokens/seq, crossing bkv_sz=1280 and page=256
+        total_pages = max_seqs * 3 + 36
+        global_cache_shape = (total_pages, *spec.page_shape(tp))
+        rng = np.random.default_rng(2027)
+        init_np = rng.standard_normal(global_cache_shape).astype(np.float32) * 0.25
+        init_cache = np.array(
+            quantize_kv(jnp.asarray(init_np, jnp.float32), kv_dtype), copy=True
+        )
+        nan_page = np.asarray(jnp.full(global_cache_shape[1:], jnp.nan, dtype=kv_dtype))
+        init_cache[0] = 0
+        init_cache[-1] = nan_page
+
+        pages = np.full((max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        next_page = 1
+        cur_kv_lens = np.zeros(max_seqs, dtype=np.int32)
+        # First 2 sequences get long histories crossing bkv_sz=1280 & page=256;
+        # remaining 158 get 1..3 pages with ragged offsets. Poison from
+        # base_kv_len - 1 onward so every decode step overwrites the slot
+        # immediately adjacent to a trailing NaN inside the same page.
+        for s in range(max_seqs):
+            if s == 0:
+                kv_l = 4096
+            elif s == 1:
+                kv_l = 1280
+            else:
+                kv_l = 254 + ((s * 37) % 515)
+            cur_kv_lens[s] = kv_l
+            used_p = (kv_l + 8 + 255) // 256
+            pages[s, :used_p] = np.arange(next_page, next_page + used_p, dtype=np.int32)
+            tail_page = next_page + (kv_l // 256)
+            init_cache[tail_page, kv_l % 256 :] = nan_page[kv_l % 256 :]
+            for p_extra in range(tail_page + 1, next_page + used_p):
+                init_cache[p_extra] = nan_page
+            next_page += used_p
+
+        cache = jax.device_put(jnp.asarray(init_cache), cache_sharding)
+        ref_cache = jax.device_put(jnp.asarray(init_cache), cache_sharding)
+
+        @functools.partial(
+            jax.jit,
+            donate_argnums=(2,),
+            out_shardings=(q_packed_sharding, cache_sharding),
+        )
+        def mosaic_batched_decode(q_p, kv_m, kv_c, meta):
+            return paged_attention(
+                q_p,
+                kv_m,
+                None,
+                kv_c,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+            )
+
+        def ref_batched_decode(q_p, kv_m, kv_c, meta):
+            return paged_attention(
+                q_p,
+                kv_m,
+                None,
+                kv_c,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+                impl=reference.ragged_paged_attention,
+            )
+
+        flat_pages = jax.device_put(pages.reshape(-1), rep_sharding)
+        step_records = []
+        counter = CompilationCounter()
+        try:
+            warm = None
+            for b_live in (1, 8, 9, 32, 154, 160):
+                q_raw = jnp.asarray(
+                    rng.standard_normal((max_seqs, 64, 128)), jnp.bfloat16
+                )
+                k_raw = quantize_kv(
+                    jnp.asarray(rng.standard_normal((max_seqs, 8, 128)), jnp.bfloat16),
+                    kv_dtype,
+                    k_scale,
+                )
+                v_raw = quantize_kv(
+                    jnp.asarray(rng.standard_normal((max_seqs, 8, 128)), jnp.bfloat16),
+                    kv_dtype,
+                    v_scale,
+                )
+                q_p, kv_m = prepare_inputs(q_raw, k_raw, v_raw)
+                q_p = jax.device_put(q_p, q_packed_sharding)
+                kv_m = jax.device_put(kv_m, kv_merged_sharding)
+
+                cur_kv_lens[:b_live] += 1
+                step_kv = np.zeros(max_seqs, dtype=np.int32)
+                step_kv[:b_live] = cur_kv_lens[:b_live]
+                cu_q = np.array(
+                    [min(i, b_live) for i in range(max_seqs + 1)], dtype=np.int32
+                )
+                meta = AttentionMetadata(
+                    jax.device_put(step_kv, rep_sharding),
+                    (flat_pages,),
+                    jax.device_put(cu_q, rep_sharding),
+                    jax.device_put(
+                        np.array([b_live, b_live, b_live], dtype=np.int32),
+                        rep_sharding,
+                    ),
+                )
+                out_p, cache = mosaic_batched_decode(q_p, kv_m, cache, meta)
+                out_p.block_until_ready()
+                if warm is None:
+                    warm = counter.count
+                else:
+                    assert counter.count == warm
+                step_records.append((b_live, step_kv.copy(), q_p, kv_m, meta, out_p))
+        finally:
+            counter.close()
+
+        for b_live, step_kv, q_p, kv_m, meta, out_p in step_records:
+            ref_p, ref_cache = ref_batched_decode(q_p, kv_m, ref_cache, meta)
+            out_unpacked = prepare_outputs(out_p, 8, 128)
+            ref_unpacked = prepare_outputs(ref_p, 8, 128)
+            out_f32 = np.asarray(out_unpacked[:b_live], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_unpacked[:b_live], np.float32),
+                rtol=rtol,
+                atol=atol,
+            )
+        # Verify final KV cache slots written by Mosaic match the reference.
+        cache_host = np.asarray(cache, np.float32)
+        ref_cache_host = np.asarray(ref_cache, np.float32)
+        for s in (0, 1, 8, 31, 153, 159):
+            pos = int(cur_kv_lens[s]) - 1
+            pg = int(pages[s, pos // 256])
+            off = pos % 256
+            np.testing.assert_array_equal(cache_host[pg, off], ref_cache_host[pg, off])
+
+
+class TestBatchedDecodeAttention:
+    def test_batched_decode_block_sizes_and_bucket_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        monkeypatch.setattr(rpa_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(
+            rpa_mod.pltpu,
+            "get_tpu_info",
+            lambda: type("I", (), {"smem_capacity_bytes": 1024 * 1024})(),
+        )
+        monkeypatch.setattr(
+            rpa_mod,
+            "_effective_vmem_limit",
+            lambda _v, _tv, vmem: 64 * 1024 * 1024 if vmem is None else vmem,
+        )
+
+        # Verify bucket dispatch and lowered TPU7x kernel block selection on
+        # Qwen3-32B tp=2 per-die shapes (32 Q heads, 4 KV heads, head_dim=128).
+        for seq_bucket, kv_dtype, sw, expected_kernel in (
+            (8, jnp.float8_e4m3fn, None, "RPAd-p_256-bq_1_1-bkv_4096_4096"),
+            (16, jnp.float8_e4m3fn, None, "RPAd-snh-p256-b8-q1-k1280"),
+            (160, jnp.float8_e4m3fn, None, "RPAd-snh-p256-b8-q1-k1280"),
+            (16, jnp.bfloat16, None, "RPAd-snh-p256-b8-q1-k512"),
+            (16, jnp.float8_e4m3fn, 512, "RPAd-snh-p256-b8-q1-k768-sw512"),
+        ):
+            cache = jnp.zeros(get_kv_cache_shape(4, 256, 4, 128, kv_dtype), kv_dtype)
+            q = jnp.ones((seq_bucket, 32, 128), jnp.bfloat16)
+            k = jnp.ones((seq_bucket, 4, 128), kv_dtype)
+            jaxpr_str = str(
+                jax.make_jaxpr(
+                    lambda qi, ki, ci, _sw=sw: rpa_mod.ragged_paged_attention(
+                        qi,
+                        ki,
+                        ki,
+                        ci,
+                        jnp.ones((seq_bucket,), jnp.int32),
+                        jnp.zeros((seq_bucket * 37,), jnp.int32),
+                        jnp.arange(seq_bucket + 1, dtype=jnp.int32),
+                        jnp.array([1, 1, 1], jnp.int32),
+                        sliding_window=_sw,
+                        interpret=True,
+                    )
+                )(q, k, cache)
+            )
+            assert expected_kernel in jaxpr_str
+            assert ("rpa_metadata_schedule" in jaxpr_str) is (seq_bucket >= 16)
+
+        with pytest.raises(ValueError, match="bq_sz == bq_csz == 1"):
+            rpa_mod.ragged_paged_attention(
+                jnp.ones((4, 8, 128), jnp.bfloat16),
+                jnp.ones((4, 2, 128), jnp.bfloat16),
+                jnp.ones((4, 2, 128), jnp.bfloat16),
+                jnp.zeros(get_kv_cache_shape(4, 8, 2, 128, jnp.bfloat16), jnp.bfloat16),
+                jnp.ones((4,), jnp.int32),
+                jnp.zeros((8,), jnp.int32),
+                jnp.arange(5, dtype=jnp.int32),
+                jnp.array([1, 1, 1], jnp.int32),
+                d_block_sizes=(2, 8, 2, 8),
+                use_batched_decode=True,
+                interpret=True,
+            )
+
+    @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+    def test_pallas_interpret_batched_decode_ragged_batches_and_page_boundaries(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        rng = np.random.default_rng(4242)
+        fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale = 0.5 if fp8 else None
+        v_scale = 0.25 if fp8 else None
+        atol = 3e-2 if fp8 else 2e-2
+        page_size = 8
+        pages_per_seq = 4
+        max_seqs = 160
+        total_pages = max_seqs * pages_per_seq + 4
+        q_heads, kv_heads, head_dim = 8, 2, 128
+        sm_scale = head_dim**-0.5
+
+        cache_shape = get_kv_cache_shape(
+            total_pages, page_size, kv_heads, head_dim, kv_dtype
+        )
+        raw_cache = rng.standard_normal(cache_shape).astype(np.float32) * 0.25
+        clean_cache = np.array(quantize_kv(jnp.asarray(raw_cache), kv_dtype), copy=True)
+        clean_cache[0] = 0
+        poisoned_cache = clean_cache.copy()
+        nan_val = np.asarray(jnp.full((), jnp.nan, dtype=kv_dtype))
+        poisoned_cache[-1] = nan_val
+
+        pages = np.full((max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        full_kv_lens = np.zeros(max_seqs, dtype=np.int32)
+        next_page = 1
+        for s in range(max_seqs):
+            kv_l = int(1 + (s * 7 + 5) % 29)
+            full_kv_lens[s] = kv_l
+            used_p = (kv_l + page_size - 1) // page_size
+            pages[s, :used_p] = np.arange(next_page, next_page + used_p, dtype=np.int32)
+            rem = kv_l % page_size
+            if rem != 0:
+                poisoned_cache[next_page + used_p - 1, rem:] = nan_val
+            next_page += used_p
+
+        q = jnp.asarray(
+            rng.standard_normal((max_seqs, q_heads, head_dim)), jnp.bfloat16
+        )
+        k = jnp.asarray(
+            rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        v = jnp.asarray(
+            rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        flat_pages_jax = jnp.asarray(pages.reshape(-1))
+        cache_jax = jnp.asarray(poisoned_cache)
+
+        batch_cases = (1, 8, 9, 32, 154, 160, 0)
+        step_inputs = []
+        for b_live in batch_cases:
+            kv_lens = np.zeros(max_seqs, dtype=np.int32)
+            kv_lens[:b_live] = full_kv_lens[:b_live]
+            cu_q = np.array(
+                [min(i, b_live) for i in range(max_seqs + 1)], dtype=np.int32
+            )
+            dist = np.array([b_live, b_live, b_live], dtype=np.int32)
+            step_inputs.append(
+                (
+                    b_live,
+                    kv_lens,
+                    cu_q,
+                    dist,
+                    jnp.asarray(kv_lens),
+                    jnp.asarray(cu_q),
+                    jnp.asarray(dist),
+                )
+            )
+
+        outputs = []
+        counter = CompilationCounter()
+        try:
+            warm = None
+            for (
+                b_live,
+                kv_lens,
+                cu_q,
+                dist,
+                kv_lens_jax,
+                cu_q_jax,
+                dist_jax,
+            ) in step_inputs:
+                out, upd_cache = ragged_paged_attention(
+                    q,
+                    k,
+                    v,
+                    cache_jax,
+                    kv_lens_jax,
+                    flat_pages_jax,
+                    cu_q_jax,
+                    dist_jax,
+                    sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    d_block_sizes=(1, 8, 1, 8),
+                    use_batched_decode=True,
+                    disable_bounds_checks=False,
+                    disable_semaphore_checks=False,
+                    interpret=True,
+                )
+                out.block_until_ready()
+                if warm is None:
+                    warm = counter.count
+                else:
+                    assert counter.count == warm
+                outputs.append((b_live, kv_lens, cu_q, dist, out, upd_cache))
+        finally:
+            counter.close()
+
+        for b_live, kv_lens, cu_q, dist, out, upd_cache in outputs:
+            if b_live == 0:
+                np.testing.assert_array_equal(np.asarray(upd_cache[0], np.float32), 0.0)
+                continue
+
+            ref_out, ref_cache = _reference_rpa(
+                np.asarray(q),
+                np.asarray(k),
+                np.asarray(v),
+                clean_cache,
+                kv_lens,
+                pages.reshape(-1),
+                cu_q,
+                dist,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            out_f32 = np.asarray(out[:b_live], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_out[:b_live], np.float32),
+                rtol=2e-2,
+                atol=atol,
+            )
+            for s in (0, b_live // 2, b_live - 1):
+                pos = int(kv_lens[s]) - 1
+                pg = int(pages[s, pos // page_size])
+                off = pos % page_size
+                np.testing.assert_array_equal(
+                    np.asarray(upd_cache[pg, off], np.float32),
+                    np.asarray(ref_cache[pg, off], np.float32),
+                )
+
+    def test_pallas_interpret_batched_decode_prepared_mixed_sliding_window_and_scales(
+        self,
+    ) -> None:
+        rng = np.random.default_rng(99)
+        page_size, pages_per_seq, max_seqs, total_pages = 8, 4, 6, 20
+        q_heads, kv_heads, head_dim = 6, 2, 64
+        sm_scale = head_dim**-0.5
+        cache_shape = get_kv_cache_shape(
+            total_pages, page_size, kv_heads, head_dim, jnp.float8_e4m3fn
+        )
+        raw_cache = rng.standard_normal(cache_shape).astype(np.float32) * 0.3
+        clean_cache = np.array(
+            quantize_kv(jnp.asarray(raw_cache), jnp.float8_e4m3fn), copy=True
+        )
+        clean_cache[0] = 0
+        poisoned_cache = clean_cache.copy()
+        nan_fp8 = np.asarray(jnp.full((), jnp.nan, dtype=jnp.float8_e4m3fn))
+        # Seq 0 has kv_len=13, sliding_window=3 (attends 10..12): poison both
+        # pre-window slots (0..9) and post-kv_len slots (13..15) with NaNs.
+        poisoned_cache[1, :] = nan_fp8
+        poisoned_cache[2, :2] = nan_fp8
+        poisoned_cache[2, 5:] = nan_fp8
+
+        pages = np.zeros((max_seqs, pages_per_seq), dtype=np.int32)
+        pages[0, :2] = [1, 2]
+        pages[1, :1] = [3]
+        pages[2, :2] = [4, 5]
+        kv_lens = np.array([13, 5, 10, 0, 0, 0], dtype=np.int32)
+        cu_q = np.array([0, 1, 2, 6, 6, 6, 6], dtype=np.int32)
+        dist = np.array([2, 2, 3], dtype=np.int32)
+
+        q_in = jnp.asarray(rng.standard_normal((8, q_heads, head_dim)), jnp.bfloat16)
+        k_in = quantize_kv(
+            jnp.asarray(rng.standard_normal((8, kv_heads, head_dim)), jnp.bfloat16),
+            jnp.float8_e4m3fn,
+            0.5,
+        )
+        v_in = quantize_kv(
+            jnp.asarray(rng.standard_normal((8, kv_heads, head_dim)), jnp.bfloat16),
+            jnp.float8_e4m3fn,
+            0.25,
+        )
+        q_pack, kv_merg = prepare_inputs(q_in, k_in, v_in)
+
+        out_packed, _ = ragged_paged_attention(
+            q_pack,
+            kv_merg,
+            None,
+            jnp.asarray(poisoned_cache),
+            jnp.asarray(kv_lens),
+            jnp.asarray(pages.reshape(-1)),
+            jnp.asarray(cu_q),
+            jnp.asarray(dist),
+            sm_scale=sm_scale,
+            sliding_window=3,
+            soft_cap=20.0,
+            q_scale=0.5,
+            k_scale=0.5,
+            v_scale=0.25,
+            prepared=True,
+            return_packed=True,
+            actual_num_q_heads=q_heads,
+            actual_head_dim=head_dim,
+            d_block_sizes=(1, 8, 1, 8),
+            m_block_sizes=(4, 8, 2, 8),
+            use_batched_decode=True,
+            disable_bounds_checks=False,
+            disable_semaphore_checks=False,
+            interpret=True,
+        )
+        out_unpacked = prepare_outputs(out_packed, q_heads // kv_heads, head_dim)
+        ref_out, _ = _reference_rpa(
+            np.asarray(q_in),
+            np.asarray(k_in),
+            np.asarray(v_in),
+            clean_cache,
+            kv_lens,
+            pages.reshape(-1),
+            cu_q,
+            dist,
+            sm_scale=sm_scale,
+            sliding_window=3,
+            soft_cap=20.0,
+            q_scale=0.5,
+            k_scale=0.5,
+            v_scale=0.25,
+        )
+        out_f32 = np.asarray(out_unpacked[:6], np.float32)
+        assert not np.any(np.isnan(out_f32))
+        np.testing.assert_allclose(
+            out_f32,
+            np.asarray(ref_out[:6], np.float32),
+            rtol=2e-2,
+            atol=3e-2,
+        )
+
+    def test_pallas_interpret_batched_decode_multi_smem_chunk_and_exact_capacity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        # Force max_steps_ub = 128 so 256x4/8 = 128 hits exact HBM schedule
+        # capacity, and 265 sequences (133 steps) straddle chunk 0 -> chunk 1.
+        monkeypatch.setattr(rpa_mod, "_DEFAULT_SMEM_BYTES", 40 * 1024)
+
+        rng = np.random.default_rng(77)
+        page_size, pages_per_seq = 8, 4
+        q_heads, kv_heads, head_dim = 4, 2, 128
+        sm_scale = head_dim**-0.5
+
+        for max_seqs, b_live in ((256, 256), (272, 265)):
+            total_pages = max_seqs * pages_per_seq + 2
+            cache_np = (
+                rng.standard_normal(
+                    get_kv_cache_shape(
+                        total_pages, page_size, kv_heads, head_dim, jnp.bfloat16
+                    )
+                ).astype(np.float32)
+                * 0.2
+            )
+            cache_np[0] = 0.0
+            cache_jax = jnp.asarray(cache_np, jnp.bfloat16)
+
+            kv_lens = np.zeros(max_seqs, dtype=np.int32)
+            pages = np.zeros((max_seqs, pages_per_seq), dtype=np.int32)
+            nxt = 1
+            for s in range(b_live):
+                # 4 blocks (29..32 tokens) per sequence; on the 272-seq case give
+                # sequence 255 3 blocks so sequence 256 straddles step 127 -> 128.
+                kv_l = 22 if (max_seqs == 272 and s == 255) else 30
+                kv_lens[s] = kv_l
+                used_p = (kv_l + page_size - 1) // page_size
+                pages[s, :used_p] = np.arange(nxt, nxt + used_p, dtype=np.int32)
+                nxt += used_p
+
+            q = jnp.asarray(
+                rng.standard_normal((max_seqs, q_heads, head_dim)), jnp.bfloat16
+            )
+            k = jnp.asarray(
+                rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+            )
+            v = jnp.asarray(
+                rng.standard_normal((max_seqs, kv_heads, head_dim)), jnp.bfloat16
+            )
+            cu_q = np.array(
+                [min(i, b_live) for i in range(max_seqs + 1)], dtype=np.int32
+            )
+            dist = np.array([b_live, b_live, b_live], dtype=np.int32)
+
+            out, _ = rpa_mod.ragged_paged_attention(
+                q,
+                k,
+                v,
+                cache_jax,
+                jnp.asarray(kv_lens),
+                jnp.asarray(pages.reshape(-1)),
+                jnp.asarray(cu_q),
+                jnp.asarray(dist),
+                sm_scale=sm_scale,
+                d_block_sizes=(1, 8, 1, 8),
+                use_batched_decode=True,
+                disable_bounds_checks=False,
+                disable_semaphore_checks=False,
+                interpret=True,
+            )
+            ref_out, _ = _reference_rpa(
+                np.asarray(q),
+                np.asarray(k),
+                np.asarray(v),
+                np.asarray(cache_jax),
+                kv_lens,
+                pages.reshape(-1),
+                cu_q,
+                dist,
+                sm_scale=sm_scale,
+            )
+            out_f32 = np.asarray(out[:b_live], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_out[:b_live], np.float32),
+                rtol=2e-2,
+                atol=2e-2,
+            )
