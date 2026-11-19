@@ -1250,7 +1250,7 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     use_batched_decode: bool | None = None,
     use_batched_mixed: bool | None = None,
-    bf16_qk_softmax: bool = False,
+    bf16_qk_softmax: bool = True,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
     interpret: bool = False,

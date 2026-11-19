@@ -818,6 +818,10 @@ class _BatchedRpaConfigMixin:
         return 1
 
     @property
+    def scratch_dtype(self) -> jnp.dtype:
+        return jnp.float32
+
+    @property
     def dtype_q(self) -> jnp.dtype:
         return jnp.dtype(self.q_dtype_name)
 
@@ -1907,9 +1911,9 @@ def _invoke_batched_rpa_pallas(
                 pltpu.SemaphoreType.DMA((_BATCHED_NUM_INPUT_SLOTS,)),
                 pltpu.SemaphoreType.DMA((_BATCHED_NUM_OUTPUT_SLOTS,)),
                 pltpu.SemaphoreType.DMA((1,)),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.lm_scratch_shape, jnp.float32),
-                pltpu.VMEM(cfgs.acc_scratch_shape, jnp.float32),
+                pltpu.VMEM(cfgs.lm_scratch_shape, cfgs.scratch_dtype),
+                pltpu.VMEM(cfgs.lm_scratch_shape, cfgs.scratch_dtype),
+                pltpu.VMEM(cfgs.acc_scratch_shape, cfgs.scratch_dtype),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -2178,11 +2182,17 @@ class BatchedMixedConfig(_BatchedRpaConfigMixin):
     bq_csz: int
     max_num_tokens: int
     use_causal_mask: bool = True
-    bf16_qk_softmax: bool = False
+    bf16_qk_softmax: bool = True
 
     @property
     def bq_tokens_per_block(self) -> int:
         return self.bq_sz
+
+    @property
+    def scratch_dtype(self) -> jnp.dtype:
+        if self.bf16_qk_softmax and self.dtype_q == jnp.bfloat16:
+            return jnp.bfloat16
+        return jnp.float32
 
     @property
     def max_steps_ub(self) -> int:
@@ -2218,8 +2228,8 @@ class BatchedMixedConfig(_BatchedRpaConfigMixin):
             f"RPAm-snh-p{self.page_size}-b{self.batch_size}"
             f"-q{self.bq_sz}_{self.bq_csz}-k{self.bkv_sz}"
         )
-        if self.bf16_qk_softmax:
-            name += "-bf16p"
+        if not self.bf16_qk_softmax:
+            name += "-f32p"
         if self.sliding_window is not None:
             name += f"-sw{self.sliding_window}"
         return name
@@ -2638,38 +2648,43 @@ def _batched_mixed_rpa_body(
         s_scale *= cfgs.q_scale
     if cfgs.k_scale is not None:
         s_scale *= cfgs.k_scale
-    use_bf16_p = cfgs.bf16_qk_softmax and cfgs.dtype_q == jnp.bfloat16
-    mask_fill = (
-        jnp.asarray(cfgs.mask_value, dtype=jnp.bfloat16)
-        if use_bf16_p
-        else cfgs.mask_value
-    )
+    acc_dt = cfgs.scratch_dtype
+    mask_fill = jnp.asarray(cfgs.mask_value, dtype=acc_dt)
+    m_reset = jnp.asarray(-jnp.inf, dtype=acc_dt)
+
+    m_val = m_scratch_ref[...]
+    l_val = l_scratch_ref[...]
+    acc_val = acc_scratch_ref[...]
 
     def _run_pv_stage(
         p_chunk: jax.Array,
         alphas: list[jax.Array],
         row_start: int,
     ) -> jax.Array:
-        pv = lax.dot_general(
-            p_chunk.reshape(-1, tq_c, cfgs.bkv_sz),
-            v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
-            dimension_numbers=(([2], [1]), ([0], [0])),
-            preferred_element_type=jnp.float32,
-        ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq_c, cfgs.aligned_head_dim)
+        pv = (
+            lax.dot_general(
+                p_chunk.reshape(-1, tq_c, cfgs.bkv_sz),
+                v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_head_dim),
+                dimension_numbers=(([2], [1]), ([0], [0])),
+                preferred_element_type=jnp.float32,
+            )
+            .astype(acc_dt)
+            .reshape(cfgs.batch_size, cfgs.num_kv_heads, tq_c, cfgs.aligned_head_dim)
+        )
         if cfgs.v_scale is not None:
             pv = pv * cfgs.v_scale
 
         o_prev_c = (
-            acc_scratch_ref[...]
+            acc_val
             if cfgs.bq_csz == cfgs.bq_sz
-            else acc_scratch_ref[:, pl.ds(row_start, tq_c), :]
+            else acc_val[:, row_start : row_start + tq_c, :]
         )
         o_next_list: list[jax.Array] = []
         for b_idx in range(cfgs.batch_size):
             alpha_full = _broadcast_minor(alphas[b_idx], o_prev_c.shape)
             o_next_b = alpha_full * o_prev_c + pv[b_idx]
             o_next_list.append(o_next_b)
-            o_prev_c = jnp.where(is_lasts[b_idx], 0.0, o_next_b)
+            o_prev_c = o_next_b
         if cfgs.bq_csz == cfgs.bq_sz:
             acc_scratch_ref[...] = o_prev_c
         else:
@@ -2704,20 +2719,19 @@ def _batched_mixed_rpa_body(
             dimension_numbers=(([2], [2]), ([0], [0])),
             preferred_element_type=jnp.float32,
         ).reshape(cfgs.batch_size, cfgs.num_kv_heads, tq_c, cfgs.bkv_sz)
-        qk = qk * s_scale
+        qk = (qk * s_scale).astype(acc_dt)
         if cfgs.soft_cap is not None:
-            qk = cfgs.soft_cap * jnp.tanh(qk / cfgs.soft_cap)
-        if use_bf16_p:
-            qk = qk.astype(jnp.bfloat16)
+            qk = (
+                cfgs.soft_cap * jnp.tanh(qk.astype(jnp.float32) / cfgs.soft_cap)
+            ).astype(acc_dt)
 
         masked_list: list[jax.Array] = []
         for b_idx in range(cfgs.batch_size):
-            mask_b = kv_iota < kv_limits[b_idx]
             if cfgs.use_causal_mask:
-                c_off = jnp.where(
-                    is_valids[b_idx], causal_offs[b_idx] - bq_start, -cfgs.bq_sz
-                )
-                mask_b = jnp.logical_and(mask_b, q_kv_diff >= c_off)
+                offset = causal_offs[b_idx] - bq_start
+                mask_b = q_kv_diff >= offset
+            else:
+                mask_b = kv_iota < kv_limits[b_idx]
             if cfgs.sliding_window is not None:
                 sw_off = jnp.where(
                     is_valids[b_idx],
@@ -2728,16 +2742,16 @@ def _batched_mixed_rpa_body(
             masked_list.append(jnp.where(mask_b, qk[b_idx], mask_fill))
         qk_masked = jnp.stack(masked_list, axis=0)
 
-        m_curr = jnp.max(qk_masked, axis=-1, keepdims=True).astype(jnp.float32)
+        m_curr = jnp.max(qk_masked, axis=-1, keepdims=True)
         m_prev_c = (
-            m_scratch_ref[...]
+            m_val
             if cfgs.bq_csz == cfgs.bq_sz
-            else m_scratch_ref[:, pl.ds(row_start, tq_c), :]
+            else m_val[:, row_start : row_start + tq_c, :]
         )
         l_prev_c = (
-            l_scratch_ref[...]
+            l_val
             if cfgs.bq_csz == cfgs.bq_sz
-            else l_scratch_ref[:, pl.ds(row_start, tq_c), :]
+            else l_val[:, row_start : row_start + tq_c, :]
         )
         alpha_list: list[jax.Array] = []
         m_next_list: list[jax.Array] = []
@@ -2746,27 +2760,21 @@ def _batched_mixed_rpa_body(
             alpha_b = jnp.exp(m_prev_c - m_next_b)
             alpha_list.append(alpha_b)
             m_next_list.append(m_next_b)
-            m_prev_c = jnp.where(is_lasts[b_idx], -jnp.inf, m_next_b)
+            m_prev_c = jnp.where(is_lasts[b_idx], m_reset, m_next_b)
         if cfgs.bq_csz == cfgs.bq_sz:
             m_scratch_ref[...] = m_prev_c
         else:
             m_scratch_ref[:, pl.ds(row_start, tq_c), :] = m_prev_c
 
         m_next_stack = jnp.stack(m_next_list, axis=0)
-        if use_bf16_p:
-            p = jnp.exp(
-                qk_masked
-                - _broadcast_minor(m_next_stack.astype(jnp.bfloat16), qk_masked.shape)
-            )
-        else:
-            p = jnp.exp(qk_masked - _broadcast_minor(m_next_stack, qk_masked.shape))
-        p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=jnp.float32)
+        p = jnp.exp(qk_masked - _broadcast_minor(m_next_stack, qk_masked.shape))
+        p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=acc_dt)
 
         l_next_list: list[jax.Array] = []
         for b_idx in range(cfgs.batch_size):
             l_next_b = alpha_list[b_idx] * l_prev_c + p_rowsum[b_idx]
             l_next_list.append(l_next_b)
-            l_prev_c = jnp.where(is_lasts[b_idx], 0.0, l_next_b)
+            l_prev_c = l_next_b
         if cfgs.bq_csz == cfgs.bq_sz:
             l_scratch_ref[...] = l_prev_c
         else:
@@ -2800,10 +2808,14 @@ def _batched_mixed_rpa_body(
             batch_acc: jax.Array, batch_l: jax.Array, _b: int = b_idx
         ) -> None:
             l_full = _broadcast_minor(batch_l, batch_acc.shape)
-            if not cfgs.interpret_mode and cfgs.dtype_q != jnp.float32:
-                res = batch_acc * pltpu.reciprocal(l_full, approx=True)
-            else:
+            if (
+                cfgs.interpret_mode
+                or cfgs.dtype_q == jnp.float32
+                or cfgs.dtype_q == batch_l.dtype == jnp.bfloat16
+            ):
                 res = lax.div(batch_acc, l_full)
+            else:
+                res = batch_acc * pltpu.reciprocal(l_full, approx=True)
             out_b = res.astype(cfgs.dtype_q)
             if cfgs.interpret_mode:
                 o_vref[_b] = out_b.reshape(o_vref.shape[1:])
