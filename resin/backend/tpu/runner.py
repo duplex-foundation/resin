@@ -85,7 +85,7 @@ class _Step:
 
 @dataclass(slots=True)
 class _Completion:
-    """An overlapped decode step; ``result`` waits only for this step."""
+    """A dispatched step; ``result`` waits only for this step."""
 
     _runner: TpuRunner
     _step: _Step
@@ -94,8 +94,9 @@ class _Completion:
 
     @property
     def feedback(self) -> jax.Array | None:
-        # None drains the Engine, so a step past max_seq_len fails in forward
-        # rather than in an overlapped enqueue.
+        # None drains the Engine. Prefill and mixed steps never continue, and a
+        # decode step past max_seq_len fails in forward rather than in an
+        # overlapped enqueue.
         return self._step.tokens if self._continues else None
 
     def result(self) -> ForwardOutput:
@@ -374,18 +375,26 @@ class TpuRunner:
     def enqueue(
         self, plan: BatchPlan, *, feedback: jax.Array | None = None
     ) -> _Completion | ForwardOutput:
-        """Dispatch a decode step without waiting for the device.
+        """Dispatch a step without waiting for the device.
 
-        ``feedback`` holds the previous step's sampled tokens for the same rows
-        in the same order; they replace the continuation plan's token IDs.
+        Decode, prefill and mixed plans dispatch asynchronously. Plans that
+        request logprobs or prompt scores run synchronously, because reading
+        their scores needs host work after the step. The Engine enqueues only
+        decode continuations today; other plans reach this path from direct
+        callers such as the benchmark driver. ``feedback`` holds the
+        previous step's sampled tokens for the same rows in the same order; it
+        replaces the continuation plan's token IDs and is valid only for an
+        unscored decode plan.
         """
 
-        if plan.phase != BatchPhase.DECODE or plan.needs_logprobs:
-            if feedback is not None:
-                raise RuntimeError("a TPU continuation requires unscored decode")
+        decode = plan.phase == BatchPhase.DECODE
+        scored = plan.needs_logprobs or plan.needs_prompt_logprobs
+        if feedback is not None and (scored or not decode):
+            raise RuntimeError("a TPU continuation requires unscored decode")
+        if scored:
             return self.forward(plan)
         step = self._launch(plan, feedback)
-        continues = int(np.max(plan.context_lengths)) + 1 < self.max_seq_len
+        continues = decode and int(np.max(plan.context_lengths)) + 1 < self.max_seq_len
         return _Completion(self, step, continues)
 
 

@@ -16,7 +16,13 @@ import jax.numpy as jnp  # noqa: E402
 from jax.sharding import NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
-from resin import CacheRetention, Engine, SamplingParams, SchedulerConfig  # noqa: E402
+from resin import (  # noqa: E402
+    BatchPhase,
+    CacheRetention,
+    Engine,
+    SamplingParams,
+    SchedulerConfig,
+)
 from resin.backend.tpu.arena import KvCacheSpec  # noqa: E402
 from resin.backend.tpu.attention import paged_attention, quantize_kv  # noqa: E402
 from resin.backend.tpu.buckets import Bucket, ShapeBuckets  # noqa: E402
@@ -234,6 +240,23 @@ def _generate(
 PROMPTS = [[3, 1, 4, 1, 5, 9, 2], [6, 5], [3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4]]
 
 
+class _EnqueueOnly:
+    """Route every Engine step through ``enqueue`` and record what it returned."""
+
+    def __init__(self, runner: TpuRunner) -> None:
+        self._runner = runner
+        self.returned: list[tuple[str, bool]] = []
+
+    def __getattr__(self, name):
+        return getattr(self._runner, name)
+
+    def forward(self, plan):
+        output = self._runner.enqueue(plan)
+        asynchronous = hasattr(output, "result")
+        self.returned.append((str(plan.phase), asynchronous))
+        return output.result() if asynchronous else output
+
+
 @pytest.fixture(scope="module")
 def tp1():
     runner, model, params = _runner(1)
@@ -286,6 +309,39 @@ class TestTpuRunner:
             params, runner._arena.caches, inputs
         )
         assert logits.sharding.spec == P(None, "tp")
+
+    def test_enqueue_dispatches_prefill_plans_asynchronously(self) -> None:
+        runner, model, params = _runner(1, prefill_chunk_size=4)
+        wrapped = _EnqueueOnly(runner)
+        with closing(_engine(wrapped)) as engine:
+            outputs = _generate(engine, PROMPTS, overlap=False, max_output_tokens=6)
+        assert outputs == [model.dense_greedy(params, prompt, 6) for prompt in PROMPTS]
+        assert runner.compilations_after_warmup == 0
+        phases = {phase for phase, _ in wrapped.returned}
+        assert len(phases) == 2
+        assert all(asynchronous for _, asynchronous in wrapped.returned)
+
+    @pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
+    @pytest.mark.parametrize("field", ["needs_logprobs", "needs_prompt_logprobs"])
+    def test_scored_plans_run_synchronously(
+        self, tp1, monkeypatch, phase, field
+    ) -> None:
+        runner = tp1[0]
+        plan = SimpleNamespace(
+            phase=phase, needs_logprobs=False, needs_prompt_logprobs=False
+        )
+        setattr(plan, field, True)
+        monkeypatch.setattr(runner, "forward", lambda given: ("forward", given))
+        assert runner.enqueue(plan) == ("forward", plan)
+        with pytest.raises(RuntimeError, match="requires unscored decode"):
+            runner.enqueue(plan, feedback=jnp.zeros(1))
+
+    def test_prefill_rejects_decode_feedback(self, tp1) -> None:
+        plan = SimpleNamespace(
+            phase=BatchPhase.PREFILL, needs_logprobs=False, needs_prompt_logprobs=False
+        )
+        with pytest.raises(RuntimeError, match="requires unscored decode"):
+            tp1[0].enqueue(plan, feedback=jnp.zeros(1))
 
     def test_two_cache_groups_with_a_sliding_window_match_dense(self) -> None:
         runner, model, params = _runner(1, prefill_chunk_size=4, window=4)
