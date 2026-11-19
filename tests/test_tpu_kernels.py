@@ -3786,76 +3786,83 @@ class TestTpuHardwareMosaic:
         # Step 2: continuation prefill on seqs 0,1 (+530, +390 -> kv_lens [830, 570], crossing
         #         both page=256 and bkv_sz=512) while seqs 2,3 decode (+1 each, placed in 0..2).
         schedules = [
-            # (seq_ids_order, q_lens, kv_lens, dist)
             ([0, 1, 2, 3], [300, 180, 260, 75], [300, 180, 260, 75], [0, 0, 4]),
             ([2, 3, 0, 1], [1, 1, 530, 390], [261, 76, 830, 570], [2, 2, 4]),
         ]
+        prepared_steps = []
+        for seq_order, q_lens_step, kv_lens_step, dist_step in schedules:
+            q_raw = jnp.asarray(
+                rng.standard_normal((max_tokens, 64, 128)) * 0.2, jnp.bfloat16
+            )
+            k_raw = quantize_kv(
+                jnp.asarray(
+                    rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
+                ),
+                kv_dtype,
+                k_scale,
+            )
+            v_raw = quantize_kv(
+                jnp.asarray(
+                    rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
+                ),
+                kv_dtype,
+                v_scale,
+            )
+            q_p, kv_m = prepare_inputs(q_raw, k_raw, v_raw)
+            q_p = jax.device_put(q_p, q_packed_sharding)
+            kv_m = jax.device_put(kv_m, kv_merged_sharding)
+
+            step_pages = np.full(
+                (max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32
+            )
+            step_kv = np.zeros(max_seqs, dtype=np.int32)
+            cu_q = np.zeros(max_seqs + 1, dtype=np.int32)
+            cur = 0
+            for idx, (orig_s, ql, kvl) in enumerate(
+                zip(seq_order, q_lens_step, kv_lens_step, strict=True)
+            ):
+                step_pages[idx] = pages[orig_s]
+                step_kv[idx] = kvl
+                cur += ql
+                cu_q[idx + 1] = cur
+            cu_q[len(seq_order) :] = cur
+
+            meta = AttentionMetadata(
+                jax.device_put(step_kv, rep_sharding),
+                (jax.device_put(step_pages.reshape(-1), rep_sharding),),
+                jax.device_put(cu_q, rep_sharding),
+                jax.device_put(np.array(dist_step, dtype=np.int32), rep_sharding),
+            )
+            jax.block_until_ready((q_p, kv_m, meta))
+            prepared_steps.append((cur, q_p, kv_m, meta))
+
+        step_records = []
         counter = CompilationCounter()
         try:
             warm = None
-            for seq_order, q_lens_step, kv_lens_step, dist_step in schedules:
-                q_raw = jnp.asarray(
-                    rng.standard_normal((max_tokens, 64, 128)) * 0.2, jnp.bfloat16
-                )
-                k_raw = quantize_kv(
-                    jnp.asarray(
-                        rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
-                    ),
-                    kv_dtype,
-                    k_scale,
-                )
-                v_raw = quantize_kv(
-                    jnp.asarray(
-                        rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
-                    ),
-                    kv_dtype,
-                    v_scale,
-                )
-                q_p, kv_m = prepare_inputs(q_raw, k_raw, v_raw)
-                q_p = jax.device_put(q_p, q_packed_sharding)
-                kv_m = jax.device_put(kv_m, kv_merged_sharding)
-
-                step_pages = np.full(
-                    (max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32
-                )
-                step_kv = np.zeros(max_seqs, dtype=np.int32)
-                cu_q = np.zeros(max_seqs + 1, dtype=np.int32)
-                cur = 0
-                for idx, (orig_s, ql, kvl) in enumerate(
-                    zip(seq_order, q_lens_step, kv_lens_step, strict=True)
-                ):
-                    step_pages[idx] = pages[orig_s]
-                    step_kv[idx] = kvl
-                    cur += ql
-                    cu_q[idx + 1] = cur
-                cu_q[len(seq_order) :] = cur
-
-                meta = AttentionMetadata(
-                    jax.device_put(step_kv, rep_sharding),
-                    (jax.device_put(step_pages.reshape(-1), rep_sharding),),
-                    jax.device_put(cu_q, rep_sharding),
-                    jax.device_put(np.array(dist_step, dtype=np.int32), rep_sharding),
-                )
+            for cur, q_p, kv_m, meta in prepared_steps:
                 out_unpacked, cache = mosaic_mixed(q_p, kv_m, cache, meta)
                 out_unpacked.block_until_ready()
                 if warm is None:
                     warm = counter.count
                 else:
                     assert counter.count == warm
-
-                ref_p, ref_cache = ref_mixed(q_p, kv_m, ref_cache, meta)
-                ref_unpacked = prepare_outputs(ref_p, 8, 128)
-                out_f32 = np.asarray(out_unpacked[:cur], np.float32)
-                assert not np.any(np.isnan(out_f32))
-                np.testing.assert_allclose(
-                    out_f32,
-                    np.asarray(ref_unpacked[:cur], np.float32),
-                    rtol=rtol,
-                    atol=atol,
-                )
+                step_records.append((cur, q_p, kv_m, meta, out_unpacked))
         finally:
             del flat_pages
             counter.close()
+
+        for cur, q_p, kv_m, meta, out_unpacked in step_records:
+            ref_p, ref_cache = ref_mixed(q_p, kv_m, ref_cache, meta)
+            ref_unpacked = prepare_outputs(ref_p, 8, 128)
+            out_f32 = np.asarray(out_unpacked[:cur], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_unpacked[:cur], np.float32),
+                rtol=rtol,
+                atol=atol,
+            )
 
         cache_host = np.asarray(cache, np.float32)
         ref_cache_host = np.asarray(ref_cache, np.float32)
