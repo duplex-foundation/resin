@@ -460,6 +460,34 @@ def test_cancel_survivor_drains_terminal_peer_without_losing_other_events():
     runner.shutdown()
 
 
+def test_tight_pool_pins_boundary_row_without_stranding_non_boundary_rows():
+    outputs = []
+    for overlap in (False, True):
+        runner = AsyncRunner()
+        runner.runner_config = RunnerConfig(
+            cache_layout=CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(128)]),
+            max_accepted_per_step=2,
+        )
+        engine = Engine(runner, enable_overlap=overlap, max_running_requests=2)
+        requests = [
+            engine.submit(
+                [1] * length, sampling_params=SamplingParams(max_output_tokens=20)
+            )
+            for length in (127, 100)
+        ]
+        while engine.has_work():
+            engine.step()
+        outputs.append([request.take_result() for request in requests])
+        if overlap:
+            # One row starts on a page boundary and the other 27 tokens short
+            # of one. Three pages are enough for both, so overlap continues.
+            assert engine.overlap_stats[1] >= 8
+        assert engine.cache_free_parent_count == 3
+        engine.close()
+        runner.shutdown()
+    assert outputs[0] == outputs[1]
+
+
 def test_gpu_feedback_matches_reference_across_page_and_budget_drains():
     outputs = []
     for overlap in (False, True):

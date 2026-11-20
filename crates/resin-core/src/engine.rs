@@ -127,11 +127,12 @@ const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
 const MIN_NEW_TOKEN_RATIO_FACTOR: f64 = 0.14;
 const NEW_TOKEN_RATIO_DECAY_STEPS: f64 = 600.0;
 const RETRACTION_DECODE_HEADROOM: usize = 20;
-/// Decode steps of progress in the fallback continuation lease. The first
-/// choice is a full history page per row. A saturated pool lacks a free page
-/// for nearly every row then, so the lease shrinks to this span, which only
-/// needs a page for rows within this many tokens of a page boundary.
-const CONTINUATION_LEASE_TOKENS: u64 = 32;
+/// Parent slabs withheld from waiting admission while work is already active,
+/// so a near-full decode cohort keeps boundary-lookahead headroom.
+const ADMISSION_LOOKAHEAD_RESERVE_PARENTS: u32 = 24;
+/// Caps the admission reserve at 1/128 of the pool, so small pools keep their
+/// full admission capacity.
+const ADMISSION_LOOKAHEAD_RESERVE_DIVISOR: u32 = 128;
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -1246,7 +1247,18 @@ impl<P: Clone> EngineCore<P> {
         }
         estimate
             .include(candidate.cache.as_ref(), self.estimated_context(candidate))
-            .is_ok_and(|parents| parents > u64::from(resources.parent_capacity()))
+            .is_ok_and(|parents| parents > self.admission_parent_budget(resources))
+    }
+
+    /// Parents admission may commit while work is active. The reserve stays
+    /// free for continuation leases; `admission_blocked` and
+    /// `admission_prefix_len` must agree on it, or a chain would drain for a
+    /// candidate that admission then rejects.
+    fn admission_parent_budget(&self, resources: &PagedKvResources) -> u64 {
+        let capacity = resources.parent_capacity();
+        let reserve = (capacity / ADMISSION_LOOKAHEAD_RESERVE_DIVISOR)
+            .min(ADMISSION_LOOKAHEAD_RESERVE_PARENTS);
+        u64::from(capacity - reserve)
     }
 
     /// A conservative host plan reserves the longest possible previous output;
@@ -1375,7 +1387,7 @@ impl<P: Clone> EngineCore<P> {
                 scheduled_rows,
                 selection,
                 mut decode_reservation_lookahead,
-                bounded_lookahead,
+                min_overlap_lookahead,
                 scheduled_has_waiting,
                 has_running,
             ) = {
@@ -1444,7 +1456,7 @@ impl<P: Clone> EngineCore<P> {
                         .zip(&selected_requests)
                         .all(|(row, _)| row.phase == Phase::Decode);
                 let narrow = self.runner_config.decode_write_lookahead();
-                let (lookahead, bounded_lookahead) = if reserve_continuation {
+                let (lookahead, min_overlap_lookahead) = if reserve_continuation {
                     let layout = self.runner_config.cache_layout.as_ref().unwrap();
                     let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
                     let page = layout
@@ -1491,11 +1503,11 @@ impl<P: Clone> EngineCore<P> {
                         (span >= maximum + writes).then(|| (span - 1) as u32)
                     };
                     // Prefer a full history page. A saturated pool cannot give
-                    // every row a spare page, so a shorter span is the fallback.
+                    // every row a spare page, so the search below falls back
+                    // toward the span of one continuation step.
                     let full = lease(page).unwrap_or(narrow);
-                    let bounded = lease(page.min(CONTINUATION_LEASE_TOKENS))
-                        .filter(|&bounded| bounded < full);
-                    (full, bounded)
+                    let min_overlap = lease(0).filter(|&span| span > narrow && span <= full);
+                    (full, min_overlap)
                 } else {
                     (narrow, None)
                 };
@@ -1503,7 +1515,7 @@ impl<P: Clone> EngineCore<P> {
                     scheduled_rows,
                     selection,
                     lookahead,
-                    bounded_lookahead,
+                    min_overlap_lookahead,
                     scheduled_has_waiting,
                     has_running,
                 )
@@ -1552,10 +1564,27 @@ impl<P: Clone> EngineCore<P> {
                                 .collect::<Vec<_>>();
                             resources.can_ensure_contexts(&requests)
                         };
-                        // Full page, then the bounded span, then the narrow lease.
+                        // A full page when the pool allows. Otherwise the widest
+                        // uniform span it covers: rows within that many tokens
+                        // of a page boundary take a page, so a wider span pins
+                        // more of the pages the cohort needs next. Coverage is
+                        // monotone in the span, which makes binary search exact.
                         if !covers(resources, decode_reservation_lookahead)? {
-                            decode_reservation_lookahead = match bounded_lookahead {
-                                Some(bounded) if covers(resources, bounded)? => bounded,
+                            decode_reservation_lookahead = match min_overlap_lookahead {
+                                Some(floor) if covers(resources, floor)? => {
+                                    let (mut best, mut low) = (floor, floor + 1);
+                                    let mut high = decode_reservation_lookahead - 1;
+                                    while low <= high {
+                                        let middle = low + (high - low) / 2;
+                                        if covers(resources, middle)? {
+                                            best = middle;
+                                            low = middle + 1;
+                                        } else {
+                                            high = middle - 1;
+                                        }
+                                    }
+                                    best
+                                }
                                 _ => narrow,
                             };
                         }
@@ -2208,13 +2237,12 @@ impl<P: Clone> EngineCore<P> {
             .take_while(|request| request.is_running())
             .count();
         let mut admitted = selected_running;
+        let budget = self.admission_parent_budget(resources);
         for request in &selected[selected_running..] {
             let parents = estimate
                 .include(request.cache.as_ref(), self.estimated_context(request))
                 .map_err(Error::from)?;
-            if parents > u64::from(resources.parent_capacity())
-                && (running_count != 0 || admitted != 0)
-            {
+            if parents > budget && (running_count != 0 || admitted != 0) {
                 break;
             }
             admitted += 1;
