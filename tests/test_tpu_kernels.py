@@ -2744,6 +2744,194 @@ class TestDecodeMatmulPath:
                     atol=2e-2,
                 )
 
+    def test_async_row_all_reduce_race_free_zero_psum_and_vmem_budget(self) -> None:
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            estimate_async_ar_vmem_bytes,
+            get_async_ar_tile_sizes,
+            quantize_fp8_act,
+            sharded_fp8_row_matmul_async_ar,
+        )
+
+        # VMEM audit across all 12 Qwen3-32B tp=2 decode buckets on o_proj and down_proj.
+        vmem_budget_bytes = 40 * 1024 * 1024
+        decode_buckets = (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320)
+        for bs in decode_buckets:
+            for n_out_dim, k_local in ((5120, 4096), (5120, 12800)):
+                tiles = get_async_ar_tile_sizes(bs, n_out_dim, k_local)
+                n_out = n_out_dim // tiles.out_block_size
+                assert n_out >= 4
+                vmem_bytes = estimate_async_ar_vmem_bytes(
+                    tiles.batch_block_size,
+                    tiles.out_block_size,
+                    tiles.in_block_size,
+                    n_out,
+                    min(tiles.w_buffer_count, n_out),
+                )
+                assert vmem_bytes <= vmem_budget_bytes
+
+        devices = jax.devices()
+        if len(devices) < 2:
+            pytest.skip("requires at least 2 devices for tp=2 async all-reduce")
+
+        mesh = make_mesh(2, devices[:2])
+        row_sharding = NamedSharding(mesh, P(None, "tp"))
+        rep_sharding = NamedSharding(mesh, P())
+        rng = np.random.default_rng(2026)
+
+        def _quant_per_die(x_bf16_sh: jax.Array) -> tuple[jax.Array, jax.Array]:
+            n_rows = x_bf16_sh.shape[0]
+
+            def _local_q(xl: jax.Array) -> tuple[jax.Array, jax.Array]:
+                ql, sl = quantize_fp8_act(xl, tp_axis="tp", sync_tp_scale=False)
+                return ql, jnp.transpose(sl.reshape(n_rows, 1))
+
+            return jax.shard_map(
+                _local_q,
+                mesh=mesh,
+                in_specs=P(None, "tp"),
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )(x_bf16_sh)
+
+        for dma_mode in ("on_wait", "eager"):
+            interp_params = pltpu.InterpretParams(
+                detect_races=True, dma_execution_mode=dma_mode
+            )
+            for batch, live, n_dim, k_global, tiles in (
+                (24, 21, 512, 512, Fp8MatmulTileSizes(24, 128, 256, 2)),
+                (13, 13, 640, 512, Fp8MatmulTileSizes(16, 128, 256, 3)),
+                (8, 8, 256, 256, Fp8MatmulTileSizes(8, 128, 128, 2)),
+            ):
+                x_np = rng.standard_normal((batch, k_global)).astype(np.float32) * 0.4
+                x_np[live:] = 0.0
+                x_bf16 = jax.device_put(jnp.asarray(x_np, jnp.bfloat16), row_sharding)
+                w = quantize_fp8_weight(
+                    jnp.asarray(
+                        rng.standard_normal((n_dim, k_global)) * 0.03, jnp.bfloat16
+                    )
+                )
+                wq = jax.device_put(w.qvalue, row_sharding)
+                ws = jax.device_put(w.scale, rep_sharding)
+                xq, xs = _quant_per_die(x_bf16)
+
+                @jax.jit
+                def ref_fn(xqi: jax.Array, xsi: jax.Array) -> jax.Array:
+                    return sharded_fp8_matmul(
+                        xqi,
+                        wq,
+                        ws,
+                        P(None, "tp"),
+                        mesh=mesh,
+                        x_scale=xsi,
+                        sync_tp_scale=False,
+                        tile_sizes=tiles,
+                        backend="pallas",
+                        interpret=True,
+                    )
+
+                @jax.jit
+                def async_fn(xqi: jax.Array, xsi: jax.Array) -> jax.Array:
+                    return sharded_fp8_row_matmul_async_ar(
+                        xqi,
+                        wq,
+                        ws,
+                        mesh=mesh,
+                        x_scale=xsi,
+                        sync_tp_scale=False,
+                        tile_sizes=tiles,
+                        backend="pallas",
+                        interpret=interp_params,
+                    )
+
+                async_jaxpr = jax.make_jaxpr(async_fn)(xq, xs)
+                assert "psum" not in str(async_jaxpr)
+
+                y_ref = jax.block_until_ready(ref_fn(xq, xs))
+                y_got = jax.block_until_ready(async_fn(xq, xs))
+                assert interpret_pallas_call.races is not None
+                assert not interpret_pallas_call.races.races_found
+
+                shard_0 = np.asarray(y_got.addressable_shards[0].data)
+                shard_1 = np.asarray(y_got.addressable_shards[1].data)
+                np.testing.assert_array_equal(shard_0, shard_1)
+                np.testing.assert_array_equal(shard_0, np.asarray(y_ref))
+                if live < batch:
+                    np.testing.assert_array_equal(
+                        np.asarray(shard_0[live:], np.float32), 0.0
+                    )
+
+        # Back-to-back o_proj -> down_proj chain in a single jit across two consecutive calls.
+        w_o = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((256, 512)) * 0.03, jnp.bfloat16)
+        )
+        w_d = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((256, 1024)) * 0.03, jnp.bfloat16)
+        )
+        wo_q = jax.device_put(w_o.qvalue, row_sharding)
+        wo_s = jax.device_put(w_o.scale, rep_sharding)
+        wd_q = jax.device_put(w_d.qvalue, row_sharding)
+        wd_s = jax.device_put(w_d.scale, rep_sharding)
+        x_o = jax.device_put(
+            jnp.asarray(rng.standard_normal((16, 512)) * 0.3, jnp.bfloat16),
+            row_sharding,
+        )
+        x_d = jax.device_put(
+            jnp.asarray(rng.standard_normal((16, 1024)) * 0.3, jnp.bfloat16),
+            row_sharding,
+        )
+        chain_ip = pltpu.InterpretParams(detect_races=True, dma_execution_mode="eager")
+
+        @jax.jit
+        def _two_proj_async(xo: jax.Array, xd: jax.Array) -> jax.Array:
+            yo = sharded_fp8_row_matmul_async_ar(
+                xo,
+                wo_q,
+                wo_s,
+                mesh=mesh,
+                sync_tp_scale=False,
+                backend="pallas",
+                interpret=chain_ip,
+            )
+            yd = sharded_fp8_row_matmul_async_ar(
+                xd,
+                wd_q,
+                wd_s,
+                mesh=mesh,
+                sync_tp_scale=False,
+                backend="pallas",
+                interpret=chain_ip,
+            )
+            return yo + yd
+
+        y1 = jax.block_until_ready(_two_proj_async(x_o, x_d))
+        y2 = jax.block_until_ready(_two_proj_async(x_o, x_d))
+        assert interpret_pallas_call.races is not None
+        assert not interpret_pallas_call.races.races_found
+        np.testing.assert_array_equal(np.asarray(y1), np.asarray(y2))
+        y_ref_chain = sharded_fp8_matmul(
+            x_o,
+            wo_q,
+            wo_s,
+            P(None, "tp"),
+            mesh=mesh,
+            sync_tp_scale=False,
+            backend="pallas",
+            interpret=True,
+        ) + sharded_fp8_matmul(
+            x_d,
+            wd_q,
+            wd_s,
+            P(None, "tp"),
+            mesh=mesh,
+            sync_tp_scale=False,
+            backend="pallas",
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
+
 
 @pytest.mark.skipif(
     jax.default_backend() != "tpu", reason="requires TPU Mosaic hardware"
@@ -3751,6 +3939,189 @@ class TestTpuHardwareMosaic:
             rtol=1e-2,
             atol=2e-2,
         )
+
+    def test_qwen3_tp2_mosaic_async_row_all_reduce_parity_and_zero_recompile(
+        self,
+    ) -> None:
+        from resin.backend.tpu.kernels import (
+            fused_add_rms_norm_fp8_quant,
+            quantize_fp8_act,
+            sharded_fp8_gate_up_swiglu,
+            sharded_fp8_row_matmul_async_ar,
+        )
+
+        if len(jax.devices()) < 2:
+            pytest.skip("requires 2 TPU cores for tp=2 async all-reduce")
+
+        hidden_size = 5120
+        q_width = 8192
+        ffn_width = 25600
+        rms_eps = 1e-6
+
+        mesh = make_mesh(2)
+        rep = NamedSharding(mesh, P())
+        rep_2d = NamedSharding(mesh, P(None, None))
+        row_sh = NamedSharding(mesh, P(None, "tp"))
+        col_sh = NamedSharding(mesh, P("tp", None))
+        sc_col_sh = NamedSharding(mesh, P("tp"))
+        sc_die_sh = NamedSharding(mesh, P("tp", None))
+        rng = np.random.default_rng(7702)
+
+        w_o = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((hidden_size, q_width)) * 0.02, jnp.bfloat16
+            )
+        )
+        w_gu = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((2 * ffn_width, hidden_size)) * 0.02, jnp.bfloat16
+            )
+        )
+        w_d = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((hidden_size, ffn_width)) * 0.02, jnp.bfloat16
+            )
+        )
+        wo_q = jax.device_put(w_o.qvalue, row_sh)
+        wo_s = jax.device_put(w_o.scale, rep)
+        wgu_q = jax.device_put(w_gu.qvalue, col_sh)
+        wgu_s = jax.device_put(w_gu.scale, sc_col_sh)
+        wd_q = jax.device_put(w_d.qvalue, row_sh)
+        wd_s = jax.device_put(w_d.scale, rep)
+        nw1 = jax.device_put(jnp.ones((hidden_size,), jnp.bfloat16), rep)
+        nw2 = jax.device_put(jnp.ones((hidden_size,), jnp.bfloat16), rep)
+
+        def _add_norm_quant(
+            dl: jax.Array, rl: jax.Array, w: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return jax.shard_map(
+                lambda d, r, nw: fused_add_rms_norm_fp8_quant(
+                    d, r, nw, rms_eps, transposed_scale=True
+                ),
+                mesh=mesh,
+                in_specs=(P(None, None), P(None, None), P()),
+                out_specs=(P(None, None), P(None, None), P(None, None)),
+                check_vma=False,
+            )(dl, rl, w)
+
+        def _quant_per_die(x_bf16_sh: jax.Array) -> tuple[jax.Array, jax.Array]:
+            n_rows = x_bf16_sh.shape[0]
+
+            def _local_q(xl: jax.Array) -> tuple[jax.Array, jax.Array]:
+                ql, sl = quantize_fp8_act(xl, tp_axis="tp", sync_tp_scale=False)
+                return ql, jnp.transpose(sl.reshape(n_rows, 1))
+
+            return jax.shard_map(
+                _local_q,
+                mesh=mesh,
+                in_specs=P(None, "tp"),
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )(x_bf16_sh)
+
+        def _row_proj(
+            xq_in: jax.Array,
+            xs_in: jax.Array | None,
+            wq_in: jax.Array,
+            ws_in: jax.Array,
+            use_async: bool,
+        ) -> jax.Array:
+            if use_async:
+                return sharded_fp8_row_matmul_async_ar(
+                    xq_in,
+                    wq_in,
+                    ws_in,
+                    mesh=mesh,
+                    x_scale=xs_in,
+                    sync_tp_scale=False,
+                    backend="pallas",
+                )
+            return sharded_fp8_matmul(
+                xq_in,
+                wq_in,
+                ws_in,
+                P(None, "tp"),
+                mesh=mesh,
+                x_scale=xs_in,
+                sync_tp_scale=False,
+                backend="pallas",
+            )
+
+        def _two_step_body(
+            res: jax.Array, aq: jax.Array, as_t: jax.Array, *, use_async: bool
+        ) -> jax.Array:
+            for _ in range(2):
+                o_out = _row_proj(aq, as_t, wo_q, wo_s, use_async)
+                mlp_q, mlp_s, res = _add_norm_quant(o_out, res, nw1)
+                gq, gs = sharded_fp8_gate_up_swiglu(
+                    mlp_q,
+                    mlp_s,
+                    wgu_q,
+                    wgu_s,
+                    mesh=mesh,
+                    sequence_parallel=False,
+                    sync_tp_scale=False,
+                    quantize_output=True,
+                    backend="pallas",
+                )
+                d_out = _row_proj(gq, gs, wd_q, wd_s, use_async)
+                _, _, res = _add_norm_quant(d_out, res, nw2)
+            return res
+
+        _o_async = jax.jit(lambda x, s: _row_proj(x, s, wo_q, wo_s, True))
+        _o_stock_psum = jax.jit(lambda x, s: _row_proj(x, s, wo_q, wo_s, False))
+        _async_two_step = jax.jit(
+            functools.partial(_two_step_body, use_async=True), donate_argnums=(0,)
+        )
+        _psum_two_step = jax.jit(
+            functools.partial(_two_step_body, use_async=False),
+            compiler_options={
+                "xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes": "67108864"
+            },
+        )
+
+        for bs in (8, 16, 160, 320):
+            live = max(1, bs - 3)
+            res_np = rng.standard_normal((bs, hidden_size)).astype(np.float32) * 0.4
+            att_np = rng.standard_normal((bs, q_width)).astype(np.float32) * 0.4
+            res_np[live:] = 0.0
+            att_np[live:] = 0.0
+            res0 = jax.device_put(jnp.asarray(res_np, jnp.bfloat16), rep_2d)
+            att_bf16 = jax.device_put(jnp.asarray(att_np, jnp.bfloat16), row_sh)
+            aq, as_t = _quant_per_die(att_bf16)
+            as_t = jax.device_put(as_t, sc_die_sh)
+
+            np.testing.assert_allclose(
+                np.asarray(_o_async(aq, as_t), np.float32),
+                np.asarray(_o_stock_psum(aq, as_t), np.float32),
+                rtol=1e-3,
+                atol=5e-2,
+            )
+
+            hlo_txt = _async_two_step.lower(res0, aq, as_t).as_text()
+            assert "stablehlo.all_reduce" not in hlo_txt
+
+            y_ref = jax.block_until_ready(_psum_two_step(res0, aq, as_t))
+            counter = CompilationCounter()
+            try:
+                y_got = jax.block_until_ready(_async_two_step(res0.copy(), aq, as_t))
+                shard_0 = np.asarray(y_got.addressable_shards[0].data)
+                shard_1 = np.asarray(y_got.addressable_shards[1].data)
+                warm = counter.count
+                y_got2 = jax.block_until_ready(_async_two_step(y_got, aq, as_t))
+                assert counter.count == warm
+                assert not np.any(np.isnan(np.asarray(y_got2, np.float32)))
+            finally:
+                counter.close()
+
+            np.testing.assert_array_equal(shard_0, shard_1)
+            np.testing.assert_array_equal(np.asarray(shard_0[live:], np.float32), 0.0)
+            np.testing.assert_allclose(
+                np.asarray(shard_0, np.float32),
+                np.asarray(y_ref, np.float32),
+                rtol=1e-2,
+                atol=2e-2,
+            )
 
     @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
     def test_qwen3_tp2_mosaic_batched_decode_parity_and_zero_recompile(

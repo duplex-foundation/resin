@@ -49,6 +49,7 @@ from resin.backend.tpu.kernels import (
     sharded_fp8_matmul,
     sharded_fp8_matmul_all_gather,
     sharded_fp8_matmul_reduce_scatter,
+    sharded_fp8_row_matmul_async_ar,
 )
 from resin.backend.tpu.kernels._rpa_v3_pallas import get_tpu_version
 from resin.backend.tpu.mesh import TP_AXIS, tp_size
@@ -59,6 +60,8 @@ COLUMN = P(TP_AXIS, None)
 ROW = P(None, TP_AXIS)
 TOKENS_SHARDED = P(TP_AXIS, None)
 _PREFILL_MATMUL_MIN_TOKENS = 512
+_DECODE_PALLAS_MAX_TOKENS = 320
+_ASYNC_AR_MIN_HIDDEN_SIZE = 256
 
 DecodeMatmulMode = Literal[
     "auto",
@@ -126,6 +129,7 @@ class Qwen3Model:
     impl: AttentionImpl | None = None
     prefill_matmul_backend: MatmulBackend = "auto"
     decode_matmul_mode: DecodeMatmulMode = "auto"
+    decode_async_all_reduce: bool = True
     fuse_unpack_attn_quant: bool = True
     sequence_parallel_min_tokens: int = _PREFILL_MATMUL_MIN_TOKENS
     _force_fused_qkv_pack_interpret: bool = field(default=False, repr=False)
@@ -170,17 +174,19 @@ class Qwen3Model:
         x_scale: jax.Array | None = None,
         x_abs_max: jax.Array | None = None,
         sync_tp_scale: bool = True,
+        async_all_reduce: bool = False,
         out_dtype: Any = None,
         backend: MatmulBackend = "auto",
         interpret: bool = False,
     ) -> jax.Array:
+        if not isinstance(weight, Fp8Weight):
+            return x @ weight.T
         target_dtype = x.dtype if out_dtype is None else out_dtype
-        if isinstance(weight, Fp8Weight):
-            return sharded_fp8_matmul(
+        if async_all_reduce and spec == ROW:
+            return sharded_fp8_row_matmul_async_ar(
                 x,
                 weight.qvalue,
                 weight.scale,
-                spec,
                 mesh=self.mesh,
                 x_scale=x_scale,
                 x_abs_max=x_abs_max,
@@ -189,7 +195,19 @@ class Qwen3Model:
                 backend=backend,
                 interpret=interpret,
             )
-        return x @ weight.T
+        return sharded_fp8_matmul(
+            x,
+            weight.qvalue,
+            weight.scale,
+            spec,
+            mesh=self.mesh,
+            x_scale=x_scale,
+            x_abs_max=x_abs_max,
+            sync_tp_scale=sync_tp_scale,
+            out_dtype=target_dtype,
+            backend=backend,
+            interpret=interpret,
+        )
 
     def _attend_qkv(
         self,
@@ -489,7 +507,7 @@ class Qwen3Model:
         tp = tp_size(self.mesh)
         layers = params.layers
         is_prefill = tokens >= _PREFILL_MATMUL_MIN_TOKENS
-        prequantize_gated = tokens <= 320
+        prequantize_gated = tokens <= _DECODE_PALLAS_MAX_TOKENS
         dec_interp = (not is_prefill) and self._force_decode_pallas_interpret
         if is_prefill:
             proj_backend: MatmulBackend = self._resolve_prefill_matmul_backend(tokens)
@@ -542,6 +560,15 @@ class Qwen3Model:
 
         x = params.embed[inputs.input_ids]
         act_dtype = x.dtype
+        use_async_row_ar = (
+            self.decode_async_all_reduce
+            and not is_prefill
+            and tokens <= _DECODE_PALLAS_MAX_TOKENS
+            and tp == 2
+            and not row_sync_tp_scale
+            and config.hidden_size >= _ASYNC_AR_MIN_HIDDEN_SIZE
+            and proj_backend != "xla"
+        )
         use_fused_unpack_quant = (
             self.fuse_unpack_attn_quant
             and not is_prefill
@@ -599,6 +626,7 @@ class Qwen3Model:
                     ROW,
                     x_scale=att_scale,
                     sync_tp_scale=False,
+                    async_all_reduce=use_async_row_ar,
                     out_dtype=act_dtype,
                     backend=proj_backend,
                     interpret=dec_interp,
@@ -613,6 +641,7 @@ class Qwen3Model:
                     weights.o,
                     ROW,
                     sync_tp_scale=row_sync_tp_scale,
+                    async_all_reduce=use_async_row_ar,
                     out_dtype=act_dtype,
                     backend=proj_backend,
                     interpret=dec_interp,
@@ -640,6 +669,7 @@ class Qwen3Model:
                 x_scale=gated_aux if prequantize_gated else None,
                 x_abs_max=None if prequantize_gated else gated_aux,
                 sync_tp_scale=row_sync_tp_scale,
+                async_all_reduce=use_async_row_ar,
                 out_dtype=act_dtype,
                 backend=proj_backend,
                 interpret=dec_interp,
