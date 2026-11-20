@@ -404,13 +404,27 @@ def test_tiny_runner_overlap_matches_sync(
     assert outputs[1] == outputs[2]
     if temperature == 0.0:
         assert all(output == outputs[0] for output in outputs[1:])
-    # Identical physical graph geometry must make exactly the same decisions.
+    # Identical physical graph geometry must make exactly the same decisions,
+    # up to the discarded successors counted below.
     # The smaller eager batch can round an assistant logit tie differently;
     # Greedy verified output remains equal to the target-only sequence above.
     # Shared sampling tests cover the probability and RNG contract. BF16
     # target-logit or nucleus-cutoff ties can change seeded categorical draws
     # between eager/graph shapes or single-token/block verification.
-    assert statistics[1] == statistics[2]
+    # Overlap enqueues a request's successor step before it can see the request
+    # finish by length, so the Engine discards that step's output. The runner
+    # still verifies the block, and counts it, for at most one row per request.
+    for sync, overlapped, requests in zip(
+        statistics[1], statistics[2], range(3, 3 * len(statistics[1]) + 1, 3)
+    ):
+        extra = {
+            name: overlapped[name] - sync[name]
+            for name in ("blocks", "drafts", "accepted", "emitted")
+        }
+        assert 0 <= extra["blocks"] <= requests
+        assert extra["drafts"] == draft_tokens * extra["blocks"]
+        assert 0 <= extra["accepted"] <= extra["drafts"]
+        assert extra["emitted"] == extra["blocks"] + extra["accepted"]
     if cached_outputs is not None:
         assert cached_outputs == outputs[1][-1]
 

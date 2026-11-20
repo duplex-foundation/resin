@@ -73,7 +73,7 @@ def test_capacity_only_probe_never_enters_capture_or_retained_cases(capsys):
     assert retained == cases and not skipped
     probe = options["cache_capacity_probes"][0]
     assert probe["batch_size"] == 64
-    assert probe["peak_context"] == 33905
+    assert probe["peak_context"] == 33904
     assert probe["fits"] is False and probe["measured"] is False
     assert '"probes"' in capsys.readouterr().out
 

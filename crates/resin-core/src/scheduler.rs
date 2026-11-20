@@ -104,6 +104,15 @@ impl<T: Schedulable> Scheduler<T> {
         self.selection(selected)
     }
 
+    /// The waiting item that anchors the next admission cohort: the oldest
+    /// request at the highest priority among those `eligible` accepts.
+    pub fn first_waiting(&self, eligible: impl Fn(&T) -> bool) -> Option<&T> {
+        self.ready
+            .iter()
+            .filter(|item| !item.is_running() && eligible(item))
+            .min_by_key(|item| Reverse(item.priority()))
+    }
+
     fn selection(&self, selected: Vec<SelectedIdentity>) -> (Vec<&T>, Selection) {
         let items = selected
             .iter()

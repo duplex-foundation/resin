@@ -191,12 +191,19 @@ using that feedback before collecting and committing the previous result on the
 CPU, so device execution overlaps host completion work. Synchronous runners
 continue to work through `forward()`.
 
-Overlap requires a stable decode cohort, enough remaining output and context
-budget, and both steps' write spans inside the same owned blocks in every cache
-group. The Engine retains the requests and a single writer lease across
-continuations. New arrivals, cancellation, close, and cache
-page boundaries drain pending work before changing ownership. Other steps,
-including prefill, use the synchronous path. `enable_overlap=False` disables
+Overlap requires a stable decode cohort, enough context budget, and both steps'
+write spans inside the same owned blocks in every cache group. The Engine retains
+the requests and a single writer lease across continuations. A waiting request
+does not stop overlap while the scheduler cannot admit it, because the running
+limit or the KV admission estimate leaves no room. A request that becomes
+admissible, a stop token or output limit, cancellation, close, and the end of the
+continuation lease drain pending work before changing ownership. The lease
+covers a full history page of progress plus the write envelope, rounded up to
+whole pages. If the pool cannot reserve that for every row, the lease covers 32
+tokens, then only the write envelope. A request that reaches
+`max_output_tokens` finishes like a stop token: its successor step still runs and
+the Engine discards that step's output. Other steps, including prefill, use the
+synchronous path. `enable_overlap=False` disables
 overlap for the Engine; `step(allow_overlap=False)` drains pending work or runs
 the next batch synchronously.
 

@@ -88,13 +88,17 @@ inputs and cache views; they do not track pending batches or schedule continuati
 The Engine keeps one batch in flight. Exact accepted tokens, positions and
 sampling offsets feed the next graph on the GPU; CPU progress and events commit
 from the completed output. A single writer lease transfers between safe decode
-continuations. Arrivals, cancellation, close and page boundaries drain before
-changing ownership. Failures after enqueue retain owners in quarantine.
+continuations. Waiting requests that the running limit or the KV admission
+estimate keeps out do not stop overlap. A request that becomes admissible, a
+stop token or output limit, cancellation, close and the end of the continuation
+lease drain before changing ownership. The lease covers a full history page of
+progress plus the write envelope, rounded up to whole pages. If the pool cannot
+reserve that for every row, it covers 32 tokens, then only the write envelope. Failures after enqueue retain owners in quarantine.
 
-The fast path requires a stable decode cohort, sufficient remaining budget, and
+The fast path requires a stable decode cohort, sufficient context budget, and
 both write spans inside the same owned blocks in every cache group. Stop tokens,
-including EOS, can finish a request while its successor step is in flight: its
-result is published immediately, but its row
+including EOS, and the output limit can finish a request while its successor step
+is in flight: its result is published immediately, but its row
 and cache lease remain alive until that step completes. Successor outputs for
 finished rows are discarded. Other steps use the synchronous path.
 `enable_overlap=False` or `step(allow_overlap=False)` selects the reference path.
