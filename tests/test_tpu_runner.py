@@ -17,6 +17,7 @@ from jax.sharding import NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from resin import CacheRetention, Engine, SamplingParams, SchedulerConfig  # noqa: E402
+from resin.backend.tpu import runner as runner_module  # noqa: E402
 from resin.backend.tpu.arena import KvCacheSpec  # noqa: E402
 from resin.backend.tpu.attention import paged_attention, quantize_kv  # noqa: E402
 from resin.backend.tpu.buckets import Bucket, ShapeBuckets  # noqa: E402
@@ -249,7 +250,68 @@ class _Die:
         return self._stats
 
 
+class _TpuJit:
+    """Stands in for ``jax`` in the runner: claims a TPU and records jit options.
+
+    CPU XLA rejects TPU compiler flags, so the recorder drops them before it
+    calls the real ``jax.jit``.
+    """
+
+    def __init__(self) -> None:
+        self.options: list[tuple[str, dict]] = []
+
+    def __getattr__(self, name):
+        return getattr(jax, name)
+
+    def default_backend(self) -> str:
+        return "tpu"
+
+    def jit(self, fn, **kwargs):
+        options = kwargs.pop("compiler_options", None)
+        self.options.append((getattr(fn, "__name__", "?"), options))
+        return jax.jit(fn, **kwargs)
+
+
 class TestTpuRunner:
+    def test_tpu_collectives_offload_to_sparse_core_only_above_64_mib(
+        self, monkeypatch
+    ) -> None:
+        recorder = _TpuJit()
+        monkeypatch.setattr(runner_module, "jax", recorder)
+        _runner(1)
+        forward = next(o for name, o in recorder.options if name == "_forward_step")
+        floor = "67108864"
+        assert (
+            forward["xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"] == floor
+        )
+        assert (
+            forward["xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"] == floor
+        )
+        # SparseCore's two-color reduce-scatter beats the one-color TensorCore ring.
+        assert not any("reduce_scatter_offload" in key for key in forward)
+
+    def test_sampler_and_projection_never_offload_all_gather_to_sparse_core(
+        self, monkeypatch
+    ) -> None:
+        recorder = _TpuJit()
+        monkeypatch.setattr(runner_module, "jax", recorder)
+        _runner(1)
+        side = [o for name, o in recorder.options if name != "_forward_step" and o]
+        assert len(side) == 3  # greedy sampler, stochastic sampler, projection
+        for options in side:
+            assert options == {
+                "xla_tpu_enable_sparse_core_collective_offload_all_gather": "false",
+                "xla_tpu_enable_sparse_core_collective_offload_2d_all_gather": "false",
+                "xla_tpu_enable_sparse_core_collective_offload_3d_all_gather": "false",
+            }
+
+    def test_cpu_jits_carry_no_tpu_compiler_options(self, monkeypatch) -> None:
+        recorder = _TpuJit()
+        recorder.default_backend = lambda: "cpu"  # ty: ignore[invalid-assignment]
+        monkeypatch.setattr(runner_module, "jax", recorder)
+        _runner(1)
+        assert {name for name, o in recorder.options if o} == set()
+
     def test_hbm_headroom_is_the_smallest_per_die_margin_above_peak(
         self, tp1, monkeypatch
     ) -> None:
