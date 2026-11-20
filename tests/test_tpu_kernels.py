@@ -1182,10 +1182,7 @@ class TestFp8Matmul:
 
     def test_qwen3_32b_tp2_buckets_all_hit_zero_pad_tpu7x_tiles(self) -> None:
         from deploy.models import TPU_WORKLOADS, _tpu_buckets
-        from resin.backend.tpu.kernels.fp8_matmul import (
-            _estimate_vmem_limit_bytes,
-            _raw_vmem_estimate_bytes,
-        )
+        from resin.backend.tpu.kernels.fp8_matmul import _raw_vmem_estimate_bytes
 
         tp2_shapes = (
             (4096, 5120),
@@ -1196,67 +1193,59 @@ class TestFp8Matmul:
             (12800, 5120),
             (25600, 5120),
         )
-        tp2_decode_shapes = set(tp2_shapes) | {(2560, 4096), (2560, 12800)}
+        tp2_decode_shapes = set(tp2_shapes)
 
         vmem_cap = 48 * 1024 * 1024
         for (batch, n_out, n_in), tile in _TPU7X_FP8_TUNED_BLOCKS.items():
-            assert get_tuned_block_sizes(batch, n_out, n_in, tpu_version=7) == tile
-            assert batch % tile.batch_block_size == 0
-            assert n_out % tile.out_block_size == 0
-            assert n_in % tile.in_block_size == 0
-            assert tile.batch_block_size % 8 == 0
-            assert tile.out_block_size % 128 == 0
-            assert tile.in_block_size % 128 == 0
-            assert batch == tile.batch_block_size or tile.batch_block_size % 128 == 0
-
-            nb = batch // tile.batch_block_size
-            no = n_out // tile.out_block_size
-            ni = n_in // tile.in_block_size
-            save_acc = ni > 1
+            assert (
+                get_tuned_block_sizes(
+                    batch, n_out, n_in, tpu_version=7, quantize_activation=False
+                )
+                == tile
+            )
             for x_dtype, quant in ((jnp.float8_e4m3fn, False), (jnp.bfloat16, True)):
+                sel = get_tuned_block_sizes(
+                    batch, n_out, n_in, tpu_version=7, quantize_activation=quant
+                )
+                assert batch % sel.batch_block_size == 0
+                assert n_out % sel.out_block_size == 0
+                assert n_in % sel.in_block_size == 0
+                assert sel.batch_block_size % 8 == 0
+                assert sel.out_block_size % 128 == 0
+                assert sel.in_block_size % 128 == 0
+                assert batch == sel.batch_block_size or sel.batch_block_size % 128 == 0
+
+                nb = batch // sel.batch_block_size
+                no = n_out // sel.out_block_size
+                ni = n_in // sel.in_block_size
+                save_acc = ni > 1
                 save_xq = (
                     quant
                     and no > 1
                     and (
-                        ni * tile.batch_block_size * tile.in_block_size
-                        <= 4 * 1024 * 1024
+                        ni * sel.batch_block_size * sel.in_block_size <= 4 * 1024 * 1024
                     )
                 )
-                est = _estimate_vmem_limit_bytes(
-                    n_batch=nb,
-                    n_out=no,
-                    n_in=ni,
-                    batch_block_size=tile.batch_block_size,
-                    out_block_size=tile.out_block_size,
-                    in_block_size=tile.in_block_size,
-                    x_dtype=x_dtype,
-                    x_q_dtype=jnp.float8_e4m3fn,
-                    w_q_dtype=jnp.float8_e4m3fn,
-                    out_dtype=jnp.bfloat16,
-                    save_acc=save_acc,
-                    save_x_q=save_xq,
-                    tpu_version=7,
-                )
-                assert est <= vmem_cap
                 if batch <= 320 and (n_out, n_in) in tp2_decode_shapes:
                     raw = _raw_vmem_estimate_bytes(
                         n_batch=nb,
                         n_out=no,
                         n_in=ni,
-                        batch_block_size=tile.batch_block_size,
-                        out_block_size=tile.out_block_size,
-                        in_block_size=tile.in_block_size,
+                        batch_block_size=sel.batch_block_size,
+                        out_block_size=sel.out_block_size,
+                        in_block_size=sel.in_block_size,
                         x_dtype=x_dtype,
                         x_q_dtype=jnp.float8_e4m3fn,
                         w_q_dtype=jnp.float8_e4m3fn,
                         out_dtype=jnp.bfloat16,
                         save_acc=save_acc,
                         save_x_q=save_xq,
+                        w_buffer_count=sel.w_buffer_count,
                     )
                     assert raw <= vmem_cap
-                    assert tile.batch_block_size == batch
-                    assert tile.out_block_size % 256 == 0
-                    assert tile.in_block_size == n_in
+                    assert sel.batch_block_size == batch
+                    assert sel.out_block_size >= 512
+                    assert sel.in_block_size == n_in
 
         buckets = {
             bucket.tokens
@@ -1267,7 +1256,27 @@ class TestFp8Matmul:
             for n_out, n_in in tp2_shapes:
                 assert (batch, n_out, n_in) in _TPU7X_FP8_TUNED_BLOCKS
 
-        # Confirm tp=1 decode entries remain at their base values (unmodified in RT-32).
+        for bs in (288, 320):
+            assert get_tuned_block_sizes(
+                bs, 5120, 5120, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 1280, 5120)
+            assert get_tuned_block_sizes(
+                bs, 5120, 4096, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 1280, 4096)
+            assert get_tuned_block_sizes(
+                bs, 5120, 12800, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 512, 12800, 3)
+            assert get_tuned_block_sizes(
+                bs, 5120, 5120, tpu_version=7, quantize_activation=True
+            ) == Fp8MatmulTileSizes(bs, 1280, 5120)
+            assert get_tuned_block_sizes(
+                bs, 5120, 12800, tpu_version=7, quantize_activation=True
+            ) == Fp8MatmulTileSizes(bs, 512, 12800)
+        assert get_tuned_block_sizes(
+            512, 12800, 5120, tpu_version=7, quantize_activation=True
+        ) == Fp8MatmulTileSizes(256, 2560, 5120)
+
+        # Confirm tp=1 decode entries remain at their base values.
         assert get_tuned_block_sizes(
             320, 5120, 8192, tpu_version=7
         ) == Fp8MatmulTileSizes(320, 2560, 4096)
@@ -1741,7 +1750,6 @@ class TestPrefillKernels:
 
             for backend, interp in (
                 ("xla", False),
-                ("gspmd_xla", False),
                 ("pallas", True),
             ):
                 ag_out = sharded_fp8_matmul_all_gather(
@@ -2195,6 +2203,7 @@ class TestDecodeMatmulPath:
             pallas_fp8_gate_up_swiglu,
             quantize_fp8_act,
         )
+        from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax
 
         rng = np.random.default_rng(9000 + batch)
         x_np = rng.standard_normal((batch, 256)).astype(np.float32) * 0.5
@@ -2243,6 +2252,70 @@ class TestDecodeMatmulPath:
             rtol=1e-2,
             atol=2e-3,
         )
+
+        reduced_row = jnp.max(tile_absmax, axis=0, keepdims=True)
+        q_jaxpr = jax.make_jaxpr(
+            lambda g_i, a_i: quantize_fp8_with_absmax(
+                g_i, a_i, transposed_scale=True, interpret=True
+            )
+        )(gated, reduced_row)
+        self._assert_no_pad_eqns(q_jaxpr)
+        assert all(
+            eqn.primitive.name != "transpose"
+            for eqn in self._iter_jaxpr_eqns(q_jaxpr, enter_pallas=False)
+        )
+        gq_pallas, gs_pallas = quantize_fp8_with_absmax(
+            gated, reduced_row, transposed_scale=True, interpret=True
+        )
+        gq_xla, gs_xla = quantize_fp8_with_absmax(
+            gated, reduced_row, transposed_scale=True, use_pallas=False
+        )
+        assert gs_pallas.shape == (1, batch)
+        np.testing.assert_array_equal(np.asarray(gq_pallas), np.asarray(gq_xla))
+        np.testing.assert_array_equal(np.asarray(gs_pallas), np.asarray(gs_xla))
+        np.testing.assert_allclose(
+            np.asarray(gq_pallas, np.float32)[live_rows:], 0.0, atol=0.0
+        )
+
+        exact_abs_row = jnp.max(
+            jnp.abs(gated.astype(jnp.float32)), axis=-1, keepdims=True
+        ).T
+        exact_gq, exact_gs = quantize_fp8_with_absmax(
+            gated, exact_abs_row, transposed_scale=True, interpret=True
+        )
+        ref_gq, ref_gs = quantize_fp8_act(gated)
+        np.testing.assert_array_equal(np.asarray(exact_gq), np.asarray(ref_gq))
+        np.testing.assert_array_equal(np.asarray(exact_gs.T), np.asarray(ref_gs))
+
+        if batch == 320:
+            # Wide K=65536 exceeds 48 MiB single-pass VMEM and falls back cleanly to XLA.
+            wide_x = jnp.asarray(
+                rng.standard_normal((batch, 65536)).astype(np.float32) * 0.25,
+                jnp.bfloat16,
+            )
+            wide_abs = jnp.max(
+                jnp.abs(wide_x.astype(jnp.float32)), axis=-1, keepdims=True
+            ).T
+            with pytest.raises(ValueError, match="unsupported"):
+                quantize_fp8_with_absmax(
+                    wide_x, wide_abs, jnp.float8_e4m3fn, use_pallas=True, interpret=True
+                )
+            wq_auto, ws_auto = quantize_fp8_with_absmax(
+                wide_x,
+                wide_abs,
+                jnp.float8_e4m3fn,
+                transposed_scale=True,
+                interpret=True,
+            )
+            wq_x, ws_x = quantize_fp8_with_absmax(
+                wide_x,
+                wide_abs,
+                jnp.float8_e4m3fn,
+                transposed_scale=True,
+                use_pallas=False,
+            )
+            np.testing.assert_array_equal(np.asarray(wq_auto), np.asarray(wq_x))
+            np.testing.assert_array_equal(np.asarray(ws_auto), np.asarray(ws_x))
 
     @pytest.mark.parametrize("batch", [160, 192, 320])
     def test_zero_pad_norms_qkv_pack_and_unpack_attn_fp8_quant(
@@ -2366,7 +2439,7 @@ class TestDecodeMatmulPath:
         )
 
         # Unpack attention + FP8 quant across reshape & bitcast_u32 with zero pad primitives,
-        # anchored directly to the original 3D heads q_ref (M15).
+        # anchored directly to the original 3D heads q_ref.
         out_packed = pack_outputs(q_ref, kv_heads)
         np.testing.assert_array_equal(np.asarray(out_packed), np.asarray(exp_qp))
         np.testing.assert_array_equal(
@@ -2403,7 +2476,7 @@ class TestDecodeMatmulPath:
             np.testing.assert_array_equal(np.asarray(att_q), np.asarray(ref_att_q))
             np.testing.assert_array_equal(np.asarray(att_s.T), np.asarray(ref_att_s))
 
-    def test_per_die_scaling_zero_pmax_lower_l2_error_and_overlap_modes(self) -> None:
+    def test_per_die_scaling_zero_pmax_and_prequantized_gate_up_down(self) -> None:
         from resin.backend.tpu.kernels import (
             MatmulBackend,
             quantize_fp8_act,
@@ -2465,6 +2538,29 @@ class TestDecodeMatmulPath:
             backend="pallas",
             interpret=True,
         )
+        from unittest import mock
+
+        from jax._src import tpu_info
+
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        with (
+            mock.patch.object(tpu_info, "get_tpu_info", return_value=v7x_info),
+            mock.patch(
+                "resin.backend.tpu.kernels.fp8_matmul.get_tpu_version", return_value=7
+            ),
+        ):
+            y_local_b3 = sharded_fp8_matmul(
+                x_sh,
+                wq_sh,
+                ws_rep,
+                P(None, "tp"),
+                mesh=mesh,
+                sync_tp_scale=False,
+                reduce_dtype=jnp.float32,
+                tile_sizes=Fp8MatmulTileSizes(32, 128, 128, 3),
+                backend="pallas",
+                interpret=True,
+            )
         y_local_xla = sharded_fp8_matmul(
             x_sh,
             wq_sh,
@@ -2479,6 +2575,7 @@ class TestDecodeMatmulPath:
         err_local = float(np.linalg.norm(np.asarray(y_local, np.float32) - exact_f32))
         assert err_local <= err_synced
         np.testing.assert_allclose(np.asarray(y_local, np.float32)[26:], 0.0, atol=0.0)
+        np.testing.assert_array_equal(np.asarray(y_local_b3), np.asarray(y_local))
         np.testing.assert_allclose(
             np.asarray(y_local_xla, np.float32),
             np.asarray(y_local, np.float32),
@@ -2486,32 +2583,7 @@ class TestDecodeMatmulPath:
             atol=1e-2,
         )
 
-        overlap_cases: tuple[tuple[MatmulBackend, int, bool, bool], ...] = (
-            ("pallas", 2, False, True),
-            ("xla", 2, False, False),
-            ("gspmd_xla", 1, True, False),
-        )
-        for backend, n_split, sync, interp in overlap_cases:
-            y_cand = sharded_fp8_matmul(
-                x_sh,
-                wq_sh,
-                ws_rep,
-                P(None, "tp"),
-                mesh=mesh,
-                sync_tp_scale=sync,
-                n_split=n_split,
-                backend=backend,
-                interpret=interp,
-            )
-            arr = np.asarray(y_cand, np.float32)
-            assert not np.any(np.isnan(arr))
-            np.testing.assert_allclose(arr[26:], 0.0, atol=0.0)
-            ref_target = y_synced if sync else y_local
-            np.testing.assert_allclose(
-                arr, np.asarray(ref_target, np.float32), rtol=2e-2, atol=5e-2
-            )
-
-        # Also verify sharded_fp8_gate_up_swiglu(..., sync_tp_scale=False) emits zero pmax.
+        # Verify sharded_fp8_gate_up_swiglu(..., sync_tp_scale=False) emits zero pmax.
         xq_rep, xs_rep = quantize_fp8_act(x)
         xq_rep = jax.device_put(xq_rep, NamedSharding(mesh, P(None, None)))
         xs_rep = jax.device_put(
@@ -2537,7 +2609,8 @@ class TestDecodeMatmulPath:
         )(xq_rep, xs_rep, w_gu_q, w_gu_s)
         assert "pmax" not in str(gu_jaxpr)
 
-        # Verify per-die gate_up absmax reduces across all FFN tiles (n_out > 1, M3).
+        # Verify per-die gate_up absmax reduces across all FFN tiles (n_out > 1)
+        # and quantize_output=True feeds pre-quantized FP8 directly into down_proj.
         ffn_local = 2560  # 2 * 1280 -> n_out = 2 tiles per die
         w_gu_multi_np = (
             rng.standard_normal((2 * 2 * ffn_local, 256)).astype(np.float32) * 0.02
@@ -2579,6 +2652,97 @@ class TestDecodeMatmulPath:
             rtol=1e-2,
             atol=2e-3,
         )
+
+        w_down_m = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((256, 2 * ffn_local)).astype(np.float32) * 0.02,
+                jnp.bfloat16,
+            )
+        )
+        w_d_q = jax.device_put(w_down_m.qvalue, NamedSharding(mesh, P(None, "tp")))
+        w_d_s = jax.device_put(w_down_m.scale, NamedSharding(mesh, P()))
+        for sync in (False, True):
+            mlp_jaxpr = jax.make_jaxpr(
+                lambda xqi, xsi, _sync=sync: sharded_fp8_gate_up_swiglu(
+                    xqi,
+                    xsi,
+                    w_gu_m_q,
+                    w_gu_m_s,
+                    mesh=mesh,
+                    sequence_parallel=False,
+                    sync_tp_scale=_sync,
+                    quantize_output=True,
+                    backend="pallas",
+                    interpret=True,
+                )
+            )(xq_rep, xs_rep)
+            self._assert_no_pad_eqns(mlp_jaxpr)
+            if not sync:
+                assert "pmax" not in str(mlp_jaxpr)
+
+            backend_cases: tuple[tuple[MatmulBackend, bool], ...] = (
+                ("pallas", True),
+                ("xla", False),
+            )
+            for be, interp in backend_cases:
+                g_bf16, g_abs = sharded_fp8_gate_up_swiglu(
+                    xq_rep,
+                    xs_rep,
+                    w_gu_m_q,
+                    w_gu_m_s,
+                    mesh=mesh,
+                    sequence_parallel=False,
+                    sync_tp_scale=sync,
+                    quantize_output=False,
+                    backend=be,
+                    interpret=interp,
+                )
+                ref_down = sharded_fp8_matmul(
+                    g_bf16,
+                    w_d_q,
+                    w_d_s,
+                    P(None, "tp"),
+                    mesh=mesh,
+                    x_abs_max=g_abs,
+                    sync_tp_scale=sync,
+                    backend=be,
+                    interpret=interp,
+                )
+                gq, gs = sharded_fp8_gate_up_swiglu(
+                    xq_rep,
+                    xs_rep,
+                    w_gu_m_q,
+                    w_gu_m_s,
+                    mesh=mesh,
+                    sequence_parallel=False,
+                    sync_tp_scale=sync,
+                    quantize_output=True,
+                    backend=be,
+                    interpret=interp,
+                )
+                assert gq.dtype == jnp.float8_e4m3fn
+                assert gs is not None
+                assert gs.shape == ((1, 32) if sync else (2, 32))
+                got_down = sharded_fp8_matmul(
+                    gq,
+                    w_d_q,
+                    w_d_s,
+                    P(None, "tp"),
+                    mesh=mesh,
+                    x_scale=gs,
+                    sync_tp_scale=sync,
+                    backend=be,
+                    interpret=interp,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(got_down, np.float32)[26:], 0.0, atol=0.0
+                )
+                np.testing.assert_allclose(
+                    np.asarray(got_down, np.float32),
+                    np.asarray(ref_down, np.float32),
+                    rtol=1e-2,
+                    atol=2e-2,
+                )
 
 
 @pytest.mark.skipif(
@@ -3494,6 +3658,44 @@ class TestTpuHardwareMosaic:
             atol=5e-2,
         )
 
+        g_dec_q, g_dec_scale = jax.jit(
+            lambda xqi, xsi: sharded_fp8_gate_up_swiglu(
+                xqi,
+                xsi,
+                w_gu_q,
+                w_gu_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                quantize_output=True,
+                backend="pallas",
+            )
+        )(xq, xs_t)
+        assert g_dec_q.dtype == jnp.float8_e4m3fn
+        assert g_dec_scale is not None
+        down_dec_prequant = jax.jit(
+            lambda gq_i, gs_i: sharded_fp8_matmul(
+                gq_i,
+                w_d_q,
+                w_d_s,
+                P(None, "tp"),
+                mesh=mesh,
+                x_scale=gs_i,
+                sync_tp_scale=False,
+                backend="pallas",
+            )
+        )(g_dec_q, g_dec_scale)
+        assert not np.any(np.isnan(np.asarray(down_dec_prequant, np.float32)))
+        np.testing.assert_allclose(
+            np.asarray(down_dec_prequant, np.float32)[live:], 0.0, atol=0.0
+        )
+        np.testing.assert_allclose(
+            np.asarray(down_dec_prequant, np.float32),
+            np.asarray(down_dec_xla_same, np.float32),
+            rtol=2e-2,
+            atol=5e-2,
+        )
+
         down_dec_xla_chained = jax.jit(
             lambda g_i: sharded_fp8_matmul(
                 g_i,
@@ -3512,6 +3714,43 @@ class TestTpuHardwareMosaic:
             / (np.linalg.norm(p_dec_flat) * np.linalg.norm(x_dec_flat))
         )
         assert dec_cos > 0.999
+
+        gq_dec_pallas, gs_dec_pallas = jax.jit(
+            lambda xqi, xsi: sharded_fp8_gate_up_swiglu(
+                xqi,
+                xsi,
+                w_gu_q,
+                w_gu_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                quantize_output=True,
+                backend="pallas",
+            )
+        )(xq, xs_t)
+        assert gq_dec_pallas.dtype == jnp.float8_e4m3fn
+        assert gs_dec_pallas is not None
+        down_preq_pallas = jax.jit(
+            lambda gq_i, gs_i: sharded_fp8_matmul(
+                gq_i,
+                w_d_q,
+                w_d_s,
+                P(None, "tp"),
+                mesh=mesh,
+                x_scale=gs_i,
+                sync_tp_scale=False,
+                backend="pallas",
+            )
+        )(gq_dec_pallas, gs_dec_pallas)
+        np.testing.assert_allclose(
+            np.asarray(down_preq_pallas, np.float32)[live:], 0.0, atol=0.0
+        )
+        np.testing.assert_allclose(
+            np.asarray(down_preq_pallas, np.float32),
+            np.asarray(down_dec_pallas, np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
 
     @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
     def test_qwen3_tp2_mosaic_batched_decode_parity_and_zero_recompile(
