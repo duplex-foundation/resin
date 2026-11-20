@@ -277,7 +277,7 @@ class TestFp8Weights:
         hd_model.save_pretrained(hd128_dir)
 
         outs = []
-        for tp in (1, 2):
+        for tp, sync_scale in ((1, False), (2, False), (2, True)):
             mesh = make_mesh(tp, devices)
             m, p = load_model(
                 hd128_dir,
@@ -287,6 +287,7 @@ class TestFp8Weights:
                 kv_dtype=jnp.float8_e4m3fn,
             )
             m.sequence_parallel_min_tokens = 8
+            m.sync_tp_scale = sync_scale
             m._force_fused_qkv_pack_interpret = True
             import functools as _ft
 
@@ -330,6 +331,220 @@ class TestFp8Weights:
             assert r.compilations_after_warmup == 0
             outs.append([ev.logprobs.logprob for ev in evs if ev.logprobs is not None])
         np.testing.assert_allclose(outs[1], outs[0], rtol=2e-2, atol=5e-2)
+        np.testing.assert_allclose(outs[2], outs[0], rtol=2e-2, atol=5e-2)
+
+    def test_sequence_parallel_prefill_fusion_jaxpr_and_tpu7x_export(self) -> None:
+        import unittest.mock as mock
+
+        from jax import export
+        from jax._src import tpu_info
+        from jax._src.pallas.mosaic import lowering as mosaic_lowering
+        from jax.sharding import NamedSharding
+
+        from resin.backend.tpu.arena import KV_PARTITION, KvCacheSpec
+        from resin.backend.tpu.kernels import ragged_paged_attention
+        from resin.backend.tpu.metadata import AttentionMetadata, ModelInputs
+        from resin.models.qwen3.config import Qwen3Config
+        from resin_models_tpu.qwen3.model import (
+            COLUMN,
+            ROW,
+            LayerParams,
+            Qwen3Model,
+            Qwen3Params,
+        )
+
+        devices = jax.devices("cpu")
+        if len(devices) < 2:
+            pytest.skip("needs 2 host devices")
+
+        cfg = Qwen3Config(
+            vocab_size=1024,
+            hidden_size=5120,
+            intermediate_size=25600,
+            num_hidden_layers=2,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=1e6,
+            eos_token_id=2,
+            bos_token_id=1,
+            dtype="bfloat16",
+        )
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        mesh = make_mesh(2, devices)
+        rep = NamedSharding(mesh, P())
+        col = NamedSharding(mesh, COLUMN)
+        row = NamedSharding(mesh, ROW)
+        sc_col = NamedSharding(mesh, P("tp"))
+        cache_sh = NamedSharding(mesh, KV_PARTITION)
+
+        def _fp8_sds(shape, qsh, ssh):
+            return Fp8Weight(
+                jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn, sharding=qsh),
+                jax.ShapeDtypeStruct((shape[0],), jnp.float32, sharding=ssh),
+            )
+
+        lp = LayerParams(
+            input_norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            q_norm=jax.ShapeDtypeStruct((128,), jnp.bfloat16, sharding=rep),
+            k_norm=jax.ShapeDtypeStruct((128,), jnp.bfloat16, sharding=rep),
+            post_norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            qkv=_fp8_sds((10240, 5120), col, sc_col),
+            o=_fp8_sds((5120, 8192), row, rep),
+            gate_up=_fp8_sds((51200, 5120), col, sc_col),
+            down=_fp8_sds((5120, 25600), row, rep),
+        )
+        params = Qwen3Params(
+            embed=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=rep),
+            layers=(lp, lp),
+            norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            lm_head=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=col),
+            rope_cache=(
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32, sharding=rep),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32, sharding=rep),
+            ),
+        )
+        spec = KvCacheSpec(2, 8, 128, 256, jnp.float8_e4m3fn)
+        caches = (
+            (
+                jax.ShapeDtypeStruct(
+                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
+                ),
+                jax.ShapeDtypeStruct(
+                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
+                ),
+            ),
+        )
+
+        def _iter_outer_eqns(jaxpr_obj):
+            jaxpr = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+            for eqn in jaxpr.eqns:
+                yield eqn
+                if eqn.primitive.name == "pallas_call":
+                    continue
+                for val in eqn.params.values():
+                    if hasattr(val, "jaxpr") or hasattr(val, "eqns"):
+                        yield from _iter_outer_eqns(val)
+                    elif isinstance(val, (tuple, list)):
+                        for item in val:
+                            if hasattr(item, "jaxpr") or hasattr(item, "eqns"):
+                                yield from _iter_outer_eqns(item)
+
+        def _inp(toks: int) -> ModelInputs:
+            return ModelInputs(
+                input_ids=jax.ShapeDtypeStruct((toks,), jnp.int32, sharding=rep),
+                positions=jax.ShapeDtypeStruct((toks,), jnp.int32, sharding=rep),
+                logits_indices=jax.ShapeDtypeStruct((320,), jnp.int32, sharding=rep),
+                attention=AttentionMetadata(
+                    jax.ShapeDtypeStruct((320,), jnp.int32, sharding=rep),
+                    (jax.ShapeDtypeStruct((320 * 17,), jnp.int32, sharding=rep),),
+                    jax.ShapeDtypeStruct((321,), jnp.int32, sharding=rep),
+                    jax.ShapeDtypeStruct((3,), jnp.int32, sharding=rep),
+                ),
+            )
+
+        with (
+            mock.patch(
+                "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=7
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.fp8_matmul.get_tpu_version", return_value=7
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.ragged_paged_attention.get_tpu_version",
+                return_value=7,
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.ragged_paged_attention.pltpu.get_tpu_info",
+                return_value=v7x_info,
+            ),
+            mock.patch.object(tpu_info, "get_tpu_info", return_value=v7x_info),
+            mock.patch.object(
+                mosaic_lowering.tpu_info, "get_tpu_info", return_value=v7x_info
+            ),
+            mock.patch(
+                "jax._src.pallas.mosaic.pallas_call_registration.tpu_info.get_tpu_info",
+                return_value=v7x_info,
+            ),
+            mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
+        ):
+            per_die_model = Qwen3Model(
+                cfg,
+                mesh,
+                jnp.float8_e4m3fn,
+                page_tokens=256,
+                impl=ragged_paged_attention,
+            )
+            sync_model = Qwen3Model(
+                cfg,
+                mesh,
+                jnp.float8_e4m3fn,
+                page_tokens=256,
+                sync_tp_scale=True,
+                impl=ragged_paged_attention,
+            )
+
+            for sp_tokens in (512, 1024, 2048, 4096):
+                inp = _inp(sp_tokens)
+                per_die_prims = [
+                    e.primitive.name
+                    for e in _iter_outer_eqns(
+                        jax.make_jaxpr(per_die_model.hidden_states)(params, caches, inp)
+                    )
+                ]
+                assert "pad" not in per_die_prims
+                assert "transpose" not in per_die_prims
+                assert "pmax" not in per_die_prims
+
+                sync_prims = [
+                    e.primitive.name
+                    for e in _iter_outer_eqns(
+                        jax.make_jaxpr(sync_model.hidden_states)(params, caches, inp)
+                    )
+                ]
+                assert "pad" not in sync_prims
+                assert "transpose" not in sync_prims
+                assert sync_prims.count("pmax") == 2 * cfg.num_hidden_layers
+
+            for exp_tokens in (1024, 4096):
+                mlir_txt = export.export(
+                    jax.jit(per_die_model.hidden_states, donate_argnums=(1,)),
+                    platforms=["tpu"],
+                )(params, caches, _inp(exp_tokens)).mlir_module()
+                assert "qkv_norm_rope_pack_512_32_4" in mlir_txt
+                assert "unpack_attn_fp8_quant_512_4096" in mlir_txt
+                assert "fused_add_rms_norm_fp8_quant_256_5120" in mlir_txt
+
+            dec_sync_prims = [
+                e.primitive.name
+                for e in _iter_outer_eqns(
+                    jax.make_jaxpr(sync_model.hidden_states)(params, caches, _inp(320))
+                )
+            ]
+            assert dec_sync_prims.count("pmax") >= 2 * cfg.num_hidden_layers
+
+            sync_mlir = export.export(
+                jax.jit(sync_model.hidden_states, donate_argnums=(1,)),
+                platforms=["tpu"],
+            )(params, caches, _inp(4096)).mlir_module()
+            assert "unpack_attn_absmax_512_4096" in sync_mlir
+
+            with mock.patch(
+                "resin_models_tpu.qwen3.model.get_tpu_version", return_value=6
+            ):
+                for v6_tokens in (320, 1024):
+                    v6_pallas = [
+                        e.params.get("name", "")
+                        for e in _iter_outer_eqns(
+                            jax.make_jaxpr(per_die_model.hidden_states)(
+                                params, caches, _inp(v6_tokens)
+                            )
+                        )
+                        if e.primitive.name == "pallas_call"
+                    ]
+                    assert all("unpack_attn_" not in name for name in v6_pallas)
 
     def test_offline_tpu_v7x_mosaic_mlir_export(self) -> None:
         import unittest.mock as mock

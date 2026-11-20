@@ -1630,6 +1630,94 @@ class TestPrefillKernels:
             atol=2e-2,
         )
 
+        # Qwen3-32B tp=2 head geometry (32 Q, 4 KV) at tb=512 with non-512-multiple tail.
+        t_big, q_big, kv_big = 525, 32, 4
+        q_big_np = rng.standard_normal((t_big, q_big, head_dim)).astype(np.float32)
+        k_big_np = rng.standard_normal((t_big, kv_big, head_dim)).astype(np.float32)
+        v_big_np = rng.standard_normal((t_big, kv_big, head_dim)).astype(np.float32)
+        q_big_np[516:] = 0.0
+        k_big_np[516:] = 0.0
+        v_big_np[516:] = 0.0
+        q_b = jnp.asarray(q_big_np, jnp.bfloat16)
+        k_b = jnp.asarray(k_big_np, jnp.bfloat16)
+        v_b = jnp.asarray(v_big_np, jnp.bfloat16)
+        pos_b = jnp.arange(t_big, dtype=jnp.int32)
+        qkv_b = jnp.concatenate(
+            [q_b.reshape(t_big, -1), k_b.reshape(t_big, -1), v_b.reshape(t_big, -1)],
+            axis=-1,
+        )
+        qp_512, kvm_512 = pallas_qkv_norm_rope_pack(
+            qkv_b,
+            pos_b,
+            rope_cache,
+            q_norm_w,
+            k_norm_w,
+            kv_dtype,
+            num_q_heads=q_big,
+            num_kv_heads=kv_big,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=1e-6,
+            pack_mode=pack_mode,
+            interpret=True,
+        )
+        qp_512_qk, kvm_512_qk = pallas_qk_norm_rope_pack(
+            q_b,
+            k_b,
+            v_b,
+            pos_b,
+            rope_cache,
+            q_norm_w,
+            k_norm_w,
+            kv_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=1e-6,
+            pack_mode=pack_mode,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(qp_512), np.asarray(qp_512_qk))
+        np.testing.assert_array_equal(np.asarray(kvm_512), np.asarray(kvm_512_qk))
+        q_ref_b = apply_rope(
+            rms_norm(q_b, q_norm_w, 1e-6), pos_b, head_dim, cos_sin_cache=rope_cache
+        )
+        k_ref_b = quantize_kv(
+            apply_rope(
+                rms_norm(k_b, k_norm_w, 1e-6),
+                pos_b,
+                head_dim,
+                cos_sin_cache=rope_cache,
+            ),
+            kv_dtype,
+            k_scale,
+        )
+        v_ref_b = quantize_kv(v_b, kv_dtype, v_scale)
+        exp_qp_b, exp_kvm_b = prepare_inputs(q_ref_b, k_ref_b, v_ref_b)
+        np.testing.assert_allclose(
+            np.asarray(qp_512, np.float32),
+            np.asarray(exp_qp_b, np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
+        kv_rtol = 0.125 if kv_dtype == jnp.float8_e4m3fn else 1e-2
+        np.testing.assert_allclose(
+            np.asarray(kvm_512, np.float32),
+            np.asarray(exp_kvm_b, np.float32),
+            rtol=kv_rtol,
+            atol=2e-2,
+        )
+        assert (
+            float(
+                np.mean(
+                    np.abs(
+                        np.asarray(kvm_512, np.float32)
+                        - np.asarray(exp_kvm_b, np.float32)
+                    )
+                )
+            )
+            < 1e-3
+        )
+
     def test_prequantized_pallas_fp8_matmul_gate_up_swiglu_and_sequence_parallel(
         self,
     ) -> None:
@@ -2154,6 +2242,160 @@ class TestPrefillKernels:
         np.testing.assert_array_equal(
             np.asarray(idle_cache[1], np.float32), before_page
         )
+
+    def test_prefill_tb512_unpack_norm_and_vmem_guards(self) -> None:
+        import unittest.mock as mock
+
+        from resin.backend.tpu.kernels import (
+            fused_add_rms_norm_fp8_quant,
+            pallas_qkv_norm_rope_pack,
+            pallas_unpack_attn_fp8_quant,
+            prepare_inputs,
+            quantize_fp8_act,
+        )
+        from resin.backend.tpu.kernels.norm_rope import _select_qk_token_block
+
+        rng = np.random.default_rng(4512)
+        iter_eqns = TestDecodeMatmulPath._iter_jaxpr_eqns
+        assert_no_pad = TestDecodeMatmulPath._assert_no_pad_eqns
+
+        def _pallas_call_info(fn, *sds):
+            call = next(
+                e
+                for e in iter_eqns(jax.make_jaxpr(fn)(*sds), enter_pallas=False)
+                if e.primitive.name == "pallas_call"
+            )
+            return call.params["name"], call.params["compiler_params"].vmem_limit_bytes
+
+        # Qwen3-32B tp=2 geometry: 32 Q heads, 4 KV heads, out_width=4096 at T=512/768 (zero pad) and T=525 (tail).
+        q_heads, kv_heads, head_dim = 32, 4, 128
+        for t_len, zero_pad_expected in ((512, True), (768, True), (525, False)):
+            q_np = rng.standard_normal((t_len, q_heads, head_dim)).astype(np.float32)
+            q_np[-9:] = 0.0
+            q_t = jnp.asarray(q_np, jnp.bfloat16)
+            dummy_kv = jnp.zeros((t_len, kv_heads, head_dim), jnp.bfloat16)
+            out_packed, _ = prepare_inputs(q_t, dummy_kv, dummy_kv)
+            ref_bf16 = q_t.reshape(t_len, q_heads * head_dim)
+            ref_abs = jnp.max(jnp.abs(ref_bf16.astype(jnp.float32)), axis=-1)
+            ref_q, ref_s = quantize_fp8_act(ref_bf16)
+
+            unpack_modes: tuple[Literal["reshape", "bitcast_u32"], ...] = (
+                "reshape",
+                "bitcast_u32",
+            )
+            for mode in unpack_modes:
+                if zero_pad_expected:
+                    u_jaxpr = jax.make_jaxpr(
+                        lambda op, _m=mode: pallas_unpack_attn_fp8_quant(
+                            op, 8, head_dim, unpack_mode=_m, interpret=True
+                        )
+                    )(out_packed)
+                    assert_no_pad(u_jaxpr)
+                att_q, att_s = pallas_unpack_attn_fp8_quant(
+                    out_packed, 8, head_dim, unpack_mode=mode, interpret=True
+                )
+                assert att_s.shape == (1, t_len)
+                np.testing.assert_array_equal(np.asarray(att_q), np.asarray(ref_q))
+                np.testing.assert_array_equal(np.asarray(att_s.T), np.asarray(ref_s))
+
+                bf16_out, abs_out = pallas_unpack_attn_fp8_quant(
+                    out_packed,
+                    8,
+                    head_dim,
+                    return_bf16_and_absmax=True,
+                    unpack_mode=mode,
+                    interpret=True,
+                )
+                assert abs_out.shape == (1, t_len)
+                np.testing.assert_array_equal(
+                    np.asarray(bf16_out), np.asarray(ref_bf16)
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(abs_out[0]), np.asarray(ref_abs)
+                )
+
+        m32 = 32 * 1024 * 1024
+        m48 = 48 * 1024 * 1024
+        with mock.patch(
+            "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=7
+        ):
+            assert _select_qk_token_block(4096, total_heads=40) == 512
+            assert _select_qk_token_block(4096, total_heads=80) == 128
+
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((320, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((320, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_8192", m32)
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((512, 10240), jnp.bfloat16),
+                jax.ShapeDtypeStruct((512, 10240), jnp.bfloat16),
+                jax.ShapeDtypeStruct((10240,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_128_10240", m32)
+
+            sp_jaxpr = jax.make_jaxpr(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6)
+            )(
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            )
+            assert_no_pad(sp_jaxpr)
+            assert all(
+                e.primitive.name != "transpose"
+                for e in iter_eqns(sp_jaxpr, enter_pallas=False)
+            )
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_5120", m32)
+            assert _pallas_call_info(
+                lambda ql, p, c, s, qw, kw: pallas_qkv_norm_rope_pack(
+                    ql,
+                    p,
+                    (c, s),
+                    qw,
+                    kw,
+                    jnp.float8_e4m3fn,
+                    num_q_heads=32,
+                    num_kv_heads=4,
+                ),
+                jax.ShapeDtypeStruct((4096, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4096,), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32),
+                jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+            ) == ("qkv_norm_rope_pack_512_32_4", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(op, 8, 128),
+                jax.ShapeDtypeStruct((8, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_fp8_quant_256_8192", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(
+                    op, 8, 128, return_bf16_and_absmax=True
+                ),
+                jax.ShapeDtypeStruct((4, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_absmax_512_4096", m48)
+
+        with mock.patch(
+            "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=6
+        ):
+            assert _select_qk_token_block(4096, total_heads=40) == 128
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_5120", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(op, 8, 128),
+                jax.ShapeDtypeStruct((4, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_fp8_quant_256_4096", m32)
 
 
 class TestDecodeMatmulPath:
@@ -3031,6 +3273,9 @@ class TestTpuHardwareMosaic:
         from resin.backend.tpu.kernels import (
             fused_add_rms_norm_fp8_quant,
             pallas_qkv_norm_rope_pack,
+            pallas_unpack_attn_fp8_quant,
+            prepare_inputs,
+            quantize_fp8_act,
             sharded_fp8_gate_up_swiglu,
             sharded_fp8_matmul_all_gather,
             sharded_fp8_matmul_reduce_scatter,
@@ -3039,7 +3284,7 @@ class TestTpuHardwareMosaic:
         mesh = make_mesh(min(len(jax.devices()), 2))
         tp = int(mesh.shape["tp"])
         rng = np.random.default_rng(2027)
-        tokens = 512
+        tokens = 1024
 
         # 1. Fused residual + RMSNorm + FP8 quant on [tokens // tp, 5120]
         x = jax.device_put(
@@ -3111,6 +3356,69 @@ class TestTpuHardwareMosaic:
             )
         )(qkv_out, pos, rc_rep[0], rc_rep[1], qnw, knw)
 
+        # Direct element-for-element parity of qp/kvm against prepare_inputs(q_ref, k_ref, v_ref).
+        q_heads_local = 64 // tp
+        kv_heads_local = 8 // tp
+        qkv_host = np.asarray(qkv_out, np.float32)
+        q_chunks, k_chunks, v_chunks = [], [], []
+        local_w = (q_heads_local + 2 * kv_heads_local) * 128
+        for s_idx in range(tp):
+            sl = jnp.asarray(
+                qkv_host[:, s_idx * local_w : (s_idx + 1) * local_w], jnp.bfloat16
+            )
+            qs, ks, vs = jnp.split(
+                sl,
+                [q_heads_local * 128, (q_heads_local + kv_heads_local) * 128],
+                axis=-1,
+            )
+            q_chunks.append(qs.reshape(tokens, q_heads_local, 128))
+            k_chunks.append(ks.reshape(tokens, kv_heads_local, 128))
+            v_chunks.append(vs.reshape(tokens, kv_heads_local, 128))
+        q_full = jnp.concatenate(q_chunks, axis=1)
+        k_full = jnp.concatenate(k_chunks, axis=1)
+        v_full = jnp.concatenate(v_chunks, axis=1)
+        pos_host = jnp.arange(tokens, dtype=jnp.int32)
+        q_ref_full = apply_rope(
+            rms_norm(q_full, jnp.ones((128,), jnp.bfloat16), 1e-6),
+            pos_host,
+            128,
+            cos_sin_cache=rc,
+        )
+        k_ref_full = quantize_kv(
+            apply_rope(
+                rms_norm(k_full, jnp.ones((128,), jnp.bfloat16), 1e-6),
+                pos_host,
+                128,
+                cos_sin_cache=rc,
+            ),
+            jnp.float8_e4m3fn,
+        )
+        v_ref_full = quantize_kv(v_full, jnp.float8_e4m3fn)
+        exp_qp_full, exp_kvm_full = prepare_inputs(q_ref_full, k_ref_full, v_ref_full)
+        np.testing.assert_allclose(
+            np.asarray(qp, np.float32),
+            np.asarray(exp_qp_full, np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(kvm, np.float32),
+            np.asarray(exp_kvm_full, np.float32),
+            rtol=0.125,
+            atol=2e-2,
+        )
+        assert (
+            float(
+                np.mean(
+                    np.abs(
+                        np.asarray(kvm, np.float32)
+                        - np.asarray(exp_kvm_full, np.float32)
+                    )
+                )
+            )
+            < 1e-3
+        )
+
         spec = KvCacheSpec(
             layers=1, kv_heads=8, head_dim=128, page_tokens=256, dtype=jnp.float8_e4m3fn
         )
@@ -3165,6 +3473,84 @@ class TestTpuHardwareMosaic:
             rtol=3e-2,
             atol=5e-2,
         )
+
+        # 2b. Packed attention output + pallas_unpack_attn_fp8_quant (tb=512).
+        cache_packed = jax.device_put(
+            jnp.zeros((8, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sharding
+        )
+        att_packed, _ = jax.jit(
+            lambda q_i, kv_i, c_i, m_i: paged_attention(
+                q_i,
+                kv_i,
+                None,
+                c_i,
+                m_i,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+            )
+        )(qp, kvm, cache_packed, meta)
+        att_q_sh, att_s_sh = jax.jit(
+            jax.shard_map(
+                lambda pk: pallas_unpack_attn_fp8_quant(pk, 8, 128),
+                mesh=mesh,
+                in_specs=Q_PACKED_PARTITION,
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )
+        )(att_packed)
+        att_bf16_sh, att_abs_sh = jax.jit(
+            jax.shard_map(
+                lambda pk: pallas_unpack_attn_fp8_quant(
+                    pk, 8, 128, return_bf16_and_absmax=True
+                ),
+                mesh=mesh,
+                in_specs=Q_PACKED_PARTITION,
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )
+        )(att_packed)
+        att_mosaic_2d = jnp.asarray(att_mosaic).reshape(tokens, 8192)
+        np.testing.assert_array_equal(
+            np.asarray(att_bf16_sh[:420]), np.asarray(att_mosaic_2d[:420])
+        )
+        for s_idx in range(tp):
+            local_2d = att_mosaic_2d[
+                :420, s_idx * (8192 // tp) : (s_idx + 1) * (8192 // tp)
+            ]
+            exp_q_l, exp_s_l = quantize_fp8_act(local_2d)
+            got_q_l = np.asarray(att_q_sh)[
+                :420, s_idx * (8192 // tp) : (s_idx + 1) * (8192 // tp)
+            ]
+            got_s_l = np.asarray(att_s_sh)[s_idx, :420]
+            np.testing.assert_allclose(
+                got_q_l.astype(np.float32),
+                np.asarray(exp_q_l, np.float32),
+                rtol=0.125,
+                atol=5e-2,
+            )
+            assert (
+                float(
+                    np.mean(
+                        np.abs(
+                            got_q_l.astype(np.float32) - np.asarray(exp_q_l, np.float32)
+                        )
+                    )
+                )
+                < 1e-3
+            )
+            np.testing.assert_allclose(
+                got_s_l, np.asarray(exp_s_l[:, 0]), rtol=1e-4, atol=1e-5
+            )
+            np.testing.assert_allclose(
+                np.asarray(att_abs_sh)[s_idx, :420],
+                np.max(np.abs(np.asarray(local_2d, np.float32)), axis=-1),
+                rtol=1e-5,
+                atol=1e-5,
+            )
 
         # 3. Fused gate_up_swiglu + down_proj reduce_scatter
         w_gu = quantize_fp8_weight(
