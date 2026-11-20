@@ -63,10 +63,7 @@ _PREFILL_MATMUL_MIN_TOKENS = 512
 DecodeMatmulMode = Literal[
     "auto",
     "pallas",
-    "n_split_pallas",
     "xla",
-    "n_split_xla",
-    "gspmd_xla",
 ]
 
 Linear = jax.Array | Fp8Weight
@@ -129,7 +126,6 @@ class Qwen3Model:
     impl: AttentionImpl | None = None
     prefill_matmul_backend: MatmulBackend = "auto"
     decode_matmul_mode: DecodeMatmulMode = "auto"
-    decode_n_split_min_tokens: int = 128
     fuse_unpack_attn_quant: bool = True
     sequence_parallel_min_tokens: int = _PREFILL_MATMUL_MIN_TOKENS
     _force_fused_qkv_pack_interpret: bool = field(default=False, repr=False)
@@ -153,13 +149,6 @@ class Qwen3Model:
             ),
         )
 
-    def _resolve_decode_matmul_mode(self, tokens: int) -> DecodeMatmulMode:
-        if self.decode_matmul_mode != "auto":
-            return self.decode_matmul_mode
-        if get_tpu_version() >= 7 and tokens <= 256:
-            return "xla"
-        return "pallas"
-
     def _can_use_fused_qkv_pack(
         self,
         act_dtype: Any,
@@ -181,7 +170,6 @@ class Qwen3Model:
         x_scale: jax.Array | None = None,
         x_abs_max: jax.Array | None = None,
         sync_tp_scale: bool = True,
-        n_split: int = 1,
         out_dtype: Any = None,
         backend: MatmulBackend = "auto",
         interpret: bool = False,
@@ -197,7 +185,6 @@ class Qwen3Model:
                 x_scale=x_scale,
                 x_abs_max=x_abs_max,
                 sync_tp_scale=sync_tp_scale,
-                n_split=n_split,
                 out_dtype=target_dtype,
                 backend=backend,
                 interpret=interpret,
@@ -502,59 +489,28 @@ class Qwen3Model:
         tp = tp_size(self.mesh)
         layers = params.layers
         is_prefill = tokens >= _PREFILL_MATMUL_MIN_TOKENS
+        prequantize_gated = tokens <= 320
         dec_interp = (not is_prefill) and self._force_decode_pallas_interpret
         if is_prefill:
-            pref_be = self._resolve_prefill_matmul_backend(tokens)
-            col_backend: MatmulBackend = pref_be
-            gu_backend: MatmulBackend = pref_be
-            row_backend: MatmulBackend = pref_be
+            proj_backend: MatmulBackend = self._resolve_prefill_matmul_backend(tokens)
+            gu_backend: MatmulBackend = proj_backend
             row_sync_tp_scale = True
-            row_n_split = 1
         else:
-            mode = self._resolve_decode_matmul_mode(tokens)
+            # Pallas FP8 BlockSpecs require the local contracting dimension to be >= 128.
             per_die_scale = (q_width // tp) >= 128 and (
                 config.intermediate_size // tp
             ) >= 128
-            if mode == "gspmd_xla":
-                col_backend = "gspmd_xla"
-                gu_backend = "gspmd_xla"
-                row_backend = "gspmd_xla"
-                row_sync_tp_scale = True
-                row_n_split = 1
-            elif mode in ("xla", "n_split_xla"):
-                col_backend = "xla"
+            row_sync_tp_scale = not per_die_scale
+            if self.decode_matmul_mode == "xla":
+                proj_backend = "xla"
                 gu_backend = "auto"
-                row_backend = "xla"
-                row_sync_tp_scale = not per_die_scale
-                row_n_split = (
-                    2
-                    if (
-                        mode == "n_split_xla"
-                        and tp > 1
-                        and tokens >= self.decode_n_split_min_tokens
-                        and config.hidden_size % 2 == 0
-                    )
-                    else 1
-                )
             else:
-                col_backend = "pallas" if dec_interp else "auto"
-                gu_backend = "pallas" if dec_interp else "auto"
-                row_backend = "pallas" if dec_interp else "auto"
-                row_sync_tp_scale = not per_die_scale
-                can_split_pallas = config.hidden_size % 2 == 0 and (
-                    (config.hidden_size // 2) % 128 == 0
-                    or not (get_tpu_version() >= 7 or dec_interp)
+                proj_backend = (
+                    "pallas"
+                    if (dec_interp or self.decode_matmul_mode == "pallas")
+                    else "auto"
                 )
-                row_n_split = (
-                    2
-                    if (
-                        mode == "n_split_pallas"
-                        and tp > 1
-                        and tokens >= self.decode_n_split_min_tokens
-                        and can_split_pallas
-                    )
-                    else 1
-                )
+                gu_backend = proj_backend
 
         rep_2d = P(None, None)
 
@@ -610,7 +566,7 @@ class Qwen3Model:
                 COLUMN,
                 x_scale=h_scale,
                 out_dtype=act_dtype,
-                backend=col_backend,
+                backend=proj_backend,
                 interpret=dec_interp,
             )
             if use_fused_unpack_quant:
@@ -643,9 +599,8 @@ class Qwen3Model:
                     ROW,
                     x_scale=att_scale,
                     sync_tp_scale=False,
-                    n_split=row_n_split,
                     out_dtype=act_dtype,
-                    backend=row_backend,
+                    backend=proj_backend,
                     interpret=dec_interp,
                 )
             else:
@@ -658,15 +613,14 @@ class Qwen3Model:
                     weights.o,
                     ROW,
                     sync_tp_scale=row_sync_tp_scale,
-                    n_split=row_n_split,
                     out_dtype=act_dtype,
-                    backend=row_backend,
+                    backend=proj_backend,
                     interpret=dec_interp,
                 )
 
             mlp_q, mlp_scale, x = _rep_add_norm_quant(o_out, x, weights.post_norm)
 
-            gated, gated_absmax = sharded_fp8_gate_up_swiglu(
+            gated_in, gated_aux = sharded_fp8_gate_up_swiglu(
                 mlp_q,
                 mlp_scale,
                 weights.gate_up.qvalue,
@@ -674,19 +628,20 @@ class Qwen3Model:
                 mesh=self.mesh,
                 sequence_parallel=False,
                 sync_tp_scale=row_sync_tp_scale,
+                quantize_output=prequantize_gated,
                 out_dtype=act_dtype,
                 backend=gu_backend,
                 interpret=dec_interp,
             )
             down_out = self._linear(
-                gated,
+                gated_in,
                 weights.down,
                 ROW,
-                x_abs_max=gated_absmax,
+                x_scale=gated_aux if prequantize_gated else None,
+                x_abs_max=None if prequantize_gated else gated_aux,
                 sync_tp_scale=row_sync_tp_scale,
-                n_split=row_n_split,
                 out_dtype=act_dtype,
-                backend=row_backend,
+                backend=proj_backend,
                 interpret=dec_interp,
             )
             if idx + 1 < num_layers:
