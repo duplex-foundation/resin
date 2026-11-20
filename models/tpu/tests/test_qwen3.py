@@ -661,12 +661,13 @@ class TestFp8Weights:
             ),
             mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
         ):
-            export_modes: tuple[DecodeMatmulMode, ...] = (
-                "auto",
-                "pallas",
-                "xla",
+            export_variants: tuple[tuple[DecodeMatmulMode, bool], ...] = (
+                ("auto", False),
+                ("pallas", False),
+                ("xla", False),
+                ("auto", True),
             )
-            for mode in export_modes:
+            for mode, sync_tp_scale in export_variants:
                 model = Qwen3Model(
                     cfg,
                     mesh,
@@ -674,6 +675,7 @@ class TestFp8Weights:
                     page_tokens=256,
                     decode_matmul_mode=mode,
                     impl=ragged_paged_attention,
+                    sync_tp_scale=sync_tp_scale,
                 )
                 if mode == "auto":
                     assert model._resolve_prefill_matmul_backend(512) == "xla"
@@ -698,6 +700,8 @@ class TestFp8Weights:
                         else ((8, 8), (320, 320))
                     )
                 )
+                if sync_tp_scale:
+                    tokens_to_check = ((8, 8), (320, 320))
                 for tokens, seqs in tokens_to_check:
                     inp = ModelInputs(
                         input_ids=jax.ShapeDtypeStruct(
@@ -734,8 +738,9 @@ class TestFp8Weights:
                         )
                     else:
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
-                    if mode == "xla":
-                        assert "fp8_w8a8_matmul_" not in mlir_txt
+                    if mode == "xla" or sync_tp_scale:
+                        if mode == "xla":
+                            assert "fp8_w8a8_matmul_" not in mlir_txt
                         assert "fp8_w8a8_async_ar_" not in mlir_txt
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode in ("auto", "pallas") and tokens <= 320:
