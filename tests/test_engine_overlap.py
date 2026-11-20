@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import pytest
 from output_helpers import forward_output
 
-from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig, SamplingParams
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    RunnerConfig,
+    SamplingParams,
+)
 
 
 @dataclass
@@ -331,6 +338,46 @@ def test_a_short_budget_overlaps_and_discards_the_finished_successor():
     assert engine.cache_free_parent_count == 16
     engine.close()
     runner.shutdown()
+
+
+def test_overlap_runs_at_most_one_discarded_row_per_request():
+    class TwoTokenRunner(AsyncRunner):
+        def forward(self, plan):
+            self.plans.append(plan)
+            width = 1 if plan.phase == BatchPhase.PREFILL else 2
+            lasts = [int(plan.token_ids[int(end) - 1]) for end in plan.token_indptr[1:]]
+            return forward_output(
+                [[last + n + 1 for n in range(width)] for last in lasts]
+            )
+
+    def run(overlap, limits):
+        runner = TwoTokenRunner()
+        engine = Engine(runner, enable_overlap=overlap, max_running_requests=3)
+        leases = [
+            engine.submit(
+                [1] * 129, sampling_params=SamplingParams(max_output_tokens=n)
+            )
+            for n in limits
+        ]
+        while engine.has_work():
+            engine.step()
+        results = [lease.take_result() for lease in leases]
+        rows = sum(
+            len(plan.sequence_ids)
+            for plan in runner.plans
+            if plan.phase == BatchPhase.DECODE
+        )
+        engine.close()
+        runner.shutdown()
+        return results, rows
+
+    for limits in ([40, 40, 40], [38, 40, 41], [16, 32, 40]):
+        synchronous, sync_rows = run(False, limits)
+        overlapped, overlap_rows = run(True, limits)
+        assert overlapped == synchronous
+        # A request that finishes by length leaves its already enqueued
+        # successor step behind; that step counts one row for the request.
+        assert 0 <= overlap_rows - sync_rows <= len(limits)
 
 
 @pytest.mark.parametrize("stop", [3, 4])
