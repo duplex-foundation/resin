@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged Paged Attention v3 and batched decode kernel for the Resin TPU backend.
+"""Ragged Paged Attention v3 and batched RPA kernels for the Resin TPU backend.
 
 Adapted from vllm-project/tpu-inference (Apache-2.0):
 - Stock RPA v3 at revision d9c7e19da8c497ec63b9381bb0bc9b2a5e0d4bb2:
   tpu_inference/kernels/ragged_paged_attention/v3/kernel.py.
-- Batched decode RPA at revision da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:
+- Batched decode and mixed RPA at revision da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:
   tpu_inference/kernels/experimental/batched_rpa/{tuned_params,wrapper}.py.
 """
 
@@ -34,16 +34,19 @@ from jax.experimental.pallas import tpu as pltpu
 from resin.backend.tpu import reference
 from resin.backend.tpu.kernels._rpa_v3_pallas import (
     BatchedDecodeConfig,
+    BatchedMixedConfig,
     RpaCase,
     _ragged_paged_attention_kernel,
     align_to,
     cdiv,
     generate_batched_decode_schedule,
+    generate_batched_mixed_schedule,
     get_dtype_packing,
     get_tpu_version,
     has_bank_conflicts,
     next_power_of_2,
     run_batched_decode_rpa,
+    run_batched_mixed_rpa,
 )
 
 DEFAULT_INTERPRET_VMEM_BYTES = 64 * 1024 * 1024
@@ -62,6 +65,11 @@ _TUNED_VMEM_CAP_FRACTION = 0.75
 _BATCHED_DECODE_VMEM_FRACTION = 0.90
 _BATCHED_DECODE_DEFAULT_BATCH_SIZE = 8
 _BATCHED_DECODE_MIN_SEQS = 16
+_BATCHED_MIXED_VMEM_FRACTION = 0.80
+_BATCHED_MIXED_DEFAULT_BATCH_SIZE = 2
+_BATCHED_MIXED_STEP2B_MAX_BKV_SZ = 512
+_BATCHED_MIXED_COMPUTE_THRESHOLD = 1500
+_BATCHED_MIXED_MIN_TOKENS = 128
 
 
 class RpaBlockSizes(NamedTuple):
@@ -999,6 +1007,186 @@ def _get_batched_decode_block_sizes(
     return bkv_sz, batch_size
 
 
+def _batched_mixed_vmem_estimate_bytes(
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    batch_size: int,
+    bq_sz: int,
+    bq_csz: int,
+    bkv_sz: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+) -> int:
+    q_packing = get_dtype_packing(q_dtype)
+    kv_packing = get_dtype_packing(kv_dtype)
+    aligned_q_per_kv = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    aligned_q_heads = aligned_q_per_kv * actual_num_kv_heads
+    actual_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    bkv_stride = int(cdiv(actual_num_kv_heads * 2, kv_packing))
+    if has_bank_conflicts(bkv_stride):
+        bkv_stride += 1
+    aligned_kv_heads_x2 = bkv_stride * kv_packing
+    aligned_hd = align_to(actual_head_dim, 128)
+    q_bytes = jnp.dtype(q_dtype).itemsize
+    kv_bytes = jnp.dtype(kv_dtype).itemsize
+
+    bq_bo_buf_bytes = 5 * bq_sz * aligned_q_heads * aligned_hd * q_bytes
+    bkv_buf_bytes = 3 * bkv_sz * aligned_kv_heads_x2 * aligned_hd * kv_bytes
+    compute_bytes = (
+        bq_sz * actual_q_heads * aligned_hd * q_bytes
+        + bkv_sz * actual_num_kv_heads * aligned_hd * kv_bytes
+        + bq_csz * bkv_sz * actual_q_heads * 4
+    )
+    scratch_bytes = (
+        bq_sz * (2 * aligned_q_heads * 128 + aligned_q_heads * aligned_hd) * 4
+    )
+    return (
+        batch_size * (bq_bo_buf_bytes + bkv_buf_bytes + compute_bytes) + scratch_bytes
+    )
+
+
+def _get_batched_mixed_block_sizes(
+    q_dtype: Any,
+    kv_dtype: Any,
+    actual_num_q_heads: int,
+    actual_num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_num_tokens: int,
+    pages_per_seq: int,
+    *,
+    tpu_version: int | None = None,
+    sliding_window: int | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[int, int, int, int]:
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+    capped_vmem = int(eff_vmem * _BATCHED_MIXED_VMEM_FRACTION)
+
+    mxu_col = 256 if (version >= 6 or version < 0) else 128
+    table_kv = pages_per_seq * page_size
+    horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+    max_bkv = min(4096, horizon_kv, table_kv)
+    bkv_step = align_to(mxu_col, page_size)
+    if bkv_step > max_bkv:
+        bkv_step = page_size
+
+    max_bq = max(1, min(4096, next_power_of_2(max_num_tokens)))
+    bq_step = min(bkv_step, max_bq)
+    q_per_kv = actual_num_q_heads // actual_num_kv_heads
+    aligned_q_per_kv = align_to(q_per_kv, get_dtype_packing(q_dtype))
+
+    batch_size = _BATCHED_MIXED_DEFAULT_BATCH_SIZE
+    while (
+        batch_size > 1
+        and _batched_mixed_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bq_step,
+            min(bq_step, 32),
+            bkv_step,
+            q_dtype,
+            kv_dtype,
+        )
+        > capped_vmem
+    ):
+        batch_size -= 1
+
+    bq_sz = bq_step
+    bkv_sz = bkv_step
+    while (
+        bkv_sz > page_size
+        and _batched_mixed_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bq_sz,
+            min(bq_sz, 32),
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > capped_vmem
+    ):
+        bkv_sz = max(page_size, (bkv_sz // 2 // page_size) * page_size)
+    while (
+        bq_sz > 1
+        and _batched_mixed_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bq_sz,
+            min(bq_sz, 32),
+            bkv_sz,
+            q_dtype,
+            kv_dtype,
+        )
+        > capped_vmem
+    ):
+        bq_sz = max(1, bq_sz // 2)
+
+    while (
+        bq_sz + bq_step <= max_bq
+        and bkv_sz + bkv_step <= max_bkv
+        and _batched_mixed_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bq_sz + bq_step,
+            min(bq_sz + bq_step, 32),
+            bkv_sz + bkv_step,
+            q_dtype,
+            kv_dtype,
+        )
+        < capped_vmem
+    ):
+        bq_sz += bq_step
+        bkv_sz += bkv_step
+
+    step2b_cap = min(_BATCHED_MIXED_STEP2B_MAX_BKV_SZ, max_bkv)
+    while (
+        bkv_sz + bkv_step <= step2b_cap
+        and _batched_mixed_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            q_per_kv,
+            head_dim,
+            batch_size,
+            bq_sz,
+            min(bq_sz, 32),
+            bkv_sz + bkv_step,
+            q_dtype,
+            kv_dtype,
+        )
+        < capped_vmem
+    ):
+        bkv_sz += bkv_step
+
+    num_k_rows = int(cdiv(bkv_sz, mxu_col))
+    num_k_cols = int(cdiv(head_dim, mxu_col))
+    num_k = max(1, num_k_rows * num_k_cols)
+    bq_csz = bq_sz
+    for num_bq_c in range(1, bq_sz + 1):
+        if bq_sz % num_bq_c != 0:
+            continue
+        cand_c = bq_sz // num_bq_c
+        if cand_c != bq_sz and (cand_c * aligned_q_per_kv) % 8 != 0:
+            continue
+        bq_csz = cand_c
+        if (
+            batch_size * cand_c * num_k * actual_num_q_heads
+            <= _BATCHED_MIXED_COMPUTE_THRESHOLD
+        ):
+            break
+
+    return bq_sz, bkv_sz, bq_csz, batch_size
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1019,6 +1207,7 @@ def _get_batched_decode_block_sizes(
         "m_block_sizes",
         "vmem_limit_bytes",
         "use_batched_decode",
+        "use_batched_mixed",
         "bf16_qk_softmax",
         "bf16_online_scratch",
         "disable_bounds_checks",
@@ -1053,6 +1242,7 @@ def ragged_paged_attention(
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
     use_batched_decode: bool | None = None,
+    use_batched_mixed: bool | None = None,
     bf16_qk_softmax: bool = True,
     bf16_online_scratch: bool = False,
     disable_bounds_checks: bool = True,
@@ -1062,12 +1252,15 @@ def ragged_paged_attention(
     """Run Ragged Paged Attention v3 over per-die ``(queries, keys, values, kv_cache)``.
 
     Uses the Pallas Mosaic kernel on TPU (and on CPU when ``interpret=True``),
-    and a jit-traceable pure-JAX fallback on CPU otherwise. On TPU7x batched
-    decode with ``bfloat16`` queries, ``bf16_qk_softmax=True`` (default) uses
-    ``bfloat16`` QK/softmax probabilities and single-pass PV while keeping
+    and a jit-traceable pure-JAX fallback on CPU otherwise. On TPU7x with
+    ``bfloat16`` queries, ``bf16_qk_softmax=True`` (default) uses ``bfloat16``
+    QK/softmax probabilities and single-pass PV in both batched decode
+    (``RPAd``) and batched mixed/prefill (``RPAm``): batched ``RPAm`` also uses
+    ``bfloat16`` ``(m, l, acc)`` scratch, whereas batched ``RPAd`` keeps
     ``float32`` cross-block ``(m, l, acc)`` scratch unless
-    ``bf16_online_scratch=True``; ignored on non-``bfloat16`` queries, stock
-    ``RPAd``/``RPAm``, and CPU fallback. Outputs match ``queries.dtype``.
+    ``bf16_online_scratch=True``. Both flags are ignored on non-``bfloat16``
+    queries, stock ``RPAd``/``RPAm``, and CPU fallback. Outputs match
+    ``queries.dtype``.
     """
     if not prepared:
         if values is None:
@@ -1415,19 +1608,122 @@ def ragged_paged_attention(
             lambda args: args,
             (q, kv_cache),
         )
-    m_blocks = _blocks_for(m_block_sizes, RpaCase.MIXED)
-    q, kv_cache = jax.lax.cond(
-        distribution[2] > distribution[1],
-        lambda args: run_rpa_case(
-            args[0],
-            args[1],
-            **m_blocks,
-            static_q_len=None,
-            case=RpaCase.MIXED,
-        ),
-        lambda args: args,
-        (q, kv_cache),
+    dispatch_batched_mixed = (
+        (
+            tpu_version >= 7
+            and m_block_sizes is None
+            and max_num_tokens >= _BATCHED_MIXED_MIN_TOKENS
+        )
+        if use_batched_mixed is None
+        else use_batched_mixed
     )
+
+    if dispatch_batched_mixed:
+        assert vmem_limit_bytes is not None
+        if m_block_sizes is not None:
+            if m_block_sizes[3] != m_block_sizes[1]:
+                raise ValueError(
+                    f"batched mixed requires bkv_csz == bkv_sz, got {m_block_sizes=}"
+                )
+            if (
+                m_block_sizes[2] != m_block_sizes[0]
+                and (m_block_sizes[2] * num_q_heads_per_kv_head) % 8 != 0
+                and not interpret
+            ):
+                raise ValueError(
+                    f"batched mixed requires (bq_csz * aligned_q_per_kv) % 8 == 0 when bq_csz < bq_sz, got {m_block_sizes=}"
+                )
+            mixed_bq_sz, mixed_bkv_sz, mixed_bq_csz, _ = m_block_sizes
+            mixed_bsz = _BATCHED_MIXED_DEFAULT_BATCH_SIZE
+        else:
+            mixed_bq_sz, mixed_bkv_sz, mixed_bq_csz, mixed_bsz = (
+                _get_batched_mixed_block_sizes(
+                    q.dtype,
+                    kv_cache.dtype,
+                    eff_q_heads,
+                    actual_num_kv_heads,
+                    eff_head_dim,
+                    page_size,
+                    max_num_tokens,
+                    pages_per_seq,
+                    tpu_version=tpu_version,
+                    sliding_window=sliding_window,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                )
+            )
+        mixed_smem_bytes = (
+            pltpu.get_tpu_info().smem_capacity_bytes
+            if tpu_version >= 4
+            else _DEFAULT_SMEM_BYTES
+        )
+        mixed_cfgs = BatchedMixedConfig(
+            batch_size=mixed_bsz,
+            bq_sz=mixed_bq_sz,
+            bq_csz=mixed_bq_csz,
+            bkv_sz=mixed_bkv_sz,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            max_num_seqs=max_num_seqs,
+            max_num_tokens=max_num_tokens,
+            num_q_heads=eff_q_heads,
+            num_kv_heads=actual_num_kv_heads,
+            head_dim=eff_head_dim,
+            q_dtype_name=jnp.dtype(q.dtype).name,
+            kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
+            sm_scale=sm_scale,
+            mask_value=mask_value,
+            use_causal_mask=use_causal_mask,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=update_kv_cache,
+            bf16_qk_softmax=bf16_qk_softmax,
+            vmem_limit_bytes=vmem_limit_bytes,
+            smem_capacity_bytes=mixed_smem_bytes,
+            disable_bounds_checks=disable_bounds_checks,
+            disable_semaphore_checks=disable_semaphore_checks,
+            interpret_mode=interpret,
+        )
+        # Emit schedule generation outside lax.cond so XLA CSE shares one
+        # schedule call across all layers of the forward step.
+        mixed_schedule = generate_batched_mixed_schedule(
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            cfgs=mixed_cfgs,
+        )
+        q, kv_cache = jax.lax.cond(
+            distribution[2] > distribution[1],
+            lambda args: run_batched_mixed_rpa(
+                kv_lens,
+                cu_q_lens,
+                page_indices,
+                mixed_schedule,
+                args[0],
+                kv,
+                args[1],
+                cfgs=mixed_cfgs,
+                tpu_version=tpu_version,
+            ),
+            lambda args: args,
+            (q, kv_cache),
+        )
+    else:
+        m_blocks = _blocks_for(m_block_sizes, RpaCase.MIXED)
+        q, kv_cache = jax.lax.cond(
+            distribution[2] > distribution[1],
+            lambda args: run_rpa_case(
+                args[0],
+                args[1],
+                **m_blocks,
+                static_q_len=None,
+                case=RpaCase.MIXED,
+            ),
+            lambda args: args,
+            (q, kv_cache),
+        )
     if return_packed:
         return q, kv_cache
     return (
