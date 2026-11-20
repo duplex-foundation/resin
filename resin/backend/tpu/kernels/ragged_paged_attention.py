@@ -62,7 +62,7 @@ _DEVICE_VMEM_BYTES = {
 _DECODE_VMEM_SCRATCH_FRACTION = 0.375
 _MIXED_VMEM_SCRATCH_FRACTION = 0.45
 _TUNED_VMEM_CAP_FRACTION = 0.75
-_BATCHED_DECODE_VMEM_FRACTION = 0.80
+_BATCHED_DECODE_VMEM_FRACTION = 0.90
 _BATCHED_DECODE_DEFAULT_BATCH_SIZE = 8
 _BATCHED_DECODE_MIN_SEQS = 16
 _BATCHED_MIXED_VMEM_FRACTION = 0.80
@@ -912,28 +912,37 @@ def _batched_decode_vmem_estimate_bytes(
     bkv_sz: int,
     q_dtype: Any,
     kv_dtype: Any,
+    *,
+    bf16_qk_softmax: bool = True,
+    bf16_online_scratch: bool = False,
 ) -> int:
-    q_packing = get_dtype_packing(q_dtype)
-    kv_packing = get_dtype_packing(kv_dtype)
+    q_dt = jnp.dtype(q_dtype)
+    kv_dt = jnp.dtype(kv_dtype)
+    q_packing = get_dtype_packing(q_dt)
+    kv_packing = get_dtype_packing(kv_dt)
     aligned_q_per_kv = align_to(actual_num_q_heads_per_kv_head, q_packing)
     aligned_q_heads = aligned_q_per_kv * actual_num_kv_heads
-    actual_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
     bkv_stride = int(cdiv(actual_num_kv_heads * 2, kv_packing))
     if has_bank_conflicts(bkv_stride):
         bkv_stride += 1
     aligned_kv_heads_x2 = bkv_stride * kv_packing
     aligned_hd = align_to(actual_head_dim, 128)
-    q_bytes = jnp.dtype(q_dtype).itemsize
-    kv_bytes = jnp.dtype(kv_dtype).itemsize
+    q_bytes = q_dt.itemsize
+    kv_bytes = kv_dt.itemsize
+    use_bf16_qkp = bf16_qk_softmax and q_dt == jnp.bfloat16
+    qkp_bytes = 2 if use_bf16_qkp else 4
+    scratch_bytes_elem = 2 if (use_bf16_qkp and bf16_online_scratch) else 4
 
     bq_bo_buf_bytes = 5 * aligned_q_heads * aligned_hd * q_bytes
     bkv_buf_bytes = 3 * bkv_sz * aligned_kv_heads_x2 * aligned_hd * kv_bytes
-    compute_bytes = (
-        actual_q_heads * aligned_hd * q_bytes
-        + bkv_sz * actual_num_kv_heads * aligned_hd * kv_bytes
-        + bkv_sz * actual_q_heads * q_bytes
+    kv_tile_bytes = bkv_sz * actual_num_kv_heads * aligned_hd * kv_bytes
+    compute_bytes = aligned_q_heads * aligned_hd * q_bytes + max(
+        2 * kv_tile_bytes + bkv_sz * aligned_q_heads * 4,
+        kv_tile_bytes + 2 * bkv_sz * aligned_q_heads * qkp_bytes,
     )
-    scratch_bytes = (2 * aligned_q_heads * 128 + aligned_q_heads * aligned_hd) * 4
+    scratch_bytes = (
+        2 * aligned_q_heads * 128 + aligned_q_heads * aligned_hd
+    ) * scratch_bytes_elem
     return (
         batch_size * (bq_bo_buf_bytes + bkv_buf_bytes + compute_bytes) + scratch_bytes
     )
@@ -951,6 +960,8 @@ def _get_batched_decode_block_sizes(
     tpu_version: int | None = None,
     sliding_window: int | None = None,
     vmem_limit_bytes: int | None = None,
+    bf16_qk_softmax: bool = True,
+    bf16_online_scratch: bool = False,
 ) -> tuple[int, int]:
     version = get_tpu_version() if tpu_version is None else tpu_version
     eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
@@ -965,50 +976,31 @@ def _get_batched_decode_block_sizes(
         bkv_step = page_size
 
     q_per_kv = actual_num_q_heads // actual_num_kv_heads
-    batch_size = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
-    while (
-        batch_size > 1
-        and _batched_decode_vmem_estimate_bytes(
+
+    def _est(bsz: int, bkv: int) -> int:
+        return _batched_decode_vmem_estimate_bytes(
             actual_num_kv_heads,
             q_per_kv,
             head_dim,
-            batch_size,
-            bkv_step,
+            bsz,
+            bkv,
             q_dtype,
             kv_dtype,
+            bf16_qk_softmax=bf16_qk_softmax,
+            bf16_online_scratch=bf16_online_scratch,
         )
-        > capped_vmem
-    ):
+
+    batch_size = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
+    while batch_size > 1 and _est(batch_size, bkv_step) > capped_vmem:
         batch_size -= 1
 
     bkv_sz = bkv_step
-    while (
-        bkv_sz > page_size
-        and _batched_decode_vmem_estimate_bytes(
-            actual_num_kv_heads,
-            q_per_kv,
-            head_dim,
-            batch_size,
-            bkv_sz,
-            q_dtype,
-            kv_dtype,
-        )
-        > capped_vmem
-    ):
+    while bkv_sz > page_size and _est(batch_size, bkv_sz) > capped_vmem:
         bkv_sz = max(page_size, (bkv_sz // 2 // page_size) * page_size)
 
     while (
         bkv_sz + bkv_step <= max_bkv
-        and _batched_decode_vmem_estimate_bytes(
-            actual_num_kv_heads,
-            q_per_kv,
-            head_dim,
-            batch_size,
-            bkv_sz + bkv_step,
-            q_dtype,
-            kv_dtype,
-        )
-        < capped_vmem
+        and _est(batch_size, bkv_sz + bkv_step) < capped_vmem
     ):
         bkv_sz += bkv_step
 
@@ -1217,6 +1209,7 @@ def _get_batched_mixed_block_sizes(
         "use_batched_decode",
         "use_batched_mixed",
         "bf16_qk_softmax",
+        "bf16_online_scratch",
         "disable_bounds_checks",
         "disable_semaphore_checks",
         "interpret",
@@ -1251,6 +1244,7 @@ def ragged_paged_attention(
     use_batched_decode: bool | None = None,
     use_batched_mixed: bool | None = None,
     bf16_qk_softmax: bool = True,
+    bf16_online_scratch: bool = False,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
     interpret: bool = False,
@@ -1258,8 +1252,15 @@ def ragged_paged_attention(
     """Run Ragged Paged Attention v3 over per-die ``(queries, keys, values, kv_cache)``.
 
     Uses the Pallas Mosaic kernel on TPU (and on CPU when ``interpret=True``),
-    and a jit-traceable pure-JAX fallback on CPU otherwise. Online softmax and
-    cross-block accumulation run in ``float32``; outputs match ``queries.dtype``.
+    and a jit-traceable pure-JAX fallback on CPU otherwise. On TPU7x with
+    ``bfloat16`` queries, ``bf16_qk_softmax=True`` (default) uses ``bfloat16``
+    QK/softmax probabilities and single-pass PV in both batched decode
+    (``RPAd``) and batched mixed/prefill (``RPAm``): batched ``RPAm`` also uses
+    ``bfloat16`` ``(m, l, acc)`` scratch, whereas batched ``RPAd`` keeps
+    ``float32`` cross-block ``(m, l, acc)`` scratch unless
+    ``bf16_online_scratch=True``. Both flags are ignored on non-``bfloat16``
+    queries, stock ``RPAd``/``RPAm``, and CPU fallback. Outputs match
+    ``queries.dtype``.
     """
     if not prepared:
         if values is None:
@@ -1535,6 +1536,8 @@ def ragged_paged_attention(
                 tpu_version=tpu_version,
                 sliding_window=sliding_window,
                 vmem_limit_bytes=vmem_limit_bytes,
+                bf16_qk_softmax=bf16_qk_softmax,
+                bf16_online_scratch=bf16_online_scratch,
             )
         smem_bytes = (
             pltpu.get_tpu_info().smem_capacity_bytes
@@ -1560,6 +1563,8 @@ def ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             update_kv_cache=update_kv_cache,
+            bf16_qk_softmax=bf16_qk_softmax,
+            bf16_online_scratch=bf16_online_scratch,
             vmem_limit_bytes=vmem_limit_bytes,
             smem_capacity_bytes=smem_bytes,
             disable_bounds_checks=disable_bounds_checks,
