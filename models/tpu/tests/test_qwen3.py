@@ -762,11 +762,13 @@ class TestFp8Weights:
                                 size <= max_vmem_bytes for size in sizes
                             )
                     elif mode == "auto" and tokens == 1024:
-                        assert "fp8_gate_up_swiglu_512_" not in mlir_txt
+                        assert "fp8_gate_up_swiglu_" not in mlir_txt
                         assert "fp8_w8a8_matmul_" not in mlir_txt
                     elif mode == "auto" and tokens == 4096:
-                        assert "fp8_gate_up_swiglu_512_1280_5120" in mlir_txt
-                        assert "fp8_w8a8_matmul_256_5120_5120" in mlir_txt
+                        assert "fp8_gate_up_swiglu_1024_1280_5120" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_1280_5120" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_1280_4096" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_2560_2560" in mlir_txt
 
     def test_decode_matmul_modes_tp2_vs_tp1_parity_and_zero_pmax(
         self, tmp_path

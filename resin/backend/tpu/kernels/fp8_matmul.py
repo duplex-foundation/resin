@@ -40,8 +40,18 @@ from resin.backend.tpu.mesh import TP_AXIS
 _FP32_TINY_SQRT = float(jnp.sqrt(jnp.finfo(jnp.float32).tiny))
 _MIN_VMEM_LIMIT_BYTES = 4 * 1024 * 1024
 _DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+_LARGE_PREFILL_SLACK_BYTES = 4 * 1024 * 1024
+# Padded token count at which the T>=2048 prefill tuning applies. Below it,
+# decode and small-chunk behavior is unchanged.
+_LARGE_PREFILL_MIN_TOKENS = 2048
 _DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: _DEFAULT_VMEM_LIMIT_BYTES}
+_SAVE_X_Q_MAX_BYTES = 16 * 1024 * 1024
+_SAVE_X_Q_SMALL_MAX_BYTES = 4 * 1024 * 1024
 _QUANT_MAX_K_TILES = 20
+
+
+def _device_vmem_limit_bytes(tpu_version: int) -> int:
+    return _DEVICE_VMEM_LIMIT.get(tpu_version, _DEFAULT_VMEM_LIMIT_BYTES)
 
 
 def _row_scale_vmem_bytes(batch_block: int) -> int:
@@ -49,7 +59,7 @@ def _row_scale_vmem_bytes(batch_block: int) -> int:
 
 
 def _clamp_vmem_limit_bytes(raw_bytes: int, tpu_version: int) -> int:
-    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, _DEFAULT_VMEM_LIMIT_BYTES)
+    upper = _device_vmem_limit_bytes(tpu_version)
     return min(max(raw_bytes, _MIN_VMEM_LIMIT_BYTES), upper)
 
 
@@ -94,29 +104,29 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         (1024, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (2048, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
         (2048, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
-        (2048, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (2048, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (2048, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (2048, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (2048, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (2048, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (2048, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (2048, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (2048, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (2048, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
+        (2048, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (2048, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (4096, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
         (4096, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
-        (4096, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (4096, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (4096, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (4096, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (4096, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (4096, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (4096, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (4096, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (4096, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (4096, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (8192, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (8192, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (4096, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (4096, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (8192, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (8192, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (8192, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (8192, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (8192, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (8192, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (8192, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (8192, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
+        (8192, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (8192, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
     }
     # Qwen3-32B tp=2 decode buckets (bs <= 320, pre-quantized FP8 activation):
     # batch_block == bs keeps n_batch == 1 (zero 128-lane scale pad) and
@@ -163,6 +173,23 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
 
 
 _TPU7X_FP8_TUNED_BLOCKS = _build_tpu7x_tuned_table()
+
+
+def _build_tpu7x_quant_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]:
+    """Overrides for ``quantize_activation=True`` (bf16 input) so pipelined VMEM <= 48 MiB."""
+    table: dict[tuple[int, int, int], Fp8MatmulTileSizes] = {}
+    for bs in (2048, 4096, 8192):
+        for n_out in (5120, 12800, 25600):
+            table[(bs, n_out, 5120)] = Fp8MatmulTileSizes(512, 1280, 5120)
+        table[(bs, 51200, 5120)] = Fp8MatmulTileSizes(256, 2560, 5120)
+    return table
+
+
+_TPU7X_FP8_QUANT_TUNED_BLOCKS = _build_tpu7x_quant_tuned_table()
+
+_TPU7X_GATE_UP_TUNED_BLOCKS: dict[tuple[int, int, int], Fp8MatmulTileSizes] = {
+    (bs, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120) for bs in (2048, 4096, 8192)
+}
 
 
 def _fp8_bound(dtype: Any) -> float:
@@ -360,6 +387,8 @@ def get_tuned_block_sizes(
     if version >= 7 and (tuned := _TPU7X_FP8_TUNED_BLOCKS.get((n_batch, n_out, n_in))):
         if not quantize_activation:
             return tuned
+        if n_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            return _TPU7X_FP8_QUANT_TUNED_BLOCKS.get((n_batch, n_out, n_in), tuned)
         if n_batch <= 320 and tuned.w_buffer_count > 2:
             return tuned._replace(w_buffer_count=2)
         if (
@@ -379,6 +408,33 @@ def get_tuned_block_sizes(
     return Fp8MatmulTileSizes(batch_block, out_block, in_block)
 
 
+def _get_tuned_gate_up_block_sizes(
+    n_batch: int,
+    n_ffn: int,
+    n_in: int,
+    *,
+    tpu_version: int | None = None,
+) -> Fp8MatmulTileSizes:
+    """Pick Pallas ``(batch_block, out_block, in_block)`` for fused gate+up SwiGLU."""
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    if version >= 7 and (
+        tuned := _TPU7X_GATE_UP_TUNED_BLOCKS.get((n_batch, n_ffn, n_in))
+    ):
+        return tuned
+    batch_block = (
+        align_to(max(8, n_batch), 8)
+        if n_batch <= 320
+        else min(align_to(n_batch, 128), 512)
+    )
+    out_block = 1280 if n_ffn % 1280 == 0 else min(align_to(max(128, n_ffn), 128), 1280)
+    in_block = (
+        n_in
+        if (n_in <= 5120 and n_in % 128 == 0)
+        else min(align_to(max(128, n_in), 128), 2560)
+    )
+    return Fp8MatmulTileSizes(batch_block, out_block, in_block)
+
+
 def _raw_vmem_estimate_bytes(
     *,
     n_batch: int,
@@ -394,6 +450,7 @@ def _raw_vmem_estimate_bytes(
     save_acc: bool,
     save_x_q: bool,
     w_buffer_count: int = 2,
+    include_headroom: bool = True,
 ) -> int:
     x_bytes = batch_block_size * in_block_size * jnp.dtype(x_dtype).itemsize
     absmax_bytes = batch_block_size * 4
@@ -401,8 +458,11 @@ def _raw_vmem_estimate_bytes(
     w_scale_bytes = out_block_size * 4
     out_bytes = batch_block_size * out_block_size * jnp.dtype(out_dtype).itemsize
     w_extra_buffers = max(0, w_buffer_count - 1)
+    base_buffers = 2 if include_headroom else 1
 
-    in_out = 2 * (x_bytes + absmax_bytes + w_bytes + w_scale_bytes + out_bytes)
+    in_out = base_buffers * (
+        x_bytes + absmax_bytes + w_bytes + w_scale_bytes + out_bytes
+    )
     if n_batch > 1 or n_in > 1:
         in_out += x_bytes
     if n_batch > 1:
@@ -421,7 +481,7 @@ def _raw_vmem_estimate_bytes(
         scratch += (
             n_in * batch_block_size * in_block_size * jnp.dtype(x_q_dtype).itemsize
         )
-    return in_out + 2 * scratch
+    return in_out + (2 if include_headroom else 1) * scratch
 
 
 def _estimate_vmem_limit_bytes(
@@ -441,6 +501,7 @@ def _estimate_vmem_limit_bytes(
     tpu_version: int,
     w_buffer_count: int = 2,
 ) -> int:
+    large_prefill = n_batch * batch_block_size >= _LARGE_PREFILL_MIN_TOKENS
     raw = _raw_vmem_estimate_bytes(
         n_batch=n_batch,
         n_out=n_out,
@@ -455,8 +516,56 @@ def _estimate_vmem_limit_bytes(
         save_acc=save_acc,
         save_x_q=save_x_q,
         w_buffer_count=w_buffer_count,
+        include_headroom=not large_prefill,
     )
+    if large_prefill:
+        raw += _LARGE_PREFILL_SLACK_BYTES
     return _clamp_vmem_limit_bytes(raw, tpu_version)
+
+
+def _should_save_x_q(
+    *,
+    quantize_activation: bool,
+    n_batch: int,
+    n_out: int,
+    n_in: int,
+    batch_block_size: int,
+    out_block_size: int,
+    in_block_size: int,
+    x_dtype: Any,
+    x_q_dtype: Any,
+    w_q_dtype: Any,
+    out_dtype: Any,
+    save_acc: bool,
+    tpu_version: int,
+    w_buffer_count: int = 2,
+) -> bool:
+    if not quantize_activation or n_out <= 1:
+        return False
+    q_dtype = jnp.dtype(x_q_dtype)
+    x_q_scratch_bytes = n_in * batch_block_size * in_block_size * q_dtype.itemsize
+    if n_batch * batch_block_size < _LARGE_PREFILL_MIN_TOKENS:
+        return x_q_scratch_bytes <= _SAVE_X_Q_SMALL_MAX_BYTES
+    if x_q_scratch_bytes > _SAVE_X_Q_MAX_BYTES:
+        return False
+    vmem_upper = _device_vmem_limit_bytes(tpu_version)
+    raw_bytes = _raw_vmem_estimate_bytes(
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block_size,
+        out_block_size=out_block_size,
+        in_block_size=in_block_size,
+        x_dtype=x_dtype,
+        x_q_dtype=q_dtype,
+        w_q_dtype=w_q_dtype,
+        out_dtype=out_dtype,
+        save_acc=save_acc,
+        save_x_q=True,
+        w_buffer_count=w_buffer_count,
+        include_headroom=False,
+    )
+    return raw_bytes <= vmem_upper
 
 
 def _unfold_bools(
@@ -704,12 +813,7 @@ def pallas_fp8_matmul(
         if tile_sizes is None
         else tile_sizes
     )
-    batch_block, out_block, in_block, w_buffer_count = (
-        resolved_tiles.batch_block_size,
-        resolved_tiles.out_block_size,
-        resolved_tiles.in_block_size,
-        resolved_tiles.w_buffer_count,
-    )
+    batch_block, out_block, in_block, w_buffer_count = resolved_tiles
     if w_buffer_count < 1:
         raise ValueError(f"Expected w_buffer_count >= 1, got {w_buffer_count}")
 
@@ -736,10 +840,21 @@ def pallas_fp8_matmul(
     n_in = padded_k // in_block
 
     save_acc = n_in > 1
-    save_x_q = (
-        quantize_activation
-        and n_out > 1
-        and (n_in * batch_block * in_block * x_q_dtype.itemsize <= 4 * 1024 * 1024)
+    save_x_q = _should_save_x_q(
+        quantize_activation=quantize_activation,
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block,
+        out_block_size=out_block,
+        in_block_size=in_block,
+        x_dtype=x_2d.dtype,
+        x_q_dtype=x_q_dtype,
+        w_q_dtype=w.dtype,
+        out_dtype=kernel_out_dtype,
+        save_acc=save_acc,
+        tpu_version=tpu_version,
+        w_buffer_count=w_buffer_count,
     )
     vmem_limit_bytes = _estimate_vmem_limit_bytes(
         n_batch=n_batch,
@@ -761,6 +876,12 @@ def pallas_fp8_matmul(
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
     o_idx = (lambda _o: 0) if n_out == 1 else (lambda o: o)
     i_idx = (lambda _i: 0) if n_in == 1 else (lambda i: i)
+    # Pin o > 0 to the last tile loaded during o == 0 (n_in - 1) so Pallas skips redundant x DMAs.
+    x_in_idx = (
+        (lambda b, o, i: (b_idx(b), jnp.where(o == 0, i, n_in - 1)))
+        if (save_x_q and n_in > 1 and padded_batch >= _LARGE_PREFILL_MIN_TOKENS)
+        else (lambda b, _o, i: (b_idx(b), i_idx(i)))
+    )
     x_q_scratch_shape = (
         (batch_block, in_block) if n_in == 1 else (n_in, batch_block, in_block)
     )
@@ -770,7 +891,7 @@ def pallas_fp8_matmul(
         else None
     )
     in_specs = [
-        pl.BlockSpec((batch_block, in_block), lambda b, _o, i: (b_idx(b), i_idx(i))),
+        pl.BlockSpec((batch_block, in_block), x_in_idx),
         pl.BlockSpec(
             (out_block, in_block),
             lambda _b, o, i: (o_idx(o), i_idx(i)),
@@ -863,6 +984,8 @@ def pallas_fp8_matmul(
         )
 
     if tpu_version >= 6 and not interpret:
+        if scatter_axis is not None and padded_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            x_2d = pltpu.with_memory_space_constraint(x_2d, pltpu.HBM)
         w = pltpu.with_memory_space_constraint(w, pltpu.HBM)
         w_scale_2d = pltpu.with_memory_space_constraint(w_scale_2d, pltpu.HBM)
 
@@ -960,28 +1083,15 @@ def pallas_fp8_gate_up_swiglu(
     else:
         x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
 
-    if tile_sizes is None:
-        batch_block = (
-            align_to(max(8, orig_batch), 8)
-            if orig_batch <= 320
-            else min(align_to(orig_batch, 128), 512)
+    tpu_version = get_tpu_version()
+    resolved_tiles = (
+        _get_tuned_gate_up_block_sizes(
+            orig_batch, orig_ffn, orig_k, tpu_version=tpu_version
         )
-        out_block = (
-            1280
-            if orig_ffn % 1280 == 0
-            else min(align_to(max(128, orig_ffn), 128), 1280)
-        )
-        in_block = (
-            orig_k
-            if (orig_k <= 5120 and orig_k % 128 == 0)
-            else min(align_to(max(128, orig_k), 128), 2560)
-        )
-    else:
-        batch_block, out_block, in_block = (
-            tile_sizes.batch_block_size,
-            tile_sizes.out_block_size,
-            tile_sizes.in_block_size,
-        )
+        if tile_sizes is None
+        else tile_sizes
+    )
+    batch_block, out_block, in_block, _ = resolved_tiles
 
     padded_batch = align_to(orig_batch, batch_block)
     padded_ffn = align_to(orig_ffn, out_block)
@@ -1013,24 +1123,27 @@ def pallas_fp8_gate_up_swiglu(
     save_acc = n_in > 1
     target_out_dtype = jnp.dtype(out_dtype)
 
-    tpu_version = get_tpu_version()
     if tpu_version >= 6 and not interpret:
-        row_scale_bytes = _row_scale_vmem_bytes(batch_block)
-        # w_in packs [gate; up] along axis 0, so its block specs are non-trivial (2x buffered).
-        gate_up_vmem = (
-            (2 if (n_batch > 1 or save_acc) else 1)
-            * batch_block
-            * in_block
-            * x_2d.dtype.itemsize
-            + 4 * out_block * (in_block * w_in.dtype.itemsize + 8 * 4)
-            + (2 if n_batch > 1 else 1) * row_scale_bytes
-            + (2 if (n_batch > 1 or n_out > 1) else 1)
-            * (batch_block * out_block * target_out_dtype.itemsize + row_scale_bytes)
-            + (6 if save_acc else 4) * batch_block * out_block * 4
-        )
-        vmem_limit_bytes: int | None = _clamp_vmem_limit_bytes(
-            gate_up_vmem, tpu_version
-        )
+        if padded_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            vmem_limit_bytes: int | None = _device_vmem_limit_bytes(tpu_version)
+        else:
+            row_scale_bytes = _row_scale_vmem_bytes(batch_block)
+            # w_in packs [gate; up] along axis 0, so its block specs are non-trivial (2x buffered).
+            gate_up_vmem = (
+                (2 if (n_batch > 1 or save_acc) else 1)
+                * batch_block
+                * in_block
+                * x_2d.dtype.itemsize
+                + 4 * out_block * (in_block * w_in.dtype.itemsize + 8 * 4)
+                + (2 if n_batch > 1 else 1) * row_scale_bytes
+                + (2 if (n_batch > 1 or n_out > 1) else 1)
+                * (
+                    batch_block * out_block * target_out_dtype.itemsize
+                    + row_scale_bytes
+                )
+                + (6 if save_acc else 4) * batch_block * out_block * 4
+            )
+            vmem_limit_bytes = _clamp_vmem_limit_bytes(gate_up_vmem, tpu_version)
     else:
         vmem_limit_bytes = None
 
