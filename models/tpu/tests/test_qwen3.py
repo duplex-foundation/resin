@@ -499,14 +499,19 @@ class TestFp8Weights:
                 assert "transpose" not in per_die_prims
                 assert "pmax" not in per_die_prims
 
-                sync_prims = [
-                    e.primitive.name
-                    for e in _iter_outer_eqns(
+                sync_eqns = list(
+                    _iter_outer_eqns(
                         jax.make_jaxpr(sync_model.hidden_states)(params, caches, inp)
                     )
-                ]
+                )
+                sync_prims = [e.primitive.name for e in sync_eqns]
                 assert "pad" not in sync_prims
-                assert "transpose" not in sync_prims
+                # The XLA absmax-quantize fallback may transpose a per-token scale.
+                assert all(
+                    e.invars[0].aval.shape in ((sp_tokens, 1), (1, sp_tokens))
+                    for e in sync_eqns
+                    if e.primitive.name == "transpose"
+                )
                 assert sync_prims.count("pmax") == 2 * cfg.num_hidden_layers
 
             for exp_tokens in (1024, 4096):
