@@ -565,7 +565,7 @@ def _should_save_x_q(
         w_buffer_count=w_buffer_count,
         include_headroom=False,
     )
-    return raw_bytes <= vmem_upper
+    return raw_bytes + _LARGE_PREFILL_SLACK_BYTES <= vmem_upper
 
 
 def _unfold_bools(

@@ -1183,7 +1183,9 @@ class TestFp8Matmul:
     def test_qwen3_32b_tp2_buckets_all_hit_zero_pad_tpu7x_tiles(self) -> None:
         from deploy.models import TPU_WORKLOADS, _tpu_buckets
         from resin.backend.tpu.kernels.fp8_matmul import (
+            _LARGE_PREFILL_SLACK_BYTES,
             _TPU7X_GATE_UP_TUNED_BLOCKS,
+            _estimate_vmem_limit_bytes,
             _get_tuned_gate_up_block_sizes,
             _raw_vmem_estimate_bytes,
             _should_save_x_q,
@@ -1260,6 +1262,29 @@ class TestFp8Matmul:
                         include_headroom=headroom,
                     )
 
+                raw_no_headroom = _vmem(headroom=False)
+                assert raw_no_headroom + _LARGE_PREFILL_SLACK_BYTES <= vmem_cap
+                if batch >= 2048:
+                    vmem_limit = _estimate_vmem_limit_bytes(
+                        n_batch=nb,
+                        n_out=no,
+                        n_in=ni,
+                        batch_block_size=sel.batch_block_size,
+                        out_block_size=sel.out_block_size,
+                        in_block_size=sel.in_block_size,
+                        x_dtype=x_dtype,
+                        x_q_dtype=jnp.float8_e4m3fn,
+                        w_q_dtype=jnp.float8_e4m3fn,
+                        out_dtype=jnp.bfloat16,
+                        save_acc=save_acc,
+                        save_x_q=save_xq,
+                        tpu_version=7,
+                        w_buffer_count=sel.w_buffer_count,
+                    )
+                    assert vmem_limit - raw_no_headroom >= _LARGE_PREFILL_SLACK_BYTES
+                    if quant and (n_out, n_in) == (5120, 8192):
+                        assert not save_xq
+
                 if (n_out, n_in) in tp2_shape_set:
                     if batch <= 320:
                         assert _vmem(headroom=True) <= vmem_cap
@@ -1267,12 +1292,11 @@ class TestFp8Matmul:
                         assert sel.out_block_size >= 512
                         assert sel.in_block_size == n_in
                     elif batch >= 2048:
-                        assert _vmem(headroom=False) <= vmem_cap
                         if quant and (n_out, n_in) == (5120, 12800):
                             assert sel == Fp8MatmulTileSizes(1024, 2560, 2560)
                             # At out_block=2560 (n_out=2), 2-buffered VMEM + 12.5 MiB
                             # x_q_scratch is 55 MiB > 48 MiB, so save_x_q stays False;
-                            # at out_block=1280 (n_out=4, 45 MiB <= 48 MiB), save_x_q is True.
+                            # at out_block=1280 (n_out=4, 38.8 MiB + 4 MiB <= 48 MiB), save_x_q is True.
                             assert not save_xq
                             assert _should_save_x_q(
                                 quantize_activation=True,
