@@ -8,6 +8,16 @@ tokens! { QwenTokens {
     tool_call => ["<tool_call>"], tool_call_end => ["</tool_call>"],
 }}
 
+/// How a checkpoint writes the body between `<tool_call>` markers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolFormat {
+    /// Qwen3.5 and later: `<function=name><parameter=key>value</parameter></function>`.
+    #[default]
+    Xml,
+    /// Qwen3: `{"name": ..., "arguments": {...}}`.
+    Json,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Text,
@@ -44,10 +54,11 @@ impl Trim {
     }
 }
 
-/// Qwen's token-delimited reasoning and schema-aware XML tool calls.
+/// Qwen's token-delimited reasoning and tool calls.
 pub type QwenParser = Parser<QwenGrammar>;
 pub struct QwenGrammar {
     tokens: QwenTokens,
+    format: ToolFormat,
     state: State,
     trim: Trim,
     tool_text: String,
@@ -62,6 +73,16 @@ impl QwenParser {
         decoder: Box<dyn Decoder>,
         prompt_ids: &[u32],
         tools: &Value,
+    ) -> Result<Self, Error> {
+        Self::with_format(tokens, decoder, prompt_ids, tools, ToolFormat::Xml)
+    }
+
+    pub fn with_format(
+        tokens: QwenTokens,
+        decoder: Box<dyn Decoder>,
+        prompt_ids: &[u32],
+        tools: &Value,
+        format: ToolFormat,
     ) -> Result<Self, Error> {
         tokens.validate()?;
         let reasoning = prompt_ids
@@ -80,6 +101,7 @@ impl QwenParser {
         Ok(Self::with_grammar(
             QwenGrammar {
                 tokens,
+                format,
                 state: if reasoning {
                     State::Reasoning
                 } else {
@@ -97,7 +119,31 @@ impl QwenParser {
 }
 
 impl QwenGrammar {
+    fn emit_json_tool(&mut self, events: &mut EventSink) {
+        let Ok(Value::Object(call)) =
+            serde_json::from_str(self.tool_text.trim_matches(super::whitespace))
+        else {
+            return;
+        };
+        let Some(name) = call
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return;
+        };
+        let arguments = match call.get("arguments") {
+            None | Some(Value::Null) => Value::Object(Map::new()),
+            Some(arguments @ Value::Object(_)) => arguments.clone(),
+            Some(_) => return,
+        };
+        emit_tool(&mut self.tool_index, name, arguments.to_string(), events);
+    }
+
     fn emit_tool(&mut self, events: &mut EventSink) {
+        if self.format == ToolFormat::Json {
+            return self.emit_json_tool(events);
+        }
         let Some((_, function)) = self.tool_text.split_once("<function=") else {
             return;
         };

@@ -148,13 +148,26 @@ def test_fast_allreduce_reaches_runner_and_rejects_unsupported_models(monkeypatc
 
 @pytest.mark.parametrize("name", bench.MODEL_SPECS)
 def test_model_defaults_build_valid_natural_sweeps(name):
-    args = bench.argument_parser().parse_args(["--model", name])
+    extra = ["--workload", "1k/8k"] if name == "qwen3-32b" else []
+    args = bench.argument_parser().parse_args(["--model", name, *extra])
     spec, cases, topology, options = bench._configuration(args)
     assert {case["phase"] for case in cases} == {"prefill", "decode"}
     assert topology.world_size == spec.world_size
     assert options["draft_tokens"] == spec.draft_tokens
     assert "accepted_drafts" not in options
     assert options["balanced_experts"] is False
+    if spec.backend == "tpu":
+        assert [
+            (case["context_length"], case["batch_size"])
+            for case in cases
+            if case["phase"] == "prefill"
+        ] == [(1024, 1)]
+        assert [
+            (case["context_length"], case["batch_size"])
+            for case in cases
+            if case["phase"] == "decode"
+        ] == [(1024, 320)]
+        return
     assert [
         (case["context_length"], case["batch_size"])
         for case in cases
@@ -165,6 +178,81 @@ def test_model_defaults_build_valid_natural_sweeps(name):
         for case in cases
         if case["phase"] == "decode"
     ] == [(8192, batch) for batch in (1, 2, 4, 8, 16, 32, 64)]
+
+
+@pytest.mark.parametrize("name", ["1k/1k", "1k/8k", "8k/1k"])
+def test_tpu_workloads_match_the_inferencex_shapes(name):
+    from deploy.models import TPU_WORKLOADS
+
+    args = bench.argument_parser().parse_args(
+        ["--model", "qwen3-32b", "--workload", name, "--prompt-source", "synthetic"]
+    )
+    spec, cases, topology, options = bench._configuration(args)
+    workload = TPU_WORKLOADS[name]
+    assert spec.backend == "tpu" and spec.gpu_memory_utilization == 0.98
+    assert topology.world_size == 1 and options["draft_tokens"] == 0
+    assert options["prefill_chunk_size"] == 4096
+    assert options["workload"] == name
+    assert [
+        (case["phase"], case["context_length"], case["batch_size"]) for case in cases
+    ] == [
+        ("prefill", workload.prompt, 1),
+        ("decode", workload.prompt, 320),
+    ]
+    assert workload.prompt + workload.output == workload.max_model_len
+
+
+def test_tpu_workload_accepts_only_decode_batch_overrides():
+    parse = bench.argument_parser().parse_args
+    base = [
+        "--model",
+        "qwen3-32b",
+        "--workload",
+        "8k/1k",
+        "--prompt-source",
+        "synthetic",
+    ]
+    _, cases, _, _ = bench._configuration(
+        parse([*base, "--decode-batch-sizes", "144,160"])
+    )
+    assert [(c["phase"], c["batch_size"]) for c in cases] == [
+        ("prefill", 1),
+        ("decode", 144),
+        ("decode", 160),
+    ]
+    with pytest.raises(ValueError, match="at most 320"):
+        bench._configuration(parse([*base, "--decode-batch-sizes", "321"]))
+    with pytest.raises(ValueError, match="only --decode-batch-sizes"):
+        bench._configuration(parse([*base, "--batch-sizes", "8"]))
+
+
+def test_tpu_workload_is_required_and_cuda_rejects_it(capsys):
+    with pytest.raises(SystemExit) as error:
+        bench.main(
+            [
+                "--model",
+                "qwen3-32b",
+                "--checkpoint",
+                "/missing",
+                "--prompt-source",
+                "synthetic",
+            ]
+        )
+    assert error.value.code == 2
+    assert "--workload" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="only for TPU"):
+        bench._configuration(
+            bench.argument_parser().parse_args(
+                ["--model", "gpt-oss-20b", "--workload", "1k/1k"]
+            )
+        )
+
+
+def test_tpu_preset_has_no_modal_checkpoint_actions(capsys):
+    with pytest.raises(SystemExit) as error:
+        bench.main(["--model", "qwen3-32b", "--backend", "modal", "--download-only"])
+    assert error.value.code == 2
+    assert "runs locally" in capsys.readouterr().err
 
 
 def test_paired_topologies_keep_allocation_and_independent_metadata(monkeypatch):

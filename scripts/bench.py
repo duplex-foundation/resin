@@ -27,7 +27,15 @@ import torch
 import torch.distributed as dist
 
 import resin
-from deploy.models import MODEL_SPECS, create_runner, get_model, validate_gpu
+from deploy.models import (
+    MODEL_SPECS,
+    TPU_WORKLOADS,
+    create_runner,
+    export_tpu_compile_cache_env,
+    get_model,
+    require_tpu_chip,
+    validate_gpu,
+)
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
@@ -82,12 +90,18 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         profile_graph_phases=options.get("profile_graph_phases", False),
         fast_allreduce=options.get("fast_allreduce", False),
         assistant_checkpoint=options.get("assistant_checkpoint"),
+        workload=options.get("workload"),
     )
 
 
 def _apple_silicon(spec) -> bool:
     """Whether this preset runs one MLX process instead of CUDA ranks."""
     return spec.backend == "mlx"
+
+
+def _local_process(spec) -> bool:
+    """Whether this preset is one process, not a CUDA rank per device."""
+    return spec.backend in {"mlx", "tpu"}
 
 
 def _result_callback(report_path):
@@ -304,7 +318,18 @@ def _rank(
             install_flashinfer_hash_cache()
     spec = get_model(model)
     apple = _apple_silicon(spec)
-    if apple:
+    kind = spec.backend
+    if kind == "tpu":
+        require_tpu_chip(queued=True)
+        export_tpu_compile_cache_env()
+        import jax
+
+        def synchronize():
+            for array in jax.live_arrays():
+                array.block_until_ready()
+
+        hardware = jax.devices()[0].device_kind
+    elif apple:
         import mlx.core as mx
 
         synchronize = mx.synchronize
@@ -349,15 +374,20 @@ def _rank(
     )
     # Reserve real generated positions, including draft write lookahead. Context
     # lengths on the charts remain the prompt lengths recorded by the harness.
-    capacity = _context_capacity(cases, options)
+    workload = TPU_WORKLOADS.get(options.get("workload"))
+    capacity = (
+        workload.max_model_len
+        if workload is not None
+        else _context_capacity(cases, options)
+    )
     if rank == 0:
-        devices = hardware if apple else f"{topology.world_size} GPUs"
+        devices = hardware if kind != "cuda" else f"{topology.world_size} GPUs"
         print(f"[bench] loading {model} over {devices}", flush=True)
     started = time.perf_counter()
     raw = _runner(
         model,
         checkpoint,
-        device=f"cuda:{rank}",
+        device="tpu" if kind == "tpu" else f"cuda:{rank}",
         groups=groups,
         cases=cases,
         options=options,
@@ -376,15 +406,15 @@ def _rank(
     if rank == 0:
         print(
             f"[bench] weights ready in {loaded_seconds:.1f}s"
-            + ("" if apple else "; capturing graphs"),
+            + ("" if kind != "cuda" else "; capturing graphs"),
             flush=True,
         )
     started = time.perf_counter()
-    if not apple:
+    if kind == "cuda":
         raw.capture_cuda_graphs()
     synchronize()
     capture_seconds = time.perf_counter() - started
-    if rank == 0 and not apple:
+    if rank == 0 and kind == "cuda":
         print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
     overlap = options.get("overlap", True) and callable(getattr(raw, "enqueue", None))
     metadata = {
@@ -413,6 +443,17 @@ def _rank(
         "fast_allreduce": options.get("fast_allreduce", False),
         "overlap": overlap,
         "timing": "continuous_completions" if overlap else "synchronized_steps",
+        **(
+            {}
+            if workload is None
+            else {
+                "tpu_workload": options["workload"],
+                "tpu_prompt_tokens": workload.prompt,
+                "tpu_output_tokens": workload.output,
+                "tpu_max_model_len": workload.max_model_len,
+                "tpu_decode_buckets": list(workload.decode_buckets),
+            }
+        ),
         "prefill_chunk_size": options["prefill_chunk_size"],
         "context_capacity": capacity,
         "max_batch_tokens": prefill_budget,
@@ -431,6 +472,9 @@ def _rank(
         "sampling": options.get("sampling", {"temperature": 0.0}),
         "sampling_filter_order": "top-p-then-top-k",
     }
+    if workload is not None:
+        metadata["quant"] = "fp8-w8a8"
+        metadata["graphs"] = {"prefill": "xla-bucket", "decode": "xla-bucket"}
     spec = get_model(model)
     if options["draft_tokens"] and spec.assistant is not None:
         metadata.update(
@@ -494,7 +538,7 @@ def _rank(
                     metadata,
                     decode_passes=2 + int(overlap),
                     synchronize=synchronize,
-                    cuda=not apple,
+                    cuda=kind == "cuda",
                 )
             ),
         )
@@ -603,7 +647,34 @@ def _validate_configuration(model, cases, topology, options):
             raise ValueError("GLM native MTP supports at most seven draft tokens")
     if numa not in ("auto", "off", "required"):
         raise ValueError("numa must be 'auto', 'off', or 'required'")
-    if _apple_silicon(spec):
+    if spec.backend == "tpu":
+        workload_name = options.get("workload")
+        if workload_name not in TPU_WORKLOADS:
+            raise ValueError("TPU benchmarks require --workload 1k/1k, 1k/8k, or 8k/1k")
+        workload = TPU_WORKLOADS[workload_name]
+        if expert_backend != "none":
+            raise ValueError(f"{model} has no expert backend")
+        if draft_tokens:
+            raise ValueError(f"{model} has no draft model; pass --draft-tokens 0")
+        if topology.world_size != 1:
+            raise ValueError(
+                f"{model} runs in one process; tensor parallel is the on-chip mesh"
+            )
+        budget = decode_output_budget(
+            warmup_steps=options["warmup_steps"],
+            measure_steps=options["measure_steps"],
+            draft_tokens=draft_tokens,
+            overlap=options.get("overlap", True),
+            trace_passes=(
+                2 + int(options.get("overlap", True)) if options.get("trace_dir") else 0
+            ),
+        )
+        if workload.prompt + budget > workload.max_model_len:
+            raise ValueError(
+                f"{workload_name} context {workload.max_model_len} cannot fit "
+                f"prompt {workload.prompt} plus the decode window {budget}"
+            )
+    elif _apple_silicon(spec):
         if expert_backend != spec.expert_backend:
             raise ValueError(f"{model} uses {spec.expert_backend} experts")
         if prefill_chunk_size != 4096:
@@ -691,6 +762,7 @@ def run_benchmark(
     prompt_source: str = "sharegpt",
     prompt_corpus: str | Path | None = None,
     sampling: dict | None = None,
+    workload: str | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep.
 
@@ -736,6 +808,7 @@ def run_benchmark(
         skip_capacity_exceeded=skip_capacity_exceeded,
         prompt_source=prompt_source,
         prompt_corpus=None if prompt_corpus is None else str(prompt_corpus),
+        workload=workload,
         sampling={
             "temperature": 0.0,
             "top_p": 1.0,
@@ -746,11 +819,12 @@ def run_benchmark(
     )
     _validate_configuration(model, cases, topology, options)
     apple = _apple_silicon(spec)
-    if apple and topology.world_size != 1:
-        raise ValueError(f"{model} runs on one Apple Silicon device")
+    if _local_process(spec) and topology.world_size != 1:
+        where = "one Apple Silicon device" if apple else "one process"
+        raise ValueError(f"{model} runs on {where}")
     # Host NUMA placement applies to CUDA ranks only.
-    numa = "off" if apple else numa
-    if not apple and torch.cuda.device_count() < topology.world_size:
+    numa = "off" if _local_process(spec) else numa
+    if not _local_process(spec) and torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = (
@@ -767,14 +841,16 @@ def run_benchmark(
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
+        if apple:
+            devices = ["mps"]
+        elif spec.backend == "tpu":
+            devices = ["tpu"]
+        else:
+            devices = [f"cuda:{rank}" for rank in range(topology.world_size)]
         processes = resin.process.spawn(
             _rank,
             args=(port, output, model, checkpoint, cases, topology, options),
-            devices=(
-                ["mps"]
-                if apple
-                else [f"cuda:{rank}" for rank in range(topology.world_size)]
-            ),
+            devices=devices,
             numa=numa,
         )
         records = json.loads(output.read_text())
@@ -842,6 +918,14 @@ def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=MODEL_SPECS, required=True)
     parser.add_argument("--backend", choices=("local", "modal"), default="local")
+    parser.add_argument(
+        "--workload",
+        choices=tuple(TPU_WORKLOADS),
+        help=(
+            "TPU server shape, required for TPU presets. On the TPU host, run "
+            "under tpu-queue.sh with RESIN_TPU_QUEUED=1"
+        ),
+    )
     parser.add_argument(
         "--prompt-source",
         choices=("sharegpt", "saved", "synthetic"),
@@ -1009,9 +1093,26 @@ def _configuration(args):
 
     spec = get_model(args.model)
     if args.backend == "modal":
-        if _apple_silicon(spec):
+        if _local_process(spec):
             raise ValueError(f"{spec.name} runs locally; use --backend local")
         validate_gpu(spec, args.gpu)
+    if spec.backend == "tpu" and args.workload is None:
+        raise ValueError("TPU benchmarks require --workload 1k/1k, 1k/8k, or 8k/1k")
+    if spec.backend != "tpu" and args.workload is not None:
+        raise ValueError("--workload is only for TPU presets")
+    if args.workload is not None and any(
+        (
+            args.context_lengths,
+            args.prefill_context_lengths,
+            args.decode_context_lengths,
+            args.batch_sizes,
+            args.prefill_batch_sizes,
+        )
+    ):
+        raise ValueError(
+            "--workload sets the TPU prompt and context limit; "
+            "only --decode-batch-sizes may vary the batch"
+        )
     world = spec.world_size if args.world_size is None else args.world_size
     topology = dict(world_size=world, cp=1 if args.cp is None else args.cp)
     for axis in ("attn_dp", "attn_tp", "ep"):
@@ -1028,18 +1129,28 @@ def _configuration(args):
     phases = args.phases.split(",")
     if not phases or any(phase not in {"prefill", "decode"} for phase in phases):
         raise ValueError("phases must be prefill, decode, or prefill,decode")
-    contexts = {
-        "prefill": args.prefill_context_lengths
-        or args.context_lengths
-        or [4096, 8192, 16384, 32768, 65536],
-        "decode": args.decode_context_lengths or args.context_lengths or [8192],
-    }
-    batches = {
-        "prefill": args.prefill_batch_sizes or args.batch_sizes or [1],
-        "decode": args.decode_batch_sizes
-        or args.batch_sizes
-        or [1, 2, 4, 8, 16, 32, 64],
-    }
+    if args.workload is not None:
+        selected = TPU_WORKLOADS[args.workload]
+        contexts = {"prefill": [selected.prompt], "decode": [selected.prompt]}
+        decode_batches = args.decode_batch_sizes or [selected.max_num_seqs]
+        if max(decode_batches) > selected.max_num_seqs:
+            raise ValueError(
+                f"{args.workload} serves at most {selected.max_num_seqs} sequences"
+            )
+        batches = {"prefill": [1], "decode": decode_batches}
+    else:
+        contexts = {
+            "prefill": args.prefill_context_lengths
+            or args.context_lengths
+            or [4096, 8192, 16384, 32768, 65536],
+            "decode": args.decode_context_lengths or args.context_lengths or [8192],
+        }
+        batches = {
+            "prefill": args.prefill_batch_sizes or args.batch_sizes or [1],
+            "decode": args.decode_batch_sizes
+            or args.batch_sizes
+            or [1, 2, 4, 8, 16, 32, 64],
+        }
     cases = [
         asdict(
             BenchCase(
@@ -1102,6 +1213,7 @@ def _configuration(args):
         skip_capacity_exceeded=args.skip_capacity_exceeded,
         prompt_source=args.prompt_source,
         prompt_corpus=args.prompt_corpus,
+        workload=args.workload,
         sampling=dict(
             temperature=args.temperature,
             top_p=args.top_p,
@@ -1116,6 +1228,17 @@ def _configuration(args):
 def main(argv=None) -> None:
     parser = argument_parser()
     args = parser.parse_args(argv)
+    if (
+        args.model in MODEL_SPECS
+        and get_model(args.model).backend == "tpu"
+        and args.prompt_source == "sharegpt"
+        and args.prompt_corpus is None
+    ):
+        args.prompt_source = "synthetic"
+        print(
+            "[bench] TPU workloads use synthetic token ids unless --prompt-corpus is set",
+            flush=True,
+        )
     if args.backend == "local" and (args.download_only or args.publish_only):
         parser.error("--download-only/--publish-only require --backend modal")
     if args.backend == "local" and args.gpu is not None:
@@ -1128,7 +1251,7 @@ def main(argv=None) -> None:
         parser.error(
             "Modal uses the pinned model registry; local checkpoint paths require --backend local"
         )
-    if (args.download_only or args.publish_only) and _apple_silicon(
+    if (args.download_only or args.publish_only) and _local_process(
         get_model(args.model)
     ):
         parser.error(f"{args.model} runs locally; pass its checkpoint directory")

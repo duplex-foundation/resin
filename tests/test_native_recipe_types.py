@@ -335,6 +335,7 @@ def test_rendered_prompt_token_view_is_owned_readonly_and_outlives_prompt():
         ("gpt_oss", ["<|return|>", "<|call|>"]),
         ("deepseek_v41", ["<｜end▁of▁sentence｜>"]),
         ("inkling2", ["<|content_model_end_sampling|>"]),
+        ("qwen3", ["<|im_end|>", "<|endoftext|>"]),
         ("qwen3_5", ["<|im_end|>", "<|endoftext|>"]),
         ("qwen3_8", ["<|im_end|>", "<|endoftext|>"]),
         ("gemma4", ["<turn|>", "<eos>"]),

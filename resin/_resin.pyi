@@ -1192,11 +1192,14 @@ class RunnerMetrics:
         spec_accepted_tokens: int = 0,
         spec_verify_rows: int = 0,
         dp_attention_sync_wait_seconds: "dict[str, Any] | None" = None,
+        compilations: int | None = None,
     ) -> RunnerMetrics: ...
     def as_dict(self, /) -> "dict[str, Any]":
         """
         Plain fields for inspection and explicit distributed transport.
         """
+    @property
+    def compilations(self, /) -> int | None: ...
     @property
     def cuda_graph_passes(self, /) -> dict[str, int]: ...
     @property
