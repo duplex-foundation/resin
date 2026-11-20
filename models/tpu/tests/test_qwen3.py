@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import closing
 from pathlib import Path
 
@@ -444,10 +445,7 @@ class TestFp8Weights:
             export_modes: tuple[DecodeMatmulMode, ...] = (
                 "auto",
                 "pallas",
-                "n_split_pallas",
                 "xla",
-                "n_split_xla",
-                "gspmd_xla",
             )
             for mode in export_modes:
                 model = Qwen3Model(
@@ -464,18 +462,21 @@ class TestFp8Weights:
                     assert model._resolve_prefill_matmul_backend(2048) == "pallas"
                     assert model._resolve_prefill_matmul_backend(4096) == "pallas"
                     assert model._resolve_prefill_matmul_backend(8192) == "pallas"
-                    assert model._resolve_decode_matmul_mode(8) == "xla"
-                    assert model._resolve_decode_matmul_mode(256) == "xla"
-                    assert model._resolve_decode_matmul_mode(288) == "pallas"
-                    assert model._resolve_decode_matmul_mode(320) == "pallas"
 
                 tokens_to_check = (
-                    ((8, 8), (320, 320), (1024, 320), (4096, 320))
+                    (
+                        (8, 8),
+                        (160, 160),
+                        (320, 320),
+                        (384, 320),
+                        (1024, 320),
+                        (4096, 320),
+                    )
                     if mode == "auto"
                     else (
                         ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320))
                         if mode == "pallas"
-                        else ((320, 320),)
+                        else ((8, 8), (320, 320))
                     )
                 )
                 for tokens, seqs in tokens_to_check:
@@ -507,7 +508,45 @@ class TestFp8Weights:
                     mlir_txt = exported.mlir_module()
                     assert "tpu_custom_call" in mlir_txt
                     assert "func.func private @_run(" not in mlir_txt
-                    if mode == "auto" and tokens == 1024:
+                    if tokens <= 320:
+                        assert f"quantize_fp8_with_absmax_{tokens}_2560" in mlir_txt
+                        assert (
+                            f"quantize_fp8_with_absmax_{tokens}_12800" not in mlir_txt
+                        )
+                    else:
+                        assert "quantize_fp8_with_absmax_" not in mlir_txt
+                    if mode == "xla":
+                        assert "fp8_w8a8_matmul_" not in mlir_txt
+                    elif mode == "auto" and tokens in (8, 320):
+                        assert f"fp8_w8a8_matmul_{tokens}_1280_4096" in mlir_txt
+                        assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
+                        assert f"fp8_w8a8_matmul_{tokens}_512_12800_b3" in mlir_txt
+                        scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
+                        custom_calls = [
+                            line
+                            for line in mlir_txt.splitlines()
+                            if "tpu_custom_call" in line
+                        ]
+                        for kernel_prefix, max_vmem_bytes in (
+                            (
+                                f'kernel_name = "fp8_gate_up_swiglu_{tokens}_',
+                                36 * 1024**2,
+                            ),
+                            (
+                                f'kernel_name = "quantize_fp8_with_absmax_{tokens}_2560"',
+                                10 * 1024**2,
+                            ),
+                        ):
+                            sizes = [
+                                int(m.group(1))
+                                for line in custom_calls
+                                if kernel_prefix in line
+                                and (m := scoped_vmem_re.search(line))
+                            ]
+                            assert sizes and all(
+                                size <= max_vmem_bytes for size in sizes
+                            )
+                    elif mode == "auto" and tokens == 1024:
                         assert "fp8_gate_up_swiglu_512_" not in mlir_txt
                         assert "fp8_w8a8_matmul_" not in mlir_txt
                     elif mode == "auto" and tokens == 4096:
@@ -558,9 +597,8 @@ class TestFp8Weights:
                 kv_dtype=jnp.float8_e4m3fn,
             )
             m.decode_matmul_mode = mode
-            m.decode_n_split_min_tokens = 2
             m._force_fused_qkv_pack_interpret = True
-            m._force_decode_pallas_interpret = mode in ("pallas", "n_split_pallas")
+            m._force_decode_pallas_interpret = mode in ("auto", "pallas")
             m.impl = _ft.partial(
                 ragged_paged_attention,
                 d_block_sizes=(1, 8, 1, 8),
@@ -577,7 +615,7 @@ class TestFp8Weights:
                 buckets=ShapeBuckets(decode_seqs=(8,), prefill_tokens=(16,)),
                 cache_slab_capacity=32,
             )
-            if tp == 2 and mode != "gspmd_xla":
+            if tp == 2:
                 from resin.backend.tpu.buckets import Bucket
                 from resin.backend.tpu.metadata import empty_inputs
 
@@ -607,7 +645,7 @@ class TestFp8Weights:
             return [ev.logprobs.logprob for ev in evs if ev.logprobs is not None]
 
         tp1_ref = _run_mode(1, "pallas")
-        for mode in ("pallas", "n_split_pallas", "xla", "n_split_xla", "gspmd_xla"):
+        for mode in ("pallas", "xla"):
             tp2_lps = _run_mode(2, mode)
             np.testing.assert_allclose(tp2_lps, tp1_ref, rtol=2e-2, atol=5e-2)
 
