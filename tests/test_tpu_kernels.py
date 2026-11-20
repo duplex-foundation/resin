@@ -2287,35 +2287,58 @@ class TestDecodeMatmulPath:
         np.testing.assert_array_equal(np.asarray(exact_gq), np.asarray(ref_gq))
         np.testing.assert_array_equal(np.asarray(exact_gs.T), np.asarray(ref_gs))
 
-        if batch == 320:
-            # Wide K=65536 exceeds 48 MiB single-pass VMEM and falls back cleanly to XLA.
-            wide_x = jnp.asarray(
-                rng.standard_normal((batch, 65536)).astype(np.float32) * 0.25,
+    def test_quantize_fp8_with_absmax_k_tiling_and_xla_fallback(self) -> None:
+        from resin.backend.tpu.kernels import quantize_fp8_act
+        from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax
+
+        rng = np.random.default_rng(320)
+        wide_x = jnp.asarray(
+            rng.standard_normal((320, 12800)).astype(np.float32) * 0.25,
+            jnp.bfloat16,
+        )
+        wide_abs = jnp.max(
+            jnp.abs(wide_x.astype(jnp.float32)), axis=-1, keepdims=True
+        ).T
+        wq_pallas, ws_pallas = quantize_fp8_with_absmax(
+            wide_x,
+            wide_abs,
+            jnp.float8_e4m3fn,
+            transposed_scale=True,
+            use_pallas=True,
+            interpret=True,
+        )
+        wq_ref, ws_ref = quantize_fp8_act(wide_x)
+        np.testing.assert_array_equal(np.asarray(wq_pallas), np.asarray(wq_ref))
+        np.testing.assert_array_equal(np.asarray(ws_pallas.T), np.asarray(ws_ref))
+
+        for fallback_shape in ((384, 256), (16, 192)):
+            fb_x = jnp.asarray(
+                rng.standard_normal(fallback_shape).astype(np.float32) * 0.25,
                 jnp.bfloat16,
             )
-            wide_abs = jnp.max(
-                jnp.abs(wide_x.astype(jnp.float32)), axis=-1, keepdims=True
+            fb_abs = jnp.max(
+                jnp.abs(fb_x.astype(jnp.float32)), axis=-1, keepdims=True
             ).T
             with pytest.raises(ValueError, match="unsupported"):
                 quantize_fp8_with_absmax(
-                    wide_x, wide_abs, jnp.float8_e4m3fn, use_pallas=True, interpret=True
+                    fb_x, fb_abs, jnp.float8_e4m3fn, use_pallas=True, interpret=True
                 )
-            wq_auto, ws_auto = quantize_fp8_with_absmax(
-                wide_x,
-                wide_abs,
+            fq_auto, fs_auto = quantize_fp8_with_absmax(
+                fb_x,
+                fb_abs,
                 jnp.float8_e4m3fn,
                 transposed_scale=True,
                 interpret=True,
             )
-            wq_x, ws_x = quantize_fp8_with_absmax(
-                wide_x,
-                wide_abs,
+            fq_x, fs_x = quantize_fp8_with_absmax(
+                fb_x,
+                fb_abs,
                 jnp.float8_e4m3fn,
                 transposed_scale=True,
                 use_pallas=False,
             )
-            np.testing.assert_array_equal(np.asarray(wq_auto), np.asarray(wq_x))
-            np.testing.assert_array_equal(np.asarray(ws_auto), np.asarray(ws_x))
+            np.testing.assert_array_equal(np.asarray(fq_auto), np.asarray(fq_x))
+            np.testing.assert_array_equal(np.asarray(fs_auto), np.asarray(fs_x))
 
     @pytest.mark.parametrize("batch", [160, 192, 320])
     def test_zero_pad_norms_qkv_pack_and_unpack_attn_fp8_quant(

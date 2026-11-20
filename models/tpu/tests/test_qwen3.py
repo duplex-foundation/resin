@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import closing
 from pathlib import Path
 
@@ -508,7 +509,10 @@ class TestFp8Weights:
                     assert "tpu_custom_call" in mlir_txt
                     assert "func.func private @_run(" not in mlir_txt
                     if tokens <= 320:
-                        assert f"quantize_fp8_with_absmax_{tokens}_12800" in mlir_txt
+                        assert f"quantize_fp8_with_absmax_{tokens}_2560" in mlir_txt
+                        assert (
+                            f"quantize_fp8_with_absmax_{tokens}_12800" not in mlir_txt
+                        )
                     else:
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
                     if mode == "xla":
@@ -517,6 +521,31 @@ class TestFp8Weights:
                         assert f"fp8_w8a8_matmul_{tokens}_1280_4096" in mlir_txt
                         assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
                         assert f"fp8_w8a8_matmul_{tokens}_512_12800_b3" in mlir_txt
+                        scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
+                        custom_calls = [
+                            line
+                            for line in mlir_txt.splitlines()
+                            if "tpu_custom_call" in line
+                        ]
+                        for kernel_prefix, max_vmem_bytes in (
+                            (
+                                f'kernel_name = "fp8_gate_up_swiglu_{tokens}_',
+                                36 * 1024**2,
+                            ),
+                            (
+                                f'kernel_name = "quantize_fp8_with_absmax_{tokens}_2560"',
+                                10 * 1024**2,
+                            ),
+                        ):
+                            sizes = [
+                                int(m.group(1))
+                                for line in custom_calls
+                                if kernel_prefix in line
+                                and (m := scoped_vmem_re.search(line))
+                            ]
+                            assert sizes and all(
+                                size <= max_vmem_bytes for size in sizes
+                            )
                     elif mode == "auto" and tokens == 1024:
                         assert "fp8_gate_up_swiglu_512_" not in mlir_txt
                         assert "fp8_w8a8_matmul_" not in mlir_txt

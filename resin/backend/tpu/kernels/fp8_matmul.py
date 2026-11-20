@@ -38,7 +38,20 @@ from resin.backend.tpu.kernels._rpa_v3_pallas import align_to, get_tpu_version
 from resin.backend.tpu.mesh import TP_AXIS
 
 _FP32_TINY_SQRT = float(jnp.sqrt(jnp.finfo(jnp.float32).tiny))
-_DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
+_MIN_VMEM_LIMIT_BYTES = 4 * 1024 * 1024
+_DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+_DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: _DEFAULT_VMEM_LIMIT_BYTES}
+_QUANT_MAX_K_TILES = 20
+
+
+def _row_scale_vmem_bytes(batch_block: int) -> int:
+    return 8 * align_to(batch_block, 128) * 4
+
+
+def _clamp_vmem_limit_bytes(raw_bytes: int, tpu_version: int) -> int:
+    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, _DEFAULT_VMEM_LIMIT_BYTES)
+    return min(max(raw_bytes, _MIN_VMEM_LIMIT_BYTES), upper)
+
 
 MatmulBackend = Literal["auto", "pallas", "xla"]
 
@@ -208,18 +221,15 @@ def quantize_fp8_act(
 
 def _quantize_fp8_with_absmax_pallas_kernel(
     x_ref,
-    absmax_row_ref,
+    scale_row_ref,
     x_q_ref,
-    scale_t_ref,
     *,
     bound: float,
 ) -> None:
-    scale_row = safe_fp8_scale(absmax_row_ref[...], bound)
-    scale_col = jnp.transpose(scale_row)
+    scale_col = jnp.transpose(scale_row_ref[...])
     x_q_ref[...] = jnp.clip(
         x_ref[...].astype(jnp.float32) / scale_col, -bound, bound
     ).astype(x_q_ref.dtype)
-    scale_t_ref[...] = scale_row
 
 
 def quantize_fp8_with_absmax(
@@ -231,7 +241,7 @@ def quantize_fp8_with_absmax(
     use_pallas: bool | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize ``x: [..., K]`` using pre-computed per-token ``abs_max`` in one VMEM pass."""
+    """Quantize ``x: [..., K]`` using pre-computed per-token ``abs_max`` via K-tiled VMEM Pallas."""
     target = jnp.dtype(dtype)
     bound = _fp8_bound(target)
     leading = x.shape[:-1]
@@ -245,13 +255,10 @@ def quantize_fp8_with_absmax(
 
     tpu_version = get_tpu_version()
     batch_block = align_to(max(8, orig_batch), 8) if orig_batch > 0 else 8
-    vmem_est = 2 * batch_block * k_dim * (x_2d.dtype.itemsize + target.itemsize)
-    vmem_cap = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
     can_pallas = (
         0 < orig_batch <= 320
         and k_dim >= 128
         and k_dim % 128 == 0
-        and vmem_est <= vmem_cap
         and (interpret or tpu_version >= 7)
     )
     if use_pallas is True and not can_pallas:
@@ -270,39 +277,57 @@ def quantize_fp8_with_absmax(
             absmax_row = abs_max
         else:
             absmax_row = abs_max.reshape(1, orig_batch).astype(jnp.float32)
+        scale_t = safe_fp8_scale(absmax_row, bound)
+        scale_in = scale_t
         if orig_batch < batch_block:
             pad_b = batch_block - orig_batch
             x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
-            absmax_row = jnp.pad(absmax_row, ((0, 0), (0, pad_b)))
+            scale_in = jnp.pad(scale_t, ((0, 0), (0, pad_b)), constant_values=1.0)
 
-        vmem_limit_bytes = vmem_cap if (tpu_version >= 7 and not interpret) else None
-        q_2d, scale_t = pl.pallas_call(
+        k_tiles = k_dim // 128
+        k_block = 128 * next(
+            d
+            for d in range(min(k_tiles, _QUANT_MAX_K_TILES), 0, -1)
+            if k_tiles % d == 0
+        )
+        n_k = k_dim // k_block
+        if tpu_version >= 7 and not interpret:
+            buf_mult = 2 if n_k > 1 else 1
+            tile_vmem = (
+                buf_mult
+                * batch_block
+                * k_block
+                * (x_2d.dtype.itemsize + target.itemsize)
+                + _row_scale_vmem_bytes(batch_block)
+                + batch_block * k_block * 4
+            )
+            vmem_limit_bytes: int | None = _clamp_vmem_limit_bytes(
+                tile_vmem, tpu_version
+            )
+        else:
+            vmem_limit_bytes = None
+        k_idx = (lambda _k: 0) if n_k == 1 else (lambda k: k)
+        q_2d = pl.pallas_call(
             functools.partial(_quantize_fp8_with_absmax_pallas_kernel, bound=bound),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
-                    pl.BlockSpec((batch_block, k_dim), lambda _b: (0, 0)),
-                    pl.BlockSpec((1, batch_block), lambda _b: (0, 0)),
+                    pl.BlockSpec((batch_block, k_block), lambda k: (0, k_idx(k))),
+                    pl.BlockSpec((1, batch_block), lambda _k: (0, 0)),
                 ],
-                out_specs=[
-                    pl.BlockSpec((batch_block, k_dim), lambda _b: (0, 0)),
-                    pl.BlockSpec((1, batch_block), lambda _b: (0, 0)),
-                ],
-                grid=(1,),
+                out_specs=pl.BlockSpec((batch_block, k_block), lambda k: (0, k_idx(k))),
+                grid=(n_k,),
             ),
-            out_shape=[
-                jax.ShapeDtypeStruct((batch_block, k_dim), target),
-                jax.ShapeDtypeStruct((1, batch_block), jnp.float32),
-            ],
+            out_shape=jax.ShapeDtypeStruct((batch_block, k_dim), target),
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("parallel",),
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
             interpret=pltpu.InterpretParams() if interpret else False,
-            name=f"quantize_fp8_with_absmax_{batch_block}_{k_dim}",
-        )(x_2d, absmax_row)
+            name=f"quantize_fp8_with_absmax_{batch_block}_{k_block}",
+        )(x_2d, scale_in)
         if orig_batch < batch_block:
-            q_2d, scale_t = q_2d[:orig_batch], scale_t[:, :orig_batch]
+            q_2d = q_2d[:orig_batch]
 
     q_out = q_2d if x.ndim == 2 else q_2d.reshape(*leading, k_dim)
     if transposed_scale:
@@ -416,7 +441,6 @@ def _estimate_vmem_limit_bytes(
     tpu_version: int,
     w_buffer_count: int = 2,
 ) -> int:
-    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
     raw = _raw_vmem_estimate_bytes(
         n_batch=n_batch,
         n_out=n_out,
@@ -432,7 +456,7 @@ def _estimate_vmem_limit_bytes(
         save_x_q=save_x_q,
         w_buffer_count=w_buffer_count,
     )
-    return min(max(raw, 4 * 1024 * 1024), upper)
+    return _clamp_vmem_limit_bytes(raw, tpu_version)
 
 
 def _unfold_bools(
@@ -990,11 +1014,25 @@ def pallas_fp8_gate_up_swiglu(
     target_out_dtype = jnp.dtype(out_dtype)
 
     tpu_version = get_tpu_version()
-    vmem_limit_bytes = (
-        _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
-        if (tpu_version >= 6 and not interpret)
-        else None
-    )
+    if tpu_version >= 6 and not interpret:
+        row_scale_bytes = _row_scale_vmem_bytes(batch_block)
+        # w_in packs [gate; up] along axis 0, so its block specs are non-trivial (2x buffered).
+        gate_up_vmem = (
+            (2 if (n_batch > 1 or save_acc) else 1)
+            * batch_block
+            * in_block
+            * x_2d.dtype.itemsize
+            + 4 * out_block * (in_block * w_in.dtype.itemsize + 8 * 4)
+            + (2 if n_batch > 1 else 1) * row_scale_bytes
+            + (2 if (n_batch > 1 or n_out > 1) else 1)
+            * (batch_block * out_block * target_out_dtype.itemsize + row_scale_bytes)
+            + (6 if save_acc else 4) * batch_block * out_block * 4
+        )
+        vmem_limit_bytes: int | None = _clamp_vmem_limit_bytes(
+            gate_up_vmem, tpu_version
+        )
+    else:
+        vmem_limit_bytes = None
 
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
     o_idx = (lambda _o: 0) if n_out == 1 else (lambda o: o)
