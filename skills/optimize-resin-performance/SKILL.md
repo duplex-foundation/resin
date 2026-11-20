@@ -95,11 +95,13 @@ different profiler and benchmark runs.
 
 Keep steady-decode traces away from request termination. Reserve output and
 context headroom beyond the traced completions and verify continuation counters
-during capture: reaching the output-budget guard intentionally drains overlap.
-That tail can expose CPU coordination and graph-launch gaps even when the timed
-window used normal overlap. Use separate labeled captures to study retirement.
-Correlate CPU graph launches with actual GPU graph intervals before treating a
-Gloo span as exposed latency; the next launch may already be queued behind work.
+during capture: a request that finishes inside the capture ends the chain and
+leaves one discarded successor step pending, and a continuation lease stops at
+the output limit. That tail can expose CPU coordination and graph-launch gaps
+even when the timed window used normal overlap. Use separate labeled captures
+to study retirement. Correlate CPU graph launches with actual GPU graph
+intervals before treating a Gloo span as exposed latency; the next launch may
+already be queued behind work.
 
 Use the evidence to choose the next experiment:
 

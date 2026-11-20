@@ -902,39 +902,38 @@ fn decode_continuation_transfers_writer_lease_and_commits_exact_feedback_depth()
 
 #[test]
 fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
-    for (prompt, limit) in [(vec![1; 124], 40), (vec![1], 4)] {
-        let mut engine = EngineCore::new(
-            RunnerConfig {
-                cache_layout: Some(
-                    KvLayout::new(
-                        8,
-                        vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
-                    )
-                    .unwrap(),
-                ),
-                max_accepted_per_step: 4,
-                ..Default::default()
-            },
-            4,
-            512,
-            SchedulerConfig::default(),
-            false,
-        )
-        .unwrap();
-        let mut model = Model::default();
-        engine.submit(input(prompt, limit)).unwrap();
-        engine.step(&mut model).unwrap();
-        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
-        assert!(!engine.retain_continuation(&plan));
-        assert!(engine.continuation_plan().unwrap().is_none());
-        let output = model.forward(plan);
-        let output = output
-            .as_ref()
-            .map(OwnedTokenRows::view)
-            .map_err(Clone::clone);
-        engine.complete_step_with(&mut model, output, Ok).unwrap();
-        engine.close(&mut model).unwrap();
-    }
+    let prompt = vec![1; 124];
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    8,
+                    vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            max_accepted_per_step: 4,
+            ..Default::default()
+        },
+        4,
+        512,
+        SchedulerConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    engine.submit(input(prompt, 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert!(!engine.retain_continuation(&plan));
+    assert!(engine.continuation_plan().unwrap().is_none());
+    let output = model.forward(plan);
+    let output = output
+        .as_ref()
+        .map(OwnedTokenRows::view)
+        .map_err(Clone::clone);
+    engine.complete_step_with(&mut model, output, Ok).unwrap();
+    engine.close(&mut model).unwrap();
 }
 
 fn cross_page_engine(prefix_cache: bool) -> EngineCore<&'static str> {
@@ -1891,7 +1890,7 @@ fn engine_sized_reservation_chains_without_allocating_or_inflating_outputs() {
 }
 
 #[test]
-fn falling_back_after_a_wide_lease_preserves_unused_owned_pages() {
+fn an_early_drain_keeps_the_wide_lease_and_its_owned_pages() {
     let mut engine = bounded_reservation_engine(40, 256);
     let mut model = Model::default();
     let request = engine.submit(input(vec![1; 58], 11)).unwrap();
@@ -1906,8 +1905,7 @@ fn falling_back_after_a_wide_lease_preserves_unused_owned_pages() {
     engine
         .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
         .unwrap();
-    // Drain early as a runtime could request. Two minimal accepted blocks move
-    // the next anchor to60. A normal span now ends64, before the old wide end70.
+    // Drain early as a runtime could request. The next anchor moves to 60.
     engine
         .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
         .unwrap();
@@ -1916,13 +1914,24 @@ fn falling_back_after_a_wide_lease_preserves_unused_owned_pages() {
         .unwrap()
         .unwrap();
     assert_eq!(next.context_lengths, [60]);
-    assert_eq!(next.cache_groups[0].block_indptr, [0, 16]);
-    assert!(!engine.retain_continuation(&next));
+    assert_eq!(next.cache_groups[0].block_indptr, [0, 18]);
+    assert!(engine.retain_continuation(&next));
+    let mut token = 5;
+    while engine.has_continuation() {
+        engine.continuation_plan().unwrap().unwrap();
+        engine
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[token], &[0, 1]), Ok)
+            .unwrap();
+        token += 1;
+    }
     engine
-        .complete_step_with(&mut model, TokenRows::new(&[5], &[0, 1]), Ok)
+        .complete_step_with(&mut model, TokenRows::new(&[token], &[0, 1]), Ok)
         .unwrap();
     engine.close(&mut model).unwrap();
-    assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5]);
+    assert_eq!(
+        request.take_result().unwrap(),
+        (2..=10).collect::<Vec<u32>>()
+    );
     assert_eq!(engine.cache_free_parent_count(), Some(40));
 }
 
@@ -2020,6 +2029,92 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         assert_eq!(metrics.aborted_requests, 0);
         assert_eq!(metrics.decode_tokens, u64::from(stop - 1));
     }
+}
+
+#[test]
+fn a_length_limit_reached_in_a_continuation_discards_the_successor_and_keeps_pages() {
+    for limit in [2, 3, 4] {
+        let mut engine = stop_overlap_engine();
+        let mut model = Model::default();
+        let request = engine.submit(input(vec![1], limit)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        assert!(engine.retain_continuation(&plan), "limit {limit}");
+        engine.continuation_plan().unwrap().unwrap();
+        let leased = engine.cache_free_parent_count();
+
+        let events = engine
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5], &[0, 3]), Ok)
+            .unwrap();
+        let last = limit as u32 + 1;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.token_id)
+                .collect::<Vec<_>>(),
+            (3..=last).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events.last().unwrap().finish_reason,
+            Some(resin_core::engine::CompletionReason::Length)
+        );
+        assert!(request.done());
+        assert_eq!(
+            request.take_result().unwrap(),
+            (2..=last).collect::<Vec<_>>()
+        );
+        assert!(engine.has_in_flight_step());
+        assert!(engine.continuation_plan().unwrap().is_none());
+        assert_eq!(engine.cache_free_parent_count(), leased);
+        assert!(model.released.is_empty());
+
+        let discarded = engine
+            .complete_step_with(
+                &mut model,
+                TokenRows::new(&[100, 101, 102, 103], &[0, 4]),
+                Ok,
+            )
+            .unwrap();
+        assert!(discarded.is_empty());
+        assert_eq!(model.released, [request.id()]);
+        assert_eq!(engine.cache_free_parent_count(), Some(8));
+        assert!(!engine.has_work());
+    }
+}
+
+#[test]
+fn rows_finishing_by_length_mid_chain_match_synchronous_output() {
+    let limits = [3, 6, 7, 40];
+    let run = |overlapped: bool| {
+        let mut engine = overlap_engine(64, 4);
+        let mut model = Model::default();
+        let requests = limits
+            .iter()
+            .map(|&limit| engine.submit(input(vec![1; 8], limit)).unwrap())
+            .collect::<Vec<_>>();
+        let continuations = if overlapped {
+            run_overlapped(&mut engine, &mut model)
+        } else {
+            while engine.has_work() {
+                engine.step(&mut model).unwrap();
+            }
+            0
+        };
+        assert!(!engine.has_work());
+        assert_eq!(engine.cache_free_parent_count(), Some(64));
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, continuations)
+    };
+    let (reference, _) = run(false);
+    let (overlapped, continuations) = run(true);
+    assert_eq!(overlapped, reference);
+    for (result, limit) in overlapped.iter().zip(limits) {
+        assert_eq!(result.len(), limit);
+    }
+    assert!(continuations > 0);
 }
 
 #[test]
@@ -2566,29 +2661,64 @@ fn waiting_chunk_backfill_never_retracts_an_in_progress_running_prefill() {
     assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 0);
 }
 
-#[test]
-fn overlap_admission_skips_wide_lookahead_while_requests_wait_in_queue() {
-    let mut engine = EngineCore::new(
+fn overlap_engine(capacity: u32, max_running: usize) -> EngineCore<&'static str> {
+    EngineCore::new(
         RunnerConfig {
             cache_layout: Some(
                 KvLayout::new(
-                    64,
+                    capacity,
                     vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
                 )
                 .unwrap(),
             ),
-            max_accepted_per_step: 4,
+            continuation_prefill: true,
+            max_accepted_per_step: 1,
             ..Default::default()
         },
-        1,
-        256,
+        max_running,
+        64,
         SchedulerConfig {
             schedule_conservativeness: 0.0,
             ..Default::default()
         },
         false,
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// Drive the Engine the way the Python adapter does, with a runner whose
+/// device runs one step ahead: it launches the continuation before the previous
+/// step is harvested.
+fn run_overlapped(engine: &mut EngineCore<&'static str>, model: &mut Model) -> usize {
+    let mut continuations = 0;
+    while engine.has_work() {
+        let Some(plan) = engine.prepare_overlap_step(model, None).unwrap() else {
+            break;
+        };
+        let chained = engine.retain_continuation(&plan);
+        let mut output = model.forward(plan).unwrap();
+        while chained && engine.has_continuation() {
+            let mut next = engine.continuation_plan().unwrap().unwrap();
+            next.token_ids = (0..output.view().len())
+                .map(|row| *output.view().row(row).last().unwrap())
+                .collect();
+            let following = model.forward(next).unwrap();
+            engine
+                .complete_continuing_step_with(model, Ok(output.view()), Ok)
+                .unwrap();
+            output = following;
+            continuations += 1;
+        }
+        engine
+            .complete_step_with(model, Ok(output.view()), Ok)
+            .unwrap();
+    }
+    continuations
+}
+
+#[test]
+fn a_waiting_request_the_running_limit_blocks_keeps_the_continuation() {
+    let mut engine = overlap_engine(64, 1);
     let mut model = Model::default();
     engine.submit(input(vec![1; 10], 40)).unwrap();
     engine.submit(input(vec![10; 10], 40)).unwrap();
@@ -2597,8 +2727,285 @@ fn overlap_admission_skips_wide_lookahead_while_requests_wait_in_queue() {
         .prepare_overlap_step(&mut model, None)
         .unwrap()
         .unwrap();
+    // The wide lease holds a full history page of progress for the chain.
     assert_eq!(plan.cache_groups[0].block_indptr, [0, 4]);
-    assert!(!engine.retain_continuation(&plan));
+    assert!(engine.retain_continuation(&plan));
+    assert!(engine.has_continuation());
+    assert!(engine.continuation_plan().unwrap().is_some());
+}
+
+/// One running request holds most of the pool; the waiting prompt cannot fit.
+fn kv_blocked_engine() -> (EngineCore<&'static str>, Model) {
+    let mut engine = overlap_engine(8, 4);
+    let mut model = Model::default();
+    let mut running = input(vec![1; 8], 20);
+    running.stop_token_ids = vec![99];
+    engine.submit(running).unwrap();
+    engine.step(&mut model).unwrap();
+    engine.submit(input(vec![5; 28], 2)).unwrap();
+    (engine, model)
+}
+
+#[test]
+fn a_waiting_request_kv_cannot_hold_does_not_stop_decode_overlap() {
+    let (mut engine, mut model) = kv_blocked_engine();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.token_indptr, [0, 1], "only the running request steps");
+    assert!(engine.retain_continuation(&plan));
+    for step in 0..3 {
+        let next = engine.continuation_plan().unwrap().unwrap();
+        assert_eq!(next.sequence_ids, plan.sequence_ids, "step {step}");
+        engine
+            .complete_continuing_step_with(&mut model, TokenRows::new(&[3 + step], &[0, 1]), Ok)
+            .unwrap();
+        assert!(engine.has_continuation(), "step {step}");
+    }
+}
+
+#[test]
+fn a_new_arrival_the_pool_can_hold_drains_the_continuation() {
+    let mut engine = overlap_engine(64, 4);
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 8], 40)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    engine.submit(input(vec![5; 8], 2)).unwrap();
+    assert!(!engine.has_continuation());
+    assert!(engine.continuation_plan().unwrap().is_none());
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
+        .unwrap();
+    assert!(!engine.has_continuation());
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
+        .unwrap();
+}
+
+#[test]
+fn a_new_arrival_the_pool_cannot_hold_leaves_the_continuation_in_place() {
+    let (mut engine, mut model) = kv_blocked_engine();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    engine.submit(input(vec![6; 28], 2)).unwrap();
+    assert!(engine.has_continuation());
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
+        .unwrap();
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
+        .unwrap();
+}
+
+#[test]
+fn pages_a_stop_frees_during_a_blocked_overlap_admit_the_waiting_request() {
+    let (mut engine, mut model) = kv_blocked_engine();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    let free_before = engine.cache_free_parent_count();
+    // The in-flight step samples the stop token. The row finishes logically,
+    // but its pages stay pinned for the successor already on the device.
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[99], &[0, 1]), Ok)
+        .unwrap();
+    assert!(!engine.has_continuation());
+    assert!(engine.continuation_plan().unwrap().is_none());
+    assert_eq!(engine.cache_free_parent_count(), free_before);
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[7], &[0, 1]), Ok)
+        .unwrap();
+    assert!(engine.cache_free_parent_count() > free_before);
+    let admitted = engine.prepare_step(&mut model, None).unwrap().unwrap();
+    assert_eq!(
+        admitted.token_indptr,
+        [0, 28],
+        "the waiting prompt runs next"
+    );
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[6], &[0, 1]), Ok)
+        .unwrap();
+}
+
+#[test]
+fn blocked_overlap_with_retractions_matches_synchronous_output() {
+    let run = |overlap: bool| {
+        let mut engine = overlap_engine(10, 4);
+        engine.enable_metrics().unwrap();
+        let mut model = Model::default();
+        let requests: Vec<_> = (0..6u32)
+            .map(|index| {
+                engine
+                    .submit(input(vec![10 * (index + 1); 6 + index as usize], 14))
+                    .unwrap()
+            })
+            .collect();
+        if overlap {
+            let continued = run_overlapped(&mut engine, &mut model);
+            assert!(continued > 0, "the pressure workload never overlapped");
+        } else {
+            while engine.has_work() {
+                engine.step(&mut model).unwrap();
+            }
+        }
+        assert_eq!(engine.cache_free_parent_count(), Some(10));
+        let retracted = engine.metrics_snapshot().unwrap().retracted_requests;
+        engine.close(&mut model).unwrap();
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, retracted)
+    };
+    let (overlapped, retracted) = run(true);
+    assert!(retracted > 0, "the workload never retracted");
+    assert_eq!(overlapped, run(false).0);
+}
+
+fn paged_overlap_engine(block: u32, capacity: u32, max_running: usize) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![KvGroupLayout::new(block, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 1,
+            ..Default::default()
+        },
+        max_running,
+        4096,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_continuation_lease_ends_at_its_owned_pages_and_the_chain_drains() {
+    let mut engine = paged_overlap_engine(128, 64, 4);
+    let mut model = Model::default();
+    let request = engine.submit(input(vec![1; 100], 400)).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 2]);
+    assert!(engine.retain_continuation(&plan));
+    let mut output = model.forward(plan).unwrap();
+    let mut chain = 0;
+    while engine.has_continuation() {
+        let mut next = engine.continuation_plan().unwrap().unwrap();
+        next.token_ids = vec![*output.view().row(0).last().unwrap()];
+        let following = model.forward(next).unwrap();
+        engine
+            .complete_continuing_step_with(&mut model, Ok(output.view()), Ok)
+            .unwrap();
+        output = following;
+        chain += 1;
+    }
+    // The lease ends at its last owned page boundary, 256 tokens in. Decoding
+    // starts near token 101, so the chain runs about 155 steps; 60 is the
+    // smallest span.
+    assert!(
+        (60..=156).contains(&chain),
+        "the chain ran {chain} continuations"
+    );
+    assert!(engine.continuation_plan().unwrap().is_none());
+    engine
+        .complete_step_with(&mut model, Ok(output.view()), Ok)
+        .unwrap();
+    // The next step leases again and a second chain follows.
+    assert!(run_overlapped(&mut engine, &mut model) > chain);
+    assert_eq!(request.take_result().unwrap().len(), 400);
+    assert_eq!(engine.cache_free_parent_count(), Some(64));
+}
+
+#[test]
+fn a_continuation_lease_steps_down_from_a_full_page_as_the_pool_tightens() {
+    // Pages leased to the first overlapped decode step, by prompt length and
+    // pool size, with 128-token pages.
+    for (prompt, capacity, pages) in [
+        // A spare page is available: a full page of look-ahead crosses two
+        // boundaries from the last position of a page.
+        (127, 64, 3),
+        // No spare page: the 32-token span still crosses one boundary.
+        (127, 2, 2),
+        (100, 2, 2),
+        // Nothing spare: the narrow lease stays inside the owned page.
+        (100, 1, 1),
+    ] {
+        let mut engine = paged_overlap_engine(128, capacity, 4);
+        let mut model = Model::default();
+        engine.submit(input(vec![1; prompt], 400)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine
+            .prepare_overlap_step(&mut model, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.cache_groups[0].block_indptr,
+            [0, pages],
+            "prompt {prompt}, {capacity} pages"
+        );
+    }
+}
+
+#[test]
+fn retraction_between_bounded_leases_matches_synchronous_output() {
+    let run = |overlap: bool| {
+        let mut engine = paged_overlap_engine(16, 30, 8);
+        engine.enable_metrics().unwrap();
+        let mut model = Model::default();
+        let requests: Vec<_> = (0..6u32)
+            .map(|index| {
+                engine
+                    .submit(input(vec![10 * (index + 1); 20 + index as usize], 150))
+                    .unwrap()
+            })
+            .collect();
+        let continued = if overlap {
+            run_overlapped(&mut engine, &mut model)
+        } else {
+            while engine.has_work() {
+                engine.step(&mut model).unwrap();
+            }
+            0
+        };
+        assert_eq!(engine.cache_free_parent_count(), Some(30));
+        let retracted = engine.metrics_snapshot().unwrap().retracted_requests;
+        engine.close(&mut model).unwrap();
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, retracted, continued)
+    };
+    let (overlapped, retracted, continued) = run(true);
+    assert!(retracted > 0, "the workload never retracted");
+    assert!(continued > 0, "the workload never overlapped");
+    assert_eq!(overlapped, run(false).0);
 }
 
 fn pressure_engine(
@@ -2824,4 +3231,96 @@ fn capacity_failure_is_reported_by_the_cohort_preflight_without_partial_growth()
         "{message}"
     );
     assert!(!request.done());
+}
+
+/// Prints how many decode steps overlap for a saturated 8k-prompt, 1k-output
+/// workload shaped like the TPU benchmark: 320 requests, 256-token pages, about
+/// 150 rows at once. Run with `cargo test --release --test engine
+/// saturated_overlap_report -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn saturated_overlap_report() {
+    const SATURATED_ROWS: usize = 145;
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    4900,
+                    vec![KvGroupLayout::new(256, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 1,
+            ..Default::default()
+        },
+        320,
+        9216,
+        SchedulerConfig {
+            max_batch_tokens: Some(NonZeroU32::new(4096).unwrap()),
+            prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
+            schedule_conservativeness: 1.0,
+        },
+        false,
+    )
+    .unwrap();
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let mut seed = 12345u64;
+    let mut draw = |low: u64, high: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        low + (seed >> 33) % (high - low + 1)
+    };
+    for _ in 0..320 {
+        let prompt = draw(6554, 8192) as usize;
+        let output = draw(819, 1024) as usize;
+        engine.submit(input(vec![1; prompt], output)).unwrap();
+    }
+    let (mut synchronous, mut overlapped, mut prefill) = (0u64, 0u64, 0u64);
+    let (mut saturated_synchronous, mut saturated_overlapped) = (0u64, 0u64);
+    while engine.has_work() {
+        let Some(plan) = engine.prepare_overlap_step(&mut model, None).unwrap() else {
+            break;
+        };
+        let decode = plan.phase == resin_core::Phase::Decode;
+        if !decode {
+            prefill += 1;
+        } else {
+            synchronous += 1;
+            saturated_synchronous += u64::from(plan.sequence_ids.len() >= SATURATED_ROWS);
+        }
+        let chained = engine.retain_continuation(&plan);
+        let mut output = model.forward(plan).unwrap();
+        while chained && engine.has_continuation() {
+            let mut next = engine.continuation_plan().unwrap().unwrap();
+            overlapped += 1;
+            saturated_overlapped += u64::from(next.sequence_ids.len() >= SATURATED_ROWS);
+            next.token_ids = (0..output.view().len())
+                .map(|row| *output.view().row(row).last().unwrap())
+                .collect();
+            let following = model.forward(next).unwrap();
+            engine
+                .complete_continuing_step_with(&mut model, Ok(output.view()), Ok)
+                .unwrap();
+            output = following;
+        }
+        engine
+            .complete_step_with(&mut model, Ok(output.view()), Ok)
+            .unwrap();
+    }
+    let saturated = saturated_synchronous + saturated_overlapped;
+    println!(
+        "prefill steps {prefill}; decode steps {synchronous} synchronous, {overlapped} overlapped"
+    );
+    println!(
+        "saturated decode steps ({SATURATED_ROWS}+ rows): {saturated_synchronous} synchronous, \
+         {saturated_overlapped} overlapped ({:.1}% overlapped)",
+        100.0 * saturated_overlapped as f64 / saturated as f64
+    );
+    println!(
+        "retractions {}",
+        engine.metrics_snapshot().unwrap().retracted_requests
+    );
 }
