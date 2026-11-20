@@ -640,6 +640,10 @@ class TestFp8Weights:
                 "resin.backend.tpu.kernels.fp8_matmul.get_tpu_version", return_value=7
             ),
             mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.get_tpu_version",
+                return_value=7,
+            ),
+            mock.patch(
                 "resin.backend.tpu.kernels.ragged_paged_attention.get_tpu_version",
                 return_value=7,
             ),
@@ -732,10 +736,12 @@ class TestFp8Weights:
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
                     if mode == "xla":
                         assert "fp8_w8a8_matmul_" not in mlir_txt
-                    elif mode == "auto" and tokens in (8, 320):
-                        assert f"fp8_w8a8_matmul_{tokens}_1280_4096" in mlir_txt
+                        assert "fp8_w8a8_async_ar_" not in mlir_txt
+                        assert "stablehlo.all_reduce" in mlir_txt
+                    elif mode in ("auto", "pallas") and tokens <= 320:
+                        assert f"fp8_w8a8_async_ar_{tokens}_1280_4096" in mlir_txt
                         assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
-                        assert f"fp8_w8a8_matmul_{tokens}_512_12800_b3" in mlir_txt
+                        assert f"fp8_w8a8_async_ar_{tokens}_512_12800_b3" in mlir_txt
                         scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
                         custom_calls = [
                             line
@@ -761,6 +767,10 @@ class TestFp8Weights:
                             assert sizes and all(
                                 size <= max_vmem_bytes for size in sizes
                             )
+                        assert "stablehlo.all_reduce" not in mlir_txt
+                    elif mode == "auto" and tokens == 384:
+                        assert "fp8_w8a8_async_ar_" not in mlir_txt
+                        assert "stablehlo.all_reduce" in mlir_txt
                     elif mode == "auto" and tokens == 1024:
                         assert "fp8_gate_up_swiglu_" not in mlir_txt
                         assert "fp8_w8a8_matmul_" not in mlir_txt
@@ -804,7 +814,9 @@ class TestFp8Weights:
         )
         hd_model.save_pretrained(hd128_dir)
 
-        def _run_mode(tp: int, mode: DecodeMatmulMode) -> list[float]:
+        def _run_mode(
+            tp: int, mode: DecodeMatmulMode, *, async_ar: bool = True
+        ) -> list[float]:
             mesh = make_mesh(tp, devices)
             m, p = load_model(
                 hd128_dir,
@@ -814,6 +826,7 @@ class TestFp8Weights:
                 kv_dtype=jnp.float8_e4m3fn,
             )
             m.decode_matmul_mode = mode
+            m.decode_async_all_reduce = async_ar
             m._force_fused_qkv_pack_interpret = True
             m._force_decode_pallas_interpret = mode in ("auto", "pallas")
             m.impl = _ft.partial(
@@ -837,8 +850,12 @@ class TestFp8Weights:
                 from resin.backend.tpu.metadata import empty_inputs
 
                 dec_inp = r._put(empty_inputs(Bucket(8, 8), r.pages_per_seq))
-                dec_jaxpr = jax.make_jaxpr(m.hidden_states)(p, r._arena.caches, dec_inp)
-                assert "pmax" not in str(dec_jaxpr)
+                dec_jaxpr_txt = str(
+                    jax.make_jaxpr(m.hidden_states)(p, r._arena.caches, dec_inp)
+                )
+                assert "pmax" not in dec_jaxpr_txt
+                if mode in ("auto", "pallas") and async_ar:
+                    assert "psum" not in dec_jaxpr_txt
             with closing(
                 Engine(
                     r,
@@ -862,9 +879,11 @@ class TestFp8Weights:
             return [ev.logprobs.logprob for ev in evs if ev.logprobs is not None]
 
         tp1_ref = _run_mode(1, "pallas")
-        for mode in ("pallas", "xla"):
-            tp2_lps = _run_mode(2, mode)
-            np.testing.assert_allclose(tp2_lps, tp1_ref, rtol=2e-2, atol=5e-2)
+        tp2_psum_lps = _run_mode(2, "pallas", async_ar=False)
+        tp2_async_lps = _run_mode(2, "pallas", async_ar=True)
+        np.testing.assert_array_equal(tp2_async_lps, tp2_psum_lps)
+        for lps in (tp2_async_lps, _run_mode(2, "xla")):
+            np.testing.assert_allclose(lps, tp1_ref, rtol=2e-2, atol=5e-2)
 
     def test_logits_track_the_reference(self, checkpoint) -> None:
         directory, reference = checkpoint

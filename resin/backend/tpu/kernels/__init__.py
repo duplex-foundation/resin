@@ -1,5 +1,11 @@
 """Shared Pallas and XLA kernels for the Resin TPU backend."""
 
+from resin.backend.tpu.kernels.collective_fp8_matmul import (
+    estimate_async_ar_vmem_bytes,
+    get_async_ar_tile_sizes,
+    pallas_fp8_row_matmul_async_ar,
+    sharded_fp8_row_matmul_async_ar,
+)
 from resin.backend.tpu.kernels.fp8_matmul import (
     Fp8MatmulTileSizes,
     Fp8Weight,
@@ -54,10 +60,12 @@ __all__ = [
     "RpaCase",
     "apply_rope",
     "build_rope_cache",
+    "estimate_async_ar_vmem_bytes",
     "fp8_matmul",
     "fp8_matmul_prequantized",
     "fused_add_rms_norm",
     "fused_add_rms_norm_fp8_quant",
+    "get_async_ar_tile_sizes",
     "get_default_block_sizes",
     "get_kv_cache_shape",
     "get_rpa_block_sizes",
@@ -67,6 +75,7 @@ __all__ = [
     "pack_outputs",
     "pallas_fp8_gate_up_swiglu",
     "pallas_fp8_matmul",
+    "pallas_fp8_row_matmul_async_ar",
     "pallas_qk_norm_rope_pack",
     "pallas_qkv_norm_rope_pack",
     "pallas_rms_norm_fp8_quant",
@@ -83,6 +92,7 @@ __all__ = [
     "sharded_fp8_matmul",
     "sharded_fp8_matmul_all_gather",
     "sharded_fp8_matmul_reduce_scatter",
+    "sharded_fp8_row_matmul_async_ar",
     "unpack_prepared_inputs",
     "xla_fp8_gate_up_swiglu",
     "xla_fp8_matmul",
