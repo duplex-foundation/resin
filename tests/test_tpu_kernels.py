@@ -1459,13 +1459,25 @@ class TestFp8Matmul:
         monkeypatch.setattr(pl, "pallas_call", _spy_pallas_call)
 
         rng = np.random.default_rng(4096)
-        x = jnp.asarray(rng.standard_normal((512, 10240)) * 0.2, jnp.bfloat16)
+        x = jnp.asarray(rng.standard_normal((2048, 10240)) * 0.2, jnp.bfloat16)
         weight = quantize_fp8_weight(
             jnp.asarray(rng.standard_normal((256, 10240)) * 0.05, jnp.bfloat16)
         )
-        tile_sizes = Fp8MatmulTileSizes(512, 128, 2560)
+        tile_sizes = Fp8MatmulTileSizes(1024, 128, 2560)
 
-        # 5 MiB x_q_scratch (> 4 MiB old cap, <= 16 MiB cap): allocates scratch and matches XLA.
+        # Below 2048 padded tokens the 4 MiB cap still applies: 5 MiB stays uncached.
+        fp8_mod.pallas_fp8_matmul(
+            x[:512],
+            weight.qvalue,
+            weight.scale,
+            tile_sizes=Fp8MatmulTileSizes(512, 128, 2560),
+            interpret=True,
+        )
+        assert len(captured_scratch) == 1
+        assert captured_scratch[0][1] is None
+        captured_scratch.clear()
+
+        # 10 MiB x_q_scratch at 2048 padded tokens (> 4 MiB old cap, <= 16 MiB cap): allocates scratch and matches XLA.
         y_cached = fp8_mod.pallas_fp8_matmul(
             x,
             weight.qvalue,
