@@ -2912,10 +2912,10 @@ fn a_continuation_lease_ends_at_its_owned_pages_and_the_chain_drains() {
         .unwrap()
         .unwrap();
     assert_eq!(plan.cache_groups[0].block_indptr, [0, 2]);
-    assert!(engine.retain_continuation(&plan));
+    let chained = engine.retain_continuation(&plan);
     let mut output = model.forward(plan).unwrap();
     let mut chain = 0;
-    while engine.has_continuation() {
+    while chained && engine.has_continuation() {
         let mut next = engine.continuation_plan().unwrap().unwrap();
         next.token_ids = vec![*output.view().row(0).last().unwrap()];
         let following = model.forward(next).unwrap();
@@ -2950,10 +2950,11 @@ fn a_continuation_lease_steps_down_from_a_full_page_as_the_pool_tightens() {
         // A spare page is available: a full page of look-ahead crosses two
         // boundaries from the last position of a page.
         (127, 64, 3),
-        // No spare page: the 32-token span still crosses one boundary.
+        // One spare page: the row on a boundary takes it, and a row with
+        // 27 tokens left in its page takes it for the widest span that fits.
         (127, 2, 2),
         (100, 2, 2),
-        // Nothing spare: the narrow lease stays inside the owned page.
+        // No spare page: the narrow lease stays inside the owned page.
         (100, 1, 1),
     ] {
         let mut engine = paged_overlap_engine(128, capacity, 4);
@@ -3006,6 +3007,195 @@ fn retraction_between_bounded_leases_matches_synchronous_output() {
     assert!(retracted > 0, "the workload never retracted");
     assert!(continued > 0, "the workload never overlapped");
     assert_eq!(overlapped, run(false).0);
+}
+
+/// Pages each running row owns in the plan, in row order.
+fn pages_per_row(plan: &ExecutionPlan<&'static str>) -> Vec<u32> {
+    plan.cache_groups[0]
+        .block_indptr
+        .windows(2)
+        .map(|range| range[1] - range[0])
+        .collect()
+}
+
+/// Prefills `prompts`, then returns the first overlapped decode plan.
+fn first_overlapped_plan(
+    engine: &mut EngineCore<&'static str>,
+    model: &mut Model,
+    prompts: &[usize],
+    output_limit: usize,
+) -> ExecutionPlan<&'static str> {
+    for &prompt in prompts {
+        engine.submit(input(vec![1; prompt], output_limit)).unwrap();
+    }
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(model).unwrap();
+    }
+    engine.prepare_overlap_step(model, None).unwrap().unwrap()
+}
+
+/// Drains the first chain of overlapped steps, if the plan allows one, and returns
+/// its continuations.
+fn run_first_chain(
+    engine: &mut EngineCore<&'static str>,
+    model: &mut Model,
+    plan: ExecutionPlan<&'static str>,
+) -> usize {
+    let chained = engine.retain_continuation(&plan);
+    let mut output = model.forward(plan).unwrap();
+    let mut chain = 0;
+    while chained && engine.has_continuation() {
+        let mut next = engine.continuation_plan().unwrap().unwrap();
+        next.token_ids = (0..output.view().len())
+            .map(|row| *output.view().row(row).last().unwrap())
+            .collect();
+        let following = model.forward(next).unwrap();
+        engine
+            .complete_continuing_step_with(model, Ok(output.view()), Ok)
+            .unwrap();
+        output = following;
+        chain += 1;
+    }
+    assert!(engine.continuation_plan().unwrap().is_none());
+    engine
+        .complete_step_with(model, Ok(output.view()), Ok)
+        .unwrap();
+    chain
+}
+
+#[test]
+fn a_continuation_lease_pins_only_boundary_rows_when_a_fixed_span_exceeds_capacity() {
+    // One row sits on a page boundary and one is 27 tokens short of it. The pool
+    // has three pages, each row owns one, and one is free. A 32-token span needs
+    // a page for both rows and fails. The widest span that fits, 27 tokens, gives
+    // the first row its next page and keeps the second inside the page it owns.
+    let mut engine = paged_overlap_engine(128, 3, 2);
+    let mut model = Model::default();
+    let plan = first_overlapped_plan(&mut engine, &mut model, &[127, 100], 400);
+    assert_eq!(plan.cache_groups[0].block_indptr, [0, 2, 3]);
+    assert_eq!(engine.cache_free_parent_count(), Some(0));
+    // The second row's page ends at token 128, so the chain runs until it is
+    // within a step of that boundary.
+    let chain = run_first_chain(&mut engine, &mut model, plan);
+    assert_eq!(chain, 27);
+    engine.close(&mut model).unwrap();
+}
+
+#[test]
+fn binary_search_continuation_lease_uses_all_available_headroom_across_staggered_rows() {
+    // Rows sit 1, 2, 3, 4 and 12 tokens short of a 16-token page boundary.
+    // Three pages are free: enough to pin the three rows closest to a boundary,
+    // not the fourth.
+    let prompts = [15, 14, 13, 12, 4];
+    let run = |overlap: bool| {
+        let mut engine = paged_overlap_engine(16, 8, 8);
+        let mut model = Model::default();
+        let requests: Vec<_> = prompts
+            .iter()
+            .map(|&prompt| engine.submit(input(vec![1; prompt], 40)).unwrap())
+            .collect();
+        let mut chain = 0;
+        if overlap {
+            while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+                engine.step(&mut model).unwrap();
+            }
+            let plan = engine
+                .prepare_overlap_step(&mut model, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pages_per_row(&plan), [2, 2, 2, 1, 1]);
+            assert_eq!(engine.cache_free_parent_count(), Some(0));
+            // The unpinned row at 12 reaches the end of its page after three steps.
+            chain = run_first_chain(&mut engine, &mut model, plan);
+            run_overlapped(&mut engine, &mut model);
+        }
+        while engine.has_work() {
+            engine.step(&mut model).unwrap();
+        }
+        assert_eq!(engine.cache_free_parent_count(), Some(8));
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, chain)
+    };
+    let (overlapped, chain) = run(true);
+    assert_eq!(chain, 3);
+    assert_eq!(overlapped, run(false).0);
+}
+
+#[test]
+fn the_lease_never_asks_for_a_page_a_full_pool_cannot_give() {
+    // Every page is owned. Only the row on a boundary can ask for a spare page,
+    // and none exists, so the lease stays inside the pages the rows own.
+    let mut engine = paged_overlap_engine(16, 5, 8);
+    let mut model = Model::default();
+    let plan = first_overlapped_plan(&mut engine, &mut model, &[15, 14, 13, 12, 4], 40);
+    assert_eq!(pages_per_row(&plan), [1, 1, 1, 1, 1]);
+    assert_eq!(engine.cache_free_parent_count(), Some(0));
+}
+
+#[test]
+fn speculative_boundary_leases_between_the_floor_and_a_full_page_match_synchronous_output() {
+    // Four-token acceptance with a sliding window and 16-token pages. Five rows
+    // sit 1, 4, 8, 12 and 16 tokens short of a page boundary. A full lease needs
+    // 27 pages and the floor needs 20, so pools between the two can pin some rows
+    // and not others. PR #24's ladder offers only those two extremes.
+    const PROMPTS: [usize; 5] = [63, 60, 56, 52, 48];
+    let run = |capacity: u32, overlap: bool| {
+        let mut engine = speculative_window_engine(capacity);
+        let mut model = Model::default();
+        let requests: Vec<_> = PROMPTS
+            .iter()
+            .map(|&prompt| engine.submit(input(vec![1; prompt], 12)).unwrap())
+            .collect();
+        let mut leased = Vec::new();
+        if overlap {
+            while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+                engine.step(&mut model).unwrap();
+            }
+            let plan = engine
+                .prepare_overlap_step(&mut model, None)
+                .unwrap()
+                .unwrap();
+            leased = pages_per_row(&plan);
+            run_first_chain(&mut engine, &mut model, plan);
+            run_overlapped(&mut engine, &mut model);
+        }
+        while engine.has_work() {
+            engine.step(&mut model).unwrap();
+        }
+        assert_eq!(engine.cache_free_parent_count(), Some(capacity as usize));
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, leased)
+    };
+    let mut leases = Vec::new();
+    for capacity in 42..=52 {
+        let (overlapped, leased) = run(capacity, true);
+        assert_eq!(overlapped, run(capacity, false).0, "capacity {capacity}");
+        assert_eq!(leased.len(), PROMPTS.len(), "capacity {capacity}");
+        leases.push(leased);
+    }
+    for pair in leases.windows(2) {
+        assert!(
+            pair[0]
+                .iter()
+                .zip(&pair[1])
+                .all(|(narrow, wide)| narrow <= wide),
+            "{pair:?}"
+        );
+    }
+    let narrowest = leases.first().unwrap();
+    let widest = leases.last().unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease != narrowest && lease != widest),
+        "no pool size produced a partial lease: {leases:?}"
+    );
 }
 
 fn pressure_engine(
@@ -3233,19 +3423,33 @@ fn capacity_failure_is_reported_by_the_cohort_preflight_without_partial_growth()
     assert!(!request.done());
 }
 
-/// Prints how many decode steps overlap for a saturated 8k-prompt, 1k-output
-/// workload shaped like the TPU benchmark: 320 requests, 256-token pages, about
-/// 150 rows at once. Run with `cargo test --release --test engine
-/// saturated_overlap_report -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn saturated_overlap_report() {
-    const SATURATED_ROWS: usize = 145;
+struct SaturatedReport {
+    saturated_synchronous: u64,
+    saturated_overlapped: u64,
+    retractions: u64,
+}
+
+impl SaturatedReport {
+    fn overlapped_percent(&self) -> f64 {
+        100.0 * self.saturated_overlapped as f64
+            / (self.saturated_synchronous + self.saturated_overlapped) as f64
+    }
+}
+
+/// Runs 320 requests of 256-token pages and counts decode steps that start with
+/// `saturated(rows, free_pages)` true, split by whether they overlap.
+fn saturated_workload(
+    capacity: u32,
+    context: u32,
+    prompts: (u64, u64),
+    outputs: (u64, u64),
+    saturated: impl Fn(usize, usize) -> bool,
+) -> SaturatedReport {
     let mut engine = EngineCore::new(
         RunnerConfig {
             cache_layout: Some(
                 KvLayout::new(
-                    4900,
+                    capacity,
                     vec![KvGroupLayout::new(256, 1, KvRetention::FullContext).unwrap()],
                 )
                 .unwrap(),
@@ -3255,7 +3459,7 @@ fn saturated_overlap_report() {
             ..Default::default()
         },
         320,
-        9216,
+        context,
         SchedulerConfig {
             max_batch_tokens: Some(NonZeroU32::new(4096).unwrap()),
             prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
@@ -3267,20 +3471,21 @@ fn saturated_overlap_report() {
     engine.enable_metrics().unwrap();
     let mut model = Model::default();
     let mut seed = 12345u64;
-    let mut draw = |low: u64, high: u64| {
+    let mut draw = |(low, high): (u64, u64)| {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         low + (seed >> 33) % (high - low + 1)
     };
     for _ in 0..320 {
-        let prompt = draw(6554, 8192) as usize;
-        let output = draw(819, 1024) as usize;
+        let prompt = draw(prompts) as usize;
+        let output = draw(outputs) as usize;
         engine.submit(input(vec![1; prompt], output)).unwrap();
     }
     let (mut synchronous, mut overlapped, mut prefill) = (0u64, 0u64, 0u64);
     let (mut saturated_synchronous, mut saturated_overlapped) = (0u64, 0u64);
     while engine.has_work() {
+        let free = engine.cache_free_parent_count().unwrap();
         let Some(plan) = engine.prepare_overlap_step(&mut model, None).unwrap() else {
             break;
         };
@@ -3289,14 +3494,15 @@ fn saturated_overlap_report() {
             prefill += 1;
         } else {
             synchronous += 1;
-            saturated_synchronous += u64::from(plan.sequence_ids.len() >= SATURATED_ROWS);
+            saturated_synchronous += u64::from(saturated(plan.sequence_ids.len(), free));
         }
         let chained = engine.retain_continuation(&plan);
         let mut output = model.forward(plan).unwrap();
         while chained && engine.has_continuation() {
+            let free = engine.cache_free_parent_count().unwrap();
             let mut next = engine.continuation_plan().unwrap().unwrap();
             overlapped += 1;
-            saturated_overlapped += u64::from(next.sequence_ids.len() >= SATURATED_ROWS);
+            saturated_overlapped += u64::from(saturated(next.sequence_ids.len(), free));
             next.token_ids = (0..output.view().len())
                 .map(|row| *output.view().row(row).last().unwrap())
                 .collect();
@@ -3310,17 +3516,86 @@ fn saturated_overlap_report() {
             .complete_step_with(&mut model, Ok(output.view()), Ok)
             .unwrap();
     }
-    let saturated = saturated_synchronous + saturated_overlapped;
+    let report = SaturatedReport {
+        saturated_synchronous,
+        saturated_overlapped,
+        retractions: engine.metrics_snapshot().unwrap().retracted_requests,
+    };
     println!(
         "prefill steps {prefill}; decode steps {synchronous} synchronous, {overlapped} overlapped"
     );
     println!(
-        "saturated decode steps ({SATURATED_ROWS}+ rows): {saturated_synchronous} synchronous, \
-         {saturated_overlapped} overlapped ({:.1}% overlapped)",
-        100.0 * saturated_overlapped as f64 / saturated as f64
+        "saturated decode steps: {} synchronous, {} overlapped ({:.1}% overlapped)",
+        report.saturated_synchronous,
+        report.saturated_overlapped,
+        report.overlapped_percent()
     );
-    println!(
-        "retractions {}",
-        engine.metrics_snapshot().unwrap().retracted_requests
-    );
+    println!("retractions {}", report.retractions);
+    report
+}
+
+/// Prints how many decode steps overlap for a saturated 8k-prompt, 1k-output
+/// workload shaped like the TPU benchmark: 320 requests, 256-token pages, about
+/// 150 rows at once. Run with `cargo test --release --test engine
+/// saturated_overlap_report -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn saturated_overlap_report() {
+    const SATURATED_ROWS: usize = 145;
+    let report = saturated_workload(4900, 9216, (6554, 8192), (819, 1024), |rows, _| {
+        rows >= SATURATED_ROWS
+    });
+    assert!(report.overlapped_percent() >= 93.0);
+}
+
+/// The 1k-prompt, 8k-output counterpart: the pool fills with decoders, nothing
+/// is admitted, and a boundary lookahead keeps the chain alive. Saturated steps
+/// are those with at most 2% of the 4,868-slab pool free. Run with `cargo test
+/// --release --test engine saturated_1k8k_overlap_report -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn saturated_1k8k_overlap_report() {
+    const SATURATED_FREE_SLABS: usize = 97;
+    let report = saturated_workload(4868, 9216, (819, 1024), (6554, 8192), |_, free| {
+        free <= SATURATED_FREE_SLABS
+    });
+    assert!(report.overlapped_percent() >= 94.0);
+}
+
+fn speculative_window_engine(capacity: u32) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![
+                        KvGroupLayout::new(16, 1, KvRetention::FullContext).unwrap(),
+                        KvGroupLayout::new(
+                            16,
+                            1,
+                            KvRetention::SlidingWindow {
+                                tokens: NonZeroU32::new(60).unwrap(),
+                            },
+                        )
+                        .unwrap()
+                        .with_read_window_tokens(16)
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            max_accepted_per_step: 4,
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        8,
+        512,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap()
 }

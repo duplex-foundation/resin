@@ -460,6 +460,52 @@ def test_cancel_survivor_drains_terminal_peer_without_losing_other_events():
     runner.shutdown()
 
 
+class OneTokenRunner(AsyncRunner):
+    runner_config = RunnerConfig(
+        cache_layout=CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(16)]),
+        max_accepted_per_step=1,
+    )
+
+    def enqueue(self, plan, *, feedback=None):
+        self.plans.append(plan)
+        tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
+        positions = plan.positions.tolist() if feedback is None else feedback.positions
+        rows = [[int(token) + 1] for token in tokens]
+        completion = Completion(
+            forward_output(rows),
+            Feedback(
+                [row[-1] for row in rows], [position + 1 for position in positions]
+            ),
+        )
+        self.pending.append(completion)
+        return completion
+
+
+def test_tight_pool_pins_only_boundary_rows_and_keeps_the_chain_running():
+    # Rows sit 1, 2, 3, 4 and 12 tokens short of a 16-token page boundary, and
+    # three of the eight pages are free. A lease that asked every row for a
+    # spare page would not fit, so the lease must reach only the boundary rows.
+    outputs = []
+    for overlap in (False, True):
+        runner = OneTokenRunner()
+        engine = Engine(runner, enable_overlap=overlap, max_running_requests=8)
+        requests = [
+            engine.submit(
+                [1] * length, sampling_params=SamplingParams(max_output_tokens=5)
+            )
+            for length in (15, 14, 13, 12, 4)
+        ]
+        while engine.has_work():
+            engine.step()
+        outputs.append([request.take_result() for request in requests])
+        if overlap:
+            assert engine.overlap_stats[1] >= 3
+        assert engine.cache_free_parent_count == 8
+        engine.close()
+        runner.shutdown()
+    assert outputs[0] == outputs[1]
+
+
 def test_gpu_feedback_matches_reference_across_page_and_budget_drains():
     outputs = []
     for overlap in (False, True):

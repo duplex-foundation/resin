@@ -199,8 +199,10 @@ limit or the KV admission estimate leaves no room. A request that becomes
 admissible, a stop token or output limit, cancellation, close, and the end of the
 continuation lease drain pending work before changing ownership. The lease
 covers a full history page of progress plus the write envelope, rounded up to
-whole pages. If the pool cannot reserve that for every row, the lease covers 32
-tokens, then only the write envelope. A request that reaches
+whole pages. If the pool cannot reserve that for every row, the lease covers the
+widest span the free pool allows, down to one continuation step and then only
+the write envelope. A wider span adds a page only to rows near a page boundary.
+A request that reaches
 `max_output_tokens` finishes like a stop token: its successor step still runs and
 the Engine discards that step's output. Other steps, including prefill, use the
 synchronous path. `enable_overlap=False` disables
