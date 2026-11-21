@@ -1,9 +1,12 @@
 """Shared Pallas and XLA kernels for the Resin TPU backend."""
 
 from resin.backend.tpu.kernels.collective_fp8_matmul import (
+    can_use_sp_async_rs,
     estimate_async_ar_vmem_bytes,
     get_async_ar_tile_sizes,
+    local_fp8_row_matmul_async_rs,
     pallas_fp8_row_matmul_async_ar,
+    pallas_fp8_row_matmul_async_rs,
     sharded_fp8_row_matmul_async_ar,
 )
 from resin.backend.tpu.kernels.fp8_matmul import (
@@ -60,6 +63,7 @@ __all__ = [
     "RpaCase",
     "apply_rope",
     "build_rope_cache",
+    "can_use_sp_async_rs",
     "estimate_async_ar_vmem_bytes",
     "fp8_matmul",
     "fp8_matmul_prequantized",
@@ -71,11 +75,13 @@ __all__ = [
     "get_rpa_block_sizes",
     "get_tuned_block_sizes",
     "get_vmem_estimate_bytes",
+    "local_fp8_row_matmul_async_rs",
     "merge_kv",
     "pack_outputs",
     "pallas_fp8_gate_up_swiglu",
     "pallas_fp8_matmul",
     "pallas_fp8_row_matmul_async_ar",
+    "pallas_fp8_row_matmul_async_rs",
     "pallas_qk_norm_rope_pack",
     "pallas_qkv_norm_rope_pack",
     "pallas_rms_norm_fp8_quant",

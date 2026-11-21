@@ -17,7 +17,10 @@ from resin.backend.tpu.kernels.fp8_matmul import (
     _DEVICE_VMEM_LIMIT,
     Fp8MatmulTileSizes,
     MatmulBackend,
+    _estimate_vmem_limit_bytes,
+    _fp8_matmul_pallas_kernel,
     _scale_shard_spec,
+    _should_save_x_q,
     _validate_matmul_shapes,
     _validate_x_scale_args,
     get_tuned_block_sizes,
@@ -568,9 +571,427 @@ def sharded_fp8_row_matmul_async_ar(
     )(x, w, w_scale)
 
 
+_HBM_PIPELINED_MIN_HALF_TOKENS = 1024
+
+
+def _can_emit_tpu7x_pipeline() -> bool:
+    from jax._src import tpu_info
+
+    try:
+        return tpu_info.get_tpu_info().generation >= 7
+    except Exception:
+        return False
+
+
+def can_use_sp_async_rs(
+    tokens: int,
+    *,
+    tp: int,
+    interpret: bool = False,
+) -> bool:
+    """Return whether TPU7x ``tp=2`` HBM-pipelined sequence-parallel async reduce-scatter applies."""
+    return (
+        tp == 2
+        and tokens % 2 == 0
+        and (tokens // tp) >= _HBM_PIPELINED_MIN_HALF_TOKENS
+        and (get_tpu_version() >= 7 or (interpret and _can_emit_tpu7x_pipeline()))
+    )
+
+
+def _pallas_fp8_row_matmul_async_rs_hbm_pipelined(
+    x_2d: jax.Array,
+    xs_or_abs_local: jax.Array,
+    w_local: jax.Array,
+    w_scale_rep: jax.Array,
+    *,
+    leading: tuple[int, ...],
+    x_ndim: int,
+    quantize_activation: bool,
+    tp_axis: str,
+    eff_reduce: jnp.dtype,
+    target_out_dtype: jnp.dtype,
+    tile_sizes: Fp8MatmulTileSizes | None,
+    collective_id: int,
+    return_partials_pair: bool,
+    is_interpret: bool,
+    interpret_arg: bool | pltpu.InterpretParams,
+) -> Any:
+    orig_batch, orig_k = x_2d.shape
+    if orig_batch % 2 != 0:
+        raise ValueError(
+            f"Expected even batch size for tp=2 reduce-scatter, got {orig_batch}"
+        )
+    orig_half = orig_batch // 2
+    orig_n = w_local.shape[0]
+    tpu_version = max(
+        get_tpu_version(), 7 if (is_interpret or _can_emit_tpu7x_pipeline()) else 0
+    )
+    if tile_sizes is None:
+        batch_block, out_block, in_block, w_buf = get_tuned_block_sizes(
+            orig_batch,
+            orig_n,
+            orig_k,
+            tpu_version=tpu_version,
+            quantize_activation=quantize_activation,
+        )
+        if eff_reduce.itemsize >= 4:
+            batch_block = min(batch_block, 512)
+        if orig_half < batch_block:
+            batch_block = align_to(max(8, orig_half), 8)
+    else:
+        batch_block, out_block, in_block, w_buf = tile_sizes
+
+    padded_half = align_to(orig_half, batch_block)
+    padded_n = align_to(orig_n, out_block)
+    padded_k = align_to(orig_k, in_block)
+    n_b_half = padded_half // batch_block
+    n_out = padded_n // out_block
+    n_in = padded_k // in_block
+    save_acc = n_in > 1
+    save_x_q = _should_save_x_q(
+        quantize_activation=quantize_activation,
+        n_batch=2 * n_b_half,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block,
+        out_block_size=out_block,
+        in_block_size=in_block,
+        x_dtype=x_2d.dtype,
+        x_q_dtype=w_local.dtype,
+        w_q_dtype=w_local.dtype,
+        out_dtype=eff_reduce,
+        save_acc=save_acc,
+        tpu_version=tpu_version,
+        w_buffer_count=w_buf,
+    )
+    x_q_scratch_shape = (
+        (batch_block, in_block) if n_in == 1 else (n_in, batch_block, in_block)
+    )
+    w_pipe = (
+        pl.Buffered(buffer_count=w_buf)
+        if w_buf != 2 and (n_out > 1 or n_in > 1)
+        else None
+    )
+
+    x_halves = x_2d.reshape(2, orig_half, orig_k)
+    if orig_half < padded_half or orig_k < padded_k:
+        x_halves = jnp.pad(
+            x_halves,
+            ((0, 0), (0, padded_half - orig_half), (0, padded_k - orig_k)),
+        )
+
+    xs_flat = xs_or_abs_local.astype(jnp.float32).reshape(2, orig_half)
+    if orig_half < padded_half:
+        xs_flat = jnp.pad(xs_flat, ((0, 0), (0, padded_half - orig_half)))
+    xs_halves = xs_flat.reshape(2, 1, padded_half)
+
+    if orig_n == padded_n and orig_k == padded_k:
+        w_in = w_local
+        ws_2d = jnp.expand_dims(w_scale_rep.astype(jnp.float32), axis=0)
+    else:
+        w_in = jnp.pad(w_local, ((0, padded_n - orig_n), (0, padded_k - orig_k)))
+        ws_2d = jnp.expand_dims(
+            jnp.pad(w_scale_rep.astype(jnp.float32), (0, padded_n - orig_n)), axis=0
+        )
+
+    inner_body = functools.partial(
+        _fp8_matmul_pallas_kernel,
+        x_q_dtype=w_in.dtype,
+        has_x_scale=True,
+        save_acc=save_acc,
+        save_x_q=save_x_q,
+    )
+
+    def _kernel(
+        x_hbm: Any,
+        xs_hbm: Any,
+        w_hbm: Any,
+        ws_hbm: Any,
+        y_pair_hbm: Any,
+        p_recv_hbm: Any,
+        acc_ref: Any,
+        x_q_ref: Any,
+        s_sem: Any,
+        r_sem: Any,
+    ) -> None:
+        my_id = jax.lax.axis_index(tp_axis)
+        peer = 1 - my_id
+        barrier_sem = pltpu.get_barrier_semaphore()
+        pl.semaphore_signal(barrier_sem, 1, device_id={tp_axis: peer})
+        pl.semaphore_wait(barrier_sem, 1)
+        cp = pltpu.make_async_remote_copy(
+            src_ref=y_pair_hbm.at[0],
+            dst_ref=p_recv_hbm,
+            send_sem=s_sem,
+            recv_sem=r_sem,
+            device_id={tp_axis: peer},
+        )
+
+        def _phase(ph: jax.Array, _: None) -> None:
+            die = jnp.where(ph == 0, peer, my_id)
+            pltpu.emit_pipeline(
+                inner_body,
+                grid=(n_b_half, n_out, n_in),
+                in_specs=[
+                    pl.BlockSpec(
+                        (None, batch_block, in_block),
+                        lambda b, _o, i: (die, b, i),
+                    ),
+                    pl.BlockSpec(
+                        (out_block, in_block),
+                        lambda _b, o, i: (o, i),
+                        pipeline_mode=w_pipe,
+                    ),
+                    pl.BlockSpec(
+                        (1, out_block),
+                        lambda _b, o, _i: (0, o),
+                        pipeline_mode=w_pipe if n_out > 1 else None,
+                    ),
+                    pl.BlockSpec(
+                        (None, 1, batch_block),
+                        lambda b, _o, _i: (die, 0, b),
+                    ),
+                ],
+                out_specs=pl.BlockSpec(
+                    (None, batch_block, out_block),
+                    lambda b, o, _i: (ph, b, o),
+                ),
+                dimension_semantics=(
+                    pltpu.PARALLEL,
+                    pltpu.ARBITRARY,
+                    pltpu.ARBITRARY,
+                ),
+            )(
+                x_hbm,
+                w_hbm,
+                ws_hbm,
+                xs_hbm,
+                y_pair_hbm,
+                scratches=(acc_ref, x_q_ref),
+            )
+
+            @pl.when(ph == 0)
+            def _send_peer_partial() -> None:
+                cp.start()
+
+            return None
+
+        jax.lax.fori_loop(0, 2, _phase, None)
+        cp.wait_recv()
+        cp.wait_send()
+
+    vmem_limit_bytes = (
+        None
+        if is_interpret
+        else _estimate_vmem_limit_bytes(
+            n_batch=2 * n_b_half,
+            n_out=n_out,
+            n_in=n_in,
+            batch_block_size=batch_block,
+            out_block_size=out_block,
+            in_block_size=in_block,
+            x_dtype=x_halves.dtype,
+            x_q_dtype=w_in.dtype,
+            w_q_dtype=w_in.dtype,
+            out_dtype=eff_reduce,
+            save_acc=save_acc,
+            save_x_q=save_x_q,
+            tpu_version=tpu_version,
+            w_buffer_count=w_buf,
+        )
+    )
+    out_shapes: list[Any] = (
+        [
+            jax.ShapeDtypeStruct((2, padded_half, padded_n), eff_reduce),
+            jax.ShapeDtypeStruct((padded_half, padded_n), eff_reduce),
+        ]
+        if is_interpret
+        else [
+            pltpu.HBM((2, padded_half, padded_n), eff_reduce),
+            pltpu.HBM((padded_half, padded_n), eff_reduce),
+        ]
+    )
+    kernel = pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((batch_block, out_block), jnp.float32) if save_acc else None,
+                pltpu.VMEM(x_q_scratch_shape, w_in.dtype) if save_x_q else None,
+                pltpu.SemaphoreType.DMA(()),
+                pltpu.SemaphoreType.DMA(()),
+            ],
+            grid=(),
+        ),
+        out_shape=out_shapes,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            collective_id=collective_id,
+        ),
+        interpret=interpret_arg,
+        name=f"fp8_w8a8_async_rs_{batch_block}_{out_block}_{in_block}",
+    )
+
+    if not is_interpret:
+        x_halves = pltpu.with_memory_space_constraint(x_halves, pltpu.HBM)
+        xs_halves = pltpu.with_memory_space_constraint(xs_halves, pltpu.HBM)
+        w_in = pltpu.with_memory_space_constraint(w_in, pltpu.HBM)
+        ws_2d = pltpu.with_memory_space_constraint(ws_2d, pltpu.HBM)
+
+    y_pair, p_recv = kernel(x_halves, xs_halves, w_in, ws_2d)
+    if return_partials_pair:
+        if orig_half == padded_half and orig_n == padded_n and x_ndim == 2:
+            return y_pair, p_recv
+        y_pair_out = y_pair
+        p_recv_out = p_recv
+        if orig_half < padded_half or orig_n < padded_n:
+            y_pair_out = y_pair_out[:, :orig_half, :orig_n]
+            p_recv_out = p_recv_out[:orig_half, :orig_n]
+        if x_ndim != 2:
+            y_pair_out = y_pair_out.reshape(2, -1, *leading[1:], orig_n)
+            p_recv_out = p_recv_out.reshape(-1, *leading[1:], orig_n)
+        return y_pair_out, p_recv_out
+
+    reduced = y_pair[1] + p_recv
+    out_padded = (
+        reduced.astype(target_out_dtype) if target_out_dtype != eff_reduce else reduced
+    )
+    if orig_half == padded_half and orig_n == padded_n:
+        return (
+            out_padded if x_ndim == 2 else out_padded.reshape(-1, *leading[1:], orig_n)
+        )
+    out_trimmed = out_padded[:orig_half, :orig_n]
+    return out_trimmed if x_ndim == 2 else out_trimmed.reshape(-1, *leading[1:], orig_n)
+
+
+def pallas_fp8_row_matmul_async_rs(
+    x_local: jax.Array,
+    xs_or_abs_local: jax.Array,
+    w_local: jax.Array,
+    w_scale_rep: jax.Array,
+    *,
+    tp_axis: str = TP_AXIS,
+    out_dtype: Any = jnp.bfloat16,
+    reduce_dtype: Any | None = None,
+    tile_sizes: Fp8MatmulTileSizes | None = None,
+    collective_id: int = 0,
+    return_partials_pair: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
+) -> Any:
+    """Compute local row-parallel FP8 matmul and cross-die ``psum_scatter`` via remote HBM DMA."""
+    _validate_matmul_shapes(x_local.shape[-1], w_local, w_scale_rep)
+    quantize_activation = jnp.dtype(x_local.dtype) != jnp.dtype(w_local.dtype)
+    is_interpret = bool(interpret)
+    interpret_arg: bool | pltpu.InterpretParams = (
+        interpret
+        if isinstance(interpret, pltpu.InterpretParams)
+        else (pltpu.InterpretParams() if interpret else False)
+    )
+    if not _can_emit_tpu7x_pipeline() and get_tpu_version() < 7 and not is_interpret:
+        raise ValueError(
+            "pallas_fp8_row_matmul_async_rs requires TPU7x+ (v7x) or interpret=True"
+        )
+    tp_size = jax.lax.axis_size(tp_axis)
+    if tp_size != 2:
+        raise ValueError(
+            f"pallas_fp8_row_matmul_async_rs requires axis_size({tp_axis!r}) == 2, got {tp_size}"
+        )
+
+    leading = x_local.shape[:-1]
+    orig_k = x_local.shape[-1]
+    x_2d = x_local if x_local.ndim == 2 else x_local.reshape(-1, orig_k)
+    orig_batch = x_2d.shape[0]
+    if xs_or_abs_local.size != orig_batch:
+        raise ValueError(
+            f"Expected xs_or_abs_local with {orig_batch} elements, got {xs_or_abs_local.shape=}"
+        )
+    target_out_dtype = jnp.dtype(out_dtype)
+    eff_reduce = jnp.dtype(target_out_dtype if reduce_dtype is None else reduce_dtype)
+
+    return _pallas_fp8_row_matmul_async_rs_hbm_pipelined(
+        x_2d,
+        xs_or_abs_local,
+        w_local,
+        w_scale_rep,
+        leading=leading,
+        x_ndim=x_local.ndim,
+        quantize_activation=quantize_activation,
+        tp_axis=tp_axis,
+        eff_reduce=eff_reduce,
+        target_out_dtype=target_out_dtype,
+        tile_sizes=tile_sizes,
+        collective_id=collective_id,
+        return_partials_pair=return_partials_pair,
+        is_interpret=is_interpret,
+        interpret_arg=interpret_arg,
+    )
+
+
+def local_fp8_row_matmul_async_rs(
+    x_local: jax.Array,
+    w_local: jax.Array,
+    ws_rep: jax.Array,
+    *,
+    x_scale_local: jax.Array | None = None,
+    x_abs_max_local: jax.Array | None = None,
+    tp_axis: str = TP_AXIS,
+    out_dtype: Any = jnp.bfloat16,
+    reduce_dtype: Any | None = None,
+    tile_sizes: Fp8MatmulTileSizes | None = None,
+    collective_id: int = 0,
+    return_partials_pair: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
+) -> Any:
+    """Per-shard body for SP row-parallel FP8 matmul + async remote-copy reduce-scatter."""
+    quantize_activation = jnp.dtype(x_local.dtype) != jnp.dtype(w_local.dtype)
+    _validate_x_scale_args(quantize_activation, x_scale_local, x_abs_max_local)
+    orig_batch = x_local.reshape(-1, x_local.shape[-1]).shape[0]
+
+    if not quantize_activation:
+        eff_aux = (
+            jnp.ones((1, orig_batch), dtype=jnp.float32)
+            if x_scale_local is None
+            else x_scale_local
+        )
+    elif x_abs_max_local is not None:
+        eff_aux = x_abs_max_local
+    else:
+        eff_aux = jnp.max(
+            jnp.abs(x_local.reshape(orig_batch, -1).astype(jnp.float32)),
+            axis=-1,
+        )[None, :]
+
+    return pallas_fp8_row_matmul_async_rs(
+        x_local,
+        eff_aux,
+        w_local,
+        ws_rep,
+        tp_axis=tp_axis,
+        out_dtype=out_dtype,
+        reduce_dtype=reduce_dtype,
+        tile_sizes=tile_sizes,
+        collective_id=collective_id,
+        return_partials_pair=return_partials_pair,
+        interpret=interpret,
+    )
+
+
 __all__ = [
+    "can_use_sp_async_rs",
     "estimate_async_ar_vmem_bytes",
     "get_async_ar_tile_sizes",
+    "local_fp8_row_matmul_async_rs",
     "pallas_fp8_row_matmul_async_ar",
+    "pallas_fp8_row_matmul_async_rs",
     "sharded_fp8_row_matmul_async_ar",
 ]

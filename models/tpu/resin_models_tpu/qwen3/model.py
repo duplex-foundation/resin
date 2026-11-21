@@ -18,6 +18,7 @@ gathering 1-byte FP8 normalized activations via ``all_gather``.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple
@@ -39,8 +40,12 @@ from resin.backend.tpu.kernels import (
     Fp8Weight,
     MatmulBackend,
     apply_rope,
+    can_use_sp_async_rs,
+    fp8_matmul,
     fused_add_rms_norm,
     fused_add_rms_norm_fp8_quant,
+    local_fp8_row_matmul_async_rs,
+    pallas_fp8_gate_up_swiglu,
     pallas_qkv_norm_rope_pack,
     pallas_unpack_attn_fp8_quant,
     rms_norm,
@@ -50,6 +55,7 @@ from resin.backend.tpu.kernels import (
     sharded_fp8_matmul_all_gather,
     sharded_fp8_matmul_reduce_scatter,
     sharded_fp8_row_matmul_async_ar,
+    xla_fp8_gate_up_swiglu,
 )
 from resin.backend.tpu.kernels._rpa_v3_pallas import get_tpu_version
 from resin.backend.tpu.mesh import TP_AXIS, tp_size
@@ -62,6 +68,14 @@ TOKENS_SHARDED = P(TP_AXIS, None)
 _PREFILL_MATMUL_MIN_TOKENS = 512
 _DECODE_PALLAS_MAX_TOKENS = 320
 _ASYNC_AR_MIN_HIDDEN_SIZE = 256
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
 
 DecodeMatmulMode = Literal[
     "auto",
@@ -131,6 +145,9 @@ class Qwen3Model:
     decode_matmul_mode: DecodeMatmulMode = "auto"
     decode_async_all_reduce: bool = True
     fuse_unpack_attn_quant: bool = True
+    prefill_sp_async_rs: bool = field(
+        default_factory=lambda: _env_bool("RESIN_TPU_PREFILL_SP_ASYNC_RS", True)
+    )
     sequence_parallel_min_tokens: int = _PREFILL_MATMUL_MIN_TOKENS
     _force_fused_qkv_pack_interpret: bool = field(default=False, repr=False)
     _force_decode_pallas_interpret: bool = field(default=False, repr=False)
@@ -404,19 +421,318 @@ class Qwen3Model:
         )
         sp_sync_tp_scale = not per_die_scale
 
-        x = jax.shard_map(
-            lambda ids, emb: emb[ids],
-            mesh=self.mesh,
-            in_specs=(P(TP_AXIS), P()),
-            out_specs=TOKENS_SHARDED,
-        )(inputs.input_ids, params.embed)
-        act_dtype = x.dtype
+        act_dtype = jnp.dtype(params.embed.dtype)
         use_fused_unpack = (
             self.fuse_unpack_attn_quant
             and (get_tpu_version() >= 7 or pallas_interp)
             and self._can_use_fused_qkv_pack(act_dtype, params.rope_cache)
             and (q_width // tp) % 128 == 0
         )
+        use_sp_async_rs = (
+            self.prefill_sp_async_rs
+            and not sp_sync_tp_scale
+            and use_fused_unpack
+            and backend != "xla"
+            and can_use_sp_async_rs(tokens, tp=tp, interpret=pallas_interp)
+        )
+
+        if use_sp_async_rs:
+            num_layers = len(layers)
+            first_qkv = layers[0].qkv
+            assert isinstance(first_qkv, Fp8Weight)
+
+            def _ag_col_matmul(
+                xq_l: jax.Array,
+                xs_l: jax.Array,
+                w_q_l: jax.Array,
+                w_s_l: jax.Array,
+            ) -> jax.Array:
+                xq_full = jax.lax.all_gather(
+                    xq_l, axis_name=TP_AXIS, axis=0, tiled=True
+                )
+                xs_full = jax.lax.all_gather(
+                    xs_l, axis_name=TP_AXIS, axis=0, tiled=True
+                )
+                return fp8_matmul(
+                    xq_full,
+                    w_q_l,
+                    w_s_l,
+                    x_scale=xs_full,
+                    out_dtype=act_dtype,
+                    backend=backend,
+                    interpret=pallas_interp,
+                )
+
+            def _prologue_local(
+                ids_l: Any,
+                emb: jax.Array,
+                norm_w: jax.Array,
+                qkv_q_l: jax.Array,
+                qkv_s_l: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                x_l = emb[ids_l]
+                hq_l, hs_l = rms_norm_fp8_quant(
+                    x_l, norm_w, eps, interpret=pallas_interp
+                )
+                return x_l, _ag_col_matmul(hq_l, hs_l, qkv_q_l, qkv_s_l)
+
+            def _post_attn_mlp_local(
+                packed_l: jax.Array,
+                x_l: jax.Array,
+                o_q_l: jax.Array,
+                o_s_l: jax.Array,
+                post_norm_w: jax.Array,
+                gu_q_l: jax.Array,
+                gu_s_l: jax.Array,
+                down_q_l: jax.Array,
+                down_s_l: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                att_q_l, att_s_l = pallas_unpack_attn_fp8_quant(
+                    packed_l,
+                    group_size,
+                    config.head_dim,
+                    dtype=o_q_l.dtype,
+                    interpret=pallas_interp,
+                )
+                o_pair_l, o_peer_l = local_fp8_row_matmul_async_rs(
+                    att_q_l,
+                    o_q_l,
+                    o_s_l,
+                    x_scale_local=att_s_l,
+                    tp_axis=TP_AXIS,
+                    out_dtype=act_dtype,
+                    collective_id=0,
+                    return_partials_pair=True,
+                    interpret=pallas_interp,
+                )
+                mlp_q_l, mlp_s_l, x_mid_l = fused_add_rms_norm_fp8_quant(
+                    o_pair_l,
+                    x_l,
+                    post_norm_w,
+                    eps,
+                    extra_x=o_peer_l,
+                    x_pair_index=1,
+                    interpret=pallas_interp,
+                )
+                mlp_q_full = jax.lax.all_gather(
+                    mlp_q_l, axis_name=TP_AXIS, axis=0, tiled=True
+                )
+                mlp_s_full = jax.lax.all_gather(
+                    mlp_s_l, axis_name=TP_AXIS, axis=0, tiled=True
+                )
+                use_pallas_gu = backend == "pallas" or (
+                    backend == "auto"
+                    and (pallas_interp or get_tpu_version() >= 7)
+                    and gu_q_l.shape[1] % 128 == 0
+                    and (gu_q_l.shape[0] // 2) % 128 == 0
+                )
+                if use_pallas_gu:
+                    gated_l, local_abs_max = pallas_fp8_gate_up_swiglu(
+                        mlp_q_full,
+                        mlp_s_full,
+                        gu_q_l,
+                        gu_s_l,
+                        out_dtype=act_dtype,
+                        interpret=pallas_interp,
+                    )
+                    gated_absmax_l: jax.Array | None = jnp.max(
+                        local_abs_max, axis=0, keepdims=True
+                    )
+                else:
+                    gated_l = xla_fp8_gate_up_swiglu(
+                        mlp_q_full,
+                        mlp_s_full,
+                        gu_q_l,
+                        gu_s_l,
+                        out_dtype=act_dtype,
+                    )
+                    gated_absmax_l = None
+                down_pair_l, down_peer_l = local_fp8_row_matmul_async_rs(
+                    gated_l,
+                    down_q_l,
+                    down_s_l,
+                    x_abs_max_local=gated_absmax_l,
+                    tp_axis=TP_AXIS,
+                    out_dtype=act_dtype,
+                    collective_id=1,
+                    return_partials_pair=True,
+                    interpret=pallas_interp,
+                )
+                return down_pair_l, down_peer_l, x_mid_l
+
+            def _mid_layer_local(
+                packed_l: jax.Array,
+                x_l: jax.Array,
+                o_q_l: jax.Array,
+                o_s_l: jax.Array,
+                post_norm_w: jax.Array,
+                gu_q_l: jax.Array,
+                gu_s_l: jax.Array,
+                down_q_l: jax.Array,
+                down_s_l: jax.Array,
+                next_norm_w: jax.Array,
+                next_qkv_q_l: jax.Array,
+                next_qkv_s_l: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                down_pair_l, down_peer_l, x_mid_l = _post_attn_mlp_local(
+                    packed_l,
+                    x_l,
+                    o_q_l,
+                    o_s_l,
+                    post_norm_w,
+                    gu_q_l,
+                    gu_s_l,
+                    down_q_l,
+                    down_s_l,
+                )
+                hq_l, hs_l, x_next_l = fused_add_rms_norm_fp8_quant(
+                    down_pair_l,
+                    x_mid_l,
+                    next_norm_w,
+                    eps,
+                    extra_x=down_peer_l,
+                    x_pair_index=1,
+                    interpret=pallas_interp,
+                )
+                return x_next_l, _ag_col_matmul(hq_l, hs_l, next_qkv_q_l, next_qkv_s_l)
+
+            def _last_layer_local(
+                packed_l: jax.Array,
+                x_l: jax.Array,
+                o_q_l: jax.Array,
+                o_s_l: jax.Array,
+                post_norm_w: jax.Array,
+                gu_q_l: jax.Array,
+                gu_s_l: jax.Array,
+                down_q_l: jax.Array,
+                down_s_l: jax.Array,
+                final_norm_w: jax.Array,
+            ) -> jax.Array:
+                down_pair_l, down_peer_l, x_mid_l = _post_attn_mlp_local(
+                    packed_l,
+                    x_l,
+                    o_q_l,
+                    o_s_l,
+                    post_norm_w,
+                    gu_q_l,
+                    gu_s_l,
+                    down_q_l,
+                    down_s_l,
+                )
+                down_sum_l = (
+                    down_pair_l[1].astype(jnp.float32) + down_peer_l.astype(jnp.float32)
+                ).astype(act_dtype)
+                normed_l = fused_add_rms_norm(down_sum_l, x_mid_l, final_norm_w, eps)[0]
+                return jax.lax.all_gather(
+                    normed_l, axis_name=TP_AXIS, axis=0, tiled=True
+                )
+
+            x, qkv_out = jax.shard_map(
+                _prologue_local,
+                mesh=self.mesh,
+                in_specs=(P(TP_AXIS), P(), P(), COLUMN, P(TP_AXIS)),
+                out_specs=(TOKENS_SHARDED, ROW),
+                check_vma=False,
+            )(
+                inputs.input_ids,
+                params.embed,
+                layers[0].input_norm,
+                first_qkv.qvalue,
+                first_qkv.scale,
+            )
+            layer_caches = []
+            for idx, (weights, kv_cache) in enumerate(
+                zip(layers, caches[0], strict=True)
+            ):
+                assert isinstance(weights.o, Fp8Weight)
+                assert isinstance(weights.gate_up, Fp8Weight)
+                assert isinstance(weights.down, Fp8Weight)
+
+                att_packed, kv_cache = self._attend_qkv(
+                    qkv_out,
+                    weights,
+                    kv_cache,
+                    inputs,
+                    params.rope_cache,
+                    return_packed=True,
+                )
+                layer_caches.append(kv_cache)
+
+                if idx + 1 < num_layers:
+                    next_qkv = layers[idx + 1].qkv
+                    assert isinstance(next_qkv, Fp8Weight)
+                    x, qkv_out = jax.shard_map(
+                        _mid_layer_local,
+                        mesh=self.mesh,
+                        in_specs=(
+                            Q_PACKED_PARTITION,
+                            TOKENS_SHARDED,
+                            ROW,
+                            P(),
+                            P(),
+                            COLUMN,
+                            P(TP_AXIS),
+                            ROW,
+                            P(),
+                            P(),
+                            COLUMN,
+                            P(TP_AXIS),
+                        ),
+                        out_specs=(TOKENS_SHARDED, ROW),
+                        check_vma=False,
+                    )(
+                        att_packed,
+                        x,
+                        weights.o.qvalue,
+                        weights.o.scale,
+                        weights.post_norm,
+                        weights.gate_up.qvalue,
+                        weights.gate_up.scale,
+                        weights.down.qvalue,
+                        weights.down.scale,
+                        layers[idx + 1].input_norm,
+                        next_qkv.qvalue,
+                        next_qkv.scale,
+                    )
+                else:
+                    hidden = jax.shard_map(
+                        _last_layer_local,
+                        mesh=self.mesh,
+                        in_specs=(
+                            Q_PACKED_PARTITION,
+                            TOKENS_SHARDED,
+                            ROW,
+                            P(),
+                            P(),
+                            COLUMN,
+                            P(TP_AXIS),
+                            ROW,
+                            P(),
+                            P(),
+                        ),
+                        out_specs=P(None, None),
+                        check_vma=False,
+                    )(
+                        att_packed,
+                        x,
+                        weights.o.qvalue,
+                        weights.o.scale,
+                        weights.post_norm,
+                        weights.gate_up.qvalue,
+                        weights.gate_up.scale,
+                        weights.down.qvalue,
+                        weights.down.scale,
+                        params.norm,
+                    )
+
+            return hidden, (tuple(layer_caches),)
+
+        x = jax.shard_map(
+            lambda ids, emb: emb[ids],
+            mesh=self.mesh,
+            in_specs=(P(TP_AXIS), P()),
+            out_specs=TOKENS_SHARDED,
+        )(inputs.input_ids, params.embed)
 
         def _sharded_norm_quant(
             x_in: jax.Array, norm_w: jax.Array

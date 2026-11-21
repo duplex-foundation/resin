@@ -3468,6 +3468,204 @@ class TestDecodeMatmulPath:
         )
         np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
 
+    def test_async_rs_partials_pair_and_fused_add2_norm_bitwise_and_race_free(
+        self,
+    ) -> None:
+        from jax._src import tpu_info
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            fused_add_rms_norm_fp8_quant,
+            local_fp8_row_matmul_async_rs,
+            sharded_fp8_matmul_reduce_scatter,
+        )
+
+        devices = jax.devices("cpu")
+        if len(devices) < 2:
+            pytest.skip("requires at least 2 CPU devices")
+
+        mesh = make_mesh(2, devices)
+        row_sharding = NamedSharding(mesh, P(None, "tp"))
+        sp_sharding = NamedSharding(mesh, P("tp", None))
+        rep_sharding = NamedSharding(mesh, P())
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        tiles = Fp8MatmulTileSizes(8, 128, 128, 2)
+        rng = np.random.default_rng(20261121)
+
+        old_cpu = tpu_info.registry.get("cpu")
+        tpu_info.registry["cpu"] = lambda: v7x_info
+        try:
+            for dma_mode in ("on_wait", "eager"):
+                ip = pltpu.InterpretParams(
+                    detect_races=True, dma_execution_mode=dma_mode
+                )
+                for quantize_act in (False, True):
+                    t_total, k_full, n_out = 32, 512, 256
+                    res = jax.device_put(
+                        jnp.asarray(
+                            rng.standard_normal((t_total, n_out)), jnp.bfloat16
+                        ),
+                        sp_sharding,
+                    )
+                    norm_w = jax.device_put(
+                        jnp.asarray(rng.uniform(0.5, 1.5, size=(n_out,)), jnp.bfloat16),
+                        rep_sharding,
+                    )
+                    w = quantize_fp8_weight(
+                        jnp.asarray(
+                            rng.standard_normal((n_out, k_full)) * 0.05, jnp.bfloat16
+                        )
+                    )
+                    wq = jax.device_put(w.qvalue, row_sharding)
+                    ws = jax.device_put(w.scale, rep_sharding)
+
+                    if quantize_act:
+                        x_in = jax.device_put(
+                            jnp.asarray(
+                                rng.standard_normal((t_total, k_full)) * 0.3,
+                                jnp.bfloat16,
+                            ),
+                            row_sharding,
+                        )
+                        absmax_local = jnp.max(
+                            jnp.abs(
+                                x_in.reshape(t_total, 2, k_full // 2).astype(
+                                    jnp.float32
+                                )
+                            ),
+                            axis=-1,
+                        ).T
+                        x_aux = jax.device_put(absmax_local, sp_sharding)
+                        ref_rs = sharded_fp8_matmul_reduce_scatter(
+                            x_in,
+                            wq,
+                            ws,
+                            mesh=mesh,
+                            x_abs_max=x_aux,
+                            sync_tp_scale=False,
+                            out_dtype=jnp.bfloat16,
+                            backend="pallas",
+                            interpret=True,
+                        )
+                    else:
+                        x_in = jax.device_put(
+                            jnp.asarray(
+                                rng.standard_normal((t_total, k_full)),
+                                jnp.float8_e4m3fn,
+                            ),
+                            row_sharding,
+                        )
+                        x_aux = jax.device_put(
+                            jnp.asarray(
+                                rng.uniform(0.01, 0.05, size=(2, t_total)), jnp.float32
+                            ),
+                            sp_sharding,
+                        )
+                        ref_rs = sharded_fp8_matmul_reduce_scatter(
+                            x_in,
+                            wq,
+                            ws,
+                            mesh=mesh,
+                            x_scale=x_aux,
+                            sync_tp_scale=False,
+                            out_dtype=jnp.bfloat16,
+                            backend="pallas",
+                            interpret=True,
+                        )
+
+                    ref_q, ref_s, ref_next_res = jax.shard_map(
+                        lambda d, r, nw: fused_add_rms_norm_fp8_quant(
+                            d, r, nw, 1e-6, interpret=True
+                        ),
+                        mesh=mesh,
+                        in_specs=(P("tp", None), P("tp", None), P()),
+                        out_specs=(P("tp", None), P("tp", None), P("tp", None)),
+                        check_vma=False,
+                    )(ref_rs, res, norm_w)
+
+                    def _rs_only_local(xl, aux_l, wl, ws_rep, _qa=quantize_act, _ip=ip):
+                        kw = (
+                            {"x_abs_max_local": aux_l}
+                            if _qa
+                            else {"x_scale_local": aux_l}
+                        )
+                        return local_fp8_row_matmul_async_rs(
+                            xl,
+                            wl,
+                            ws_rep,
+                            tp_axis="tp",
+                            out_dtype=jnp.bfloat16,
+                            tile_sizes=tiles,
+                            return_partials_pair=True,
+                            interpret=_ip,
+                            **kw,
+                        )
+
+                    y_pair, y_peer = jax.block_until_ready(
+                        jax.jit(
+                            jax.shard_map(
+                                _rs_only_local,
+                                mesh=mesh,
+                                in_specs=(
+                                    P(None, "tp"),
+                                    P("tp", None),
+                                    P(None, "tp"),
+                                    P(),
+                                ),
+                                out_specs=(P("tp", None, None), P("tp", None)),
+                                check_vma=False,
+                            )
+                        )(x_in, x_aux, wq, ws)
+                    )
+                    assert interpret_pallas_call.races is not None
+                    assert bool(interpret_pallas_call.races.reads)
+                    assert not interpret_pallas_call.races.races_found
+
+                    cand_q, cand_s, cand_next_res = jax.block_until_ready(
+                        jax.jit(
+                            jax.shard_map(
+                                lambda yp, ypr, rl, nw, _ip=ip: (
+                                    fused_add_rms_norm_fp8_quant(
+                                        yp,
+                                        rl,
+                                        nw,
+                                        1e-6,
+                                        extra_x=ypr,
+                                        x_pair_index=1,
+                                        interpret=_ip,
+                                    )
+                                ),
+                                mesh=mesh,
+                                in_specs=(
+                                    P("tp", None, None),
+                                    P("tp", None),
+                                    P("tp", None),
+                                    P(),
+                                ),
+                                out_specs=(
+                                    P("tp", None),
+                                    P("tp", None),
+                                    P("tp", None),
+                                ),
+                                check_vma=False,
+                            )
+                        )(y_pair, y_peer, res, norm_w)
+                    )
+                    assert interpret_pallas_call.races is not None
+                    assert bool(interpret_pallas_call.races.reads)
+                    assert not interpret_pallas_call.races.races_found
+                    np.testing.assert_array_equal(np.asarray(cand_q), np.asarray(ref_q))
+                    np.testing.assert_array_equal(np.asarray(cand_s), np.asarray(ref_s))
+                    np.testing.assert_array_equal(
+                        np.asarray(cand_next_res), np.asarray(ref_next_res)
+                    )
+        finally:
+            if old_cpu is None:
+                tpu_info.registry.pop("cpu", None)
+            else:
+                tpu_info.registry["cpu"] = old_cpu
+
 
 @pytest.mark.skipif(
     jax.default_backend() != "tpu", reason="requires TPU Mosaic hardware"
