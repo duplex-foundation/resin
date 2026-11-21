@@ -749,7 +749,8 @@ class TestFp8Weights:
                         assert "fp8_w8a8_async_ar_" not in mlir_txt
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode in ("auto", "pallas") and tokens <= 320:
-                        assert f"fp8_w8a8_async_ar_{tokens}_1280_4096" in mlir_txt
+                        o_blk = 640 if tokens <= 192 else 1280
+                        assert f"fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3" in mlir_txt
                         assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
                         assert f"fp8_w8a8_async_ar_{tokens}_512_12800_b3" in mlir_txt
                         scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")

@@ -72,9 +72,8 @@ def _rms_norm_fp8_pallas_kernel(
 ) -> None:
     x_f32 = x_ref[...].astype(jnp.float32)
     var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
-    normed = (x_f32 * jax.lax.rsqrt(var + eps) * w_ref[...].astype(jnp.float32)).astype(
-        x_ref.dtype
-    )
+    w_f32 = w_ref[...].astype(jnp.float32)[None, :]
+    normed = (x_f32 * jax.lax.rsqrt(var + eps) * w_f32).astype(x_ref.dtype)
     normed_f32 = normed.astype(jnp.float32)
     absmax = jnp.max(jnp.abs(normed_f32), axis=-1, keepdims=True)
     scale = safe_fp8_scale(absmax, bound)
@@ -99,9 +98,8 @@ def _fused_add_rms_norm_fp8_pallas_kernel(
     next_res_ref[...] = next_res
     x_f32 = next_res.astype(jnp.float32)
     var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
-    normed = (x_f32 * jax.lax.rsqrt(var + eps) * w_ref[...].astype(jnp.float32)).astype(
-        x_ref.dtype
-    )
+    w_f32 = w_ref[...].astype(jnp.float32)[None, :]
+    normed = (x_f32 * jax.lax.rsqrt(var + eps) * w_f32).astype(x_ref.dtype)
     normed_f32 = normed.astype(jnp.float32)
     absmax = jnp.max(jnp.abs(normed_f32), axis=-1, keepdims=True)
     scale = safe_fp8_scale(absmax, bound)
@@ -180,11 +178,14 @@ def pallas_rms_norm_fp8_quant(
     if orig_batch < padded_batch:
         x_2d = jnp.pad(x_2d, ((0, padded_batch - orig_batch), (0, 0)))
 
-    w_2d = (
-        jnp.ones((1, k_dim), dtype=jnp.float32)
-        if weight is None
-        else weight.reshape(1, k_dim)
-    )
+    if weight is None:
+        w_1d = jnp.ones((k_dim,), dtype=jnp.float32)
+    elif weight.shape == (k_dim,):
+        w_1d = weight
+    elif weight.size == k_dim:
+        w_1d = weight.reshape(k_dim)
+    else:
+        raise ValueError(f"Expected weight with {k_dim} elements, got {weight.shape=}")
     n_batch = padded_batch // batch_block
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
     vmem_limit_bytes = _pallas_vmem_limit_bytes(interpret=interpret)
@@ -196,7 +197,7 @@ def pallas_rms_norm_fp8_quant(
                 num_scalar_prefetch=0,
                 in_specs=[
                     pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
-                    pl.BlockSpec((1, k_dim), lambda _b: (0, 0)),
+                    pl.BlockSpec((k_dim,), lambda _b: (0,)),
                 ],
                 out_specs=[
                     pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
@@ -215,7 +216,7 @@ def pallas_rms_norm_fp8_quant(
             interpret=pltpu.InterpretParams() if interpret else False,
             name=f"rms_norm_fp8_quant_{batch_block}_{k_dim}",
         )
-        x_q, scale_t = kernel(x_2d, w_2d)
+        x_q, scale_t = kernel(x_2d, w_1d)
         if orig_batch < padded_batch:
             x_q = x_q[:orig_batch]
             scale_t = scale_t[:, :orig_batch]
@@ -238,7 +239,7 @@ def pallas_rms_norm_fp8_quant(
             in_specs=[
                 pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
                 pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
-                pl.BlockSpec((1, k_dim), lambda _b: (0, 0)),
+                pl.BlockSpec((k_dim,), lambda _b: (0,)),
             ],
             out_specs=[
                 pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
@@ -259,7 +260,7 @@ def pallas_rms_norm_fp8_quant(
         interpret=pltpu.InterpretParams() if interpret else False,
         name=f"fused_add_rms_norm_fp8_quant_{batch_block}_{k_dim}",
     )
-    x_q, scale_t, next_res = fused_kernel(x_2d, res_2d, w_2d)
+    x_q, scale_t, next_res = fused_kernel(x_2d, res_2d, w_1d)
     if orig_batch < padded_batch:
         x_q = x_q[:orig_batch]
         scale_t = scale_t[:, :orig_batch]
@@ -503,8 +504,8 @@ def _process_and_store_qk_kv(
     kv_packing = get_dtype_packing(kv_dtype)
     kv_rows = align_to(2 * num_kv_heads, kv_packing) // kv_packing
 
-    qw_f32 = q_norm_w_ref[...].astype(jnp.float32)
-    kw_f32 = k_norm_w_ref[...].astype(jnp.float32)
+    qw_f32 = q_norm_w_ref[...].astype(jnp.float32)[None, :]
+    kw_f32 = k_norm_w_ref[...].astype(jnp.float32)[None, :]
     zero_q = jnp.zeros((bsz, 128), dtype=q_dtype)
     q_cos_rep = jnp.tile(cos_b, (group_size, 1))
     q_sin_rep = jnp.tile(sin_b, (group_size, 1))
@@ -763,8 +764,8 @@ def _run_qk_pack_pallas(
                 ),
                 pl.BlockSpec((batch_block, 128), lambda b: (b_idx(b), 0)),
                 pl.BlockSpec((batch_block, 128), lambda b: (b_idx(b), 0)),
-                pl.BlockSpec((1, 128), lambda _b: (0, 0)),
-                pl.BlockSpec((1, 128), lambda _b: (0, 0)),
+                pl.BlockSpec((128,), lambda _b: (0,)),
+                pl.BlockSpec((128,), lambda _b: (0,)),
                 pl.BlockSpec((128, 128), lambda _b: (0, 0)),
             ],
             out_specs=[
@@ -797,8 +798,8 @@ def _run_qk_pack_pallas(
         *tensor_inputs,
         cos_pos,
         sin_pos,
-        q_norm_w.reshape(1, 128),
-        k_norm_w.reshape(1, 128),
+        q_norm_w,
+        k_norm_w,
         perm_128,
     )
     if orig_t < padded_t:

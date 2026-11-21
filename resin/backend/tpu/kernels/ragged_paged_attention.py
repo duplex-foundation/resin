@@ -1417,6 +1417,23 @@ def ragged_paged_attention(
             scope_name += f"-sw_{sliding_window}"
 
         pin_hbm = tpu_version >= 7 and not interpret
+        scratch_est = get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            eff_head_dim,
+            bq_sz,
+            bkv_sz,
+            cur_q.dtype,
+            cur_cache.dtype,
+        )
+        case_vmem_limit = (
+            min(
+                vmem_limit_bytes,
+                max(16 * 1024 * 1024, 2 * scratch_est + 4 * 1024 * 1024),
+            )
+            if vmem_limit_bytes is not None
+            else None
+        )
         kernel = pl.pallas_call(
             functools.partial(
                 _ragged_paged_attention_kernel,
@@ -1455,7 +1472,7 @@ def ragged_paged_attention(
             ),
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=case_vmem_limit,
                 disable_bounds_checks=disable_bounds_checks,
                 disable_semaphore_checks=disable_semaphore_checks,
             ),

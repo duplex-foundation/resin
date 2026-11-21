@@ -1097,6 +1097,65 @@ class TestRpaDecodeBlockSizes:
                 atol=3e-2,
             )
 
+    def test_rpa_v3_case_vmem_limit_capped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        from jax._src import tpu_info
+        from jax.experimental import pallas as pl
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        assert v7x_info.vmem_capacity_bytes == 64 * 1024 * 1024
+
+        captured_calls: list[tuple[str, int | None]] = []
+        orig_pallas_call = pl.pallas_call
+
+        def _spy_pallas_call(*args: Any, **kwargs: Any) -> Any:
+            cp = kwargs.get("compiler_params")
+            captured_calls.append(
+                (kwargs.get("name", ""), getattr(cp, "vmem_limit_bytes", None))
+            )
+            return orig_pallas_call(*args, **kwargs)
+
+        monkeypatch.setattr(rpa_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(rpa_mod.pltpu, "get_tpu_info", lambda: v7x_info)
+        monkeypatch.setattr(pl, "pallas_call", _spy_pallas_call)
+
+        cache = jax.ShapeDtypeStruct(
+            get_kv_cache_shape(64, 256, 2, 128, jnp.float8_e4m3fn), jnp.float8_e4m3fn
+        )
+        q = jax.ShapeDtypeStruct((8, 16, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((8, 2, 128), jnp.float8_e4m3fn)
+        v = jax.ShapeDtypeStruct((8, 2, 128), jnp.float8_e4m3fn)
+        kv_lens = jax.ShapeDtypeStruct((8,), jnp.int32)
+        page_indices = jax.ShapeDtypeStruct((8 * 36,), jnp.int32)
+        cu_q_lens = jax.ShapeDtypeStruct((9,), jnp.int32)
+        dist = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+        _ = jax.make_jaxpr(
+            lambda q_i, k_i, v_i, c_i, kl_i, pi_i, cq_i, d_i: (
+                rpa_mod.ragged_paged_attention(
+                    q_i, k_i, v_i, c_i, kl_i, pi_i, cq_i, d_i, sm_scale=128**-0.5
+                )
+            )
+        )(q, k, v, cache, kv_lens, page_indices, cu_q_lens, dist)
+
+        rpad_calls = [
+            (name, vmem) for name, vmem in captured_calls if name.startswith("RPAd-")
+        ]
+        rpam_calls = [
+            (name, vmem) for name, vmem in captured_calls if name.startswith("RPAm-")
+        ]
+        assert rpad_calls and rpam_calls
+        assert rpad_calls[0][0] == "RPAd-p_256-bq_1_1-bkv_4096_4096"
+        for _name, vmem in rpad_calls + rpam_calls:
+            assert vmem is not None
+            assert 16 * 1024 * 1024 <= vmem <= 24 * 1024 * 1024
+
 
 def _qwix_reference_fp8_w8a8(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     """Independent Qwix symmetric absmax FP8 W8A8 reference (x: [T, K], w: [N, K])."""
@@ -1354,13 +1413,18 @@ class TestFp8Matmul:
             for n_out, n_in in tp2_shapes:
                 assert (batch, n_out, n_in) in _TPU7X_FP8_TUNED_BLOCKS
 
+        for bs in (8, 16, 32, 64, 96, 128, 160, 192):
+            assert get_tuned_block_sizes(
+                bs, 5120, 4096, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 640, 4096, 3)
+        for bs in (224, 256, 288, 320):
+            assert get_tuned_block_sizes(
+                bs, 5120, 4096, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 1280, 4096, 3)
         for bs in (288, 320):
             assert get_tuned_block_sizes(
                 bs, 5120, 5120, tpu_version=7, quantize_activation=False
             ) == Fp8MatmulTileSizes(bs, 1280, 5120)
-            assert get_tuned_block_sizes(
-                bs, 5120, 4096, tpu_version=7, quantize_activation=False
-            ) == Fp8MatmulTileSizes(bs, 1280, 4096)
             assert get_tuned_block_sizes(
                 bs, 5120, 12800, tpu_version=7, quantize_activation=False
             ) == Fp8MatmulTileSizes(bs, 512, 12800, 3)
@@ -1770,6 +1834,86 @@ class TestNormAndRope:
             )
         finally:
             counter.close()
+
+    @pytest.mark.parametrize("batch", [1, 7, 8, 33, 320])
+    @pytest.mark.parametrize("k_dim", [256, 5120])
+    def test_pallas_rms_norm_fp8_quant_1d_weight(self, batch: int, k_dim: int) -> None:
+        from resin.backend.tpu.kernels.norm_rope import (
+            pallas_qkv_norm_rope_pack,
+            pallas_rms_norm_fp8_quant,
+        )
+
+        rng = np.random.default_rng(1100 + batch * 17 + k_dim)
+        x = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        res = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        w_1d = jnp.asarray(rng.uniform(0.5, 1.5, size=(k_dim,)), jnp.bfloat16)
+
+        jaxpr_plain = jax.make_jaxpr(
+            lambda xi, wi: pallas_rms_norm_fp8_quant(
+                xi, wi, eps=1e-6, transposed_scale=True, interpret=True
+            )
+        )(x, w_1d)
+        assert not any(
+            e.primitive.name == "reshape" and e.invars[0].aval.shape == (k_dim,)
+            for e in jaxpr_plain.jaxpr.eqns
+        )
+
+        jaxpr_fused = jax.make_jaxpr(
+            lambda xi, ri, wi: pallas_rms_norm_fp8_quant(
+                xi, wi, eps=1e-6, residual=ri, transposed_scale=True, interpret=True
+            )
+        )(x, res, w_1d)
+        assert not any(
+            e.primitive.name == "reshape" and e.invars[0].aval.shape == (k_dim,)
+            for e in jaxpr_fused.jaxpr.eqns
+        )
+
+        xq, xs = pallas_rms_norm_fp8_quant(
+            x, w_1d, eps=1e-6, transposed_scale=True, interpret=True
+        )
+        xq_2d, xs_2d = pallas_rms_norm_fp8_quant(
+            x, w_1d.reshape(1, k_dim), eps=1e-6, transposed_scale=True, interpret=True
+        )
+        np.testing.assert_array_equal(np.asarray(xq), np.asarray(xq_2d))
+        np.testing.assert_array_equal(np.asarray(xs), np.asarray(xs_2d))
+
+        fxq, fxs, fnr = pallas_rms_norm_fp8_quant(
+            x, w_1d, eps=1e-6, residual=res, transposed_scale=True, interpret=True
+        )
+        fxq_2d, fxs_2d, fnr_2d = pallas_rms_norm_fp8_quant(
+            x,
+            w_1d.reshape(1, k_dim),
+            eps=1e-6,
+            residual=res,
+            transposed_scale=True,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(fnr), np.asarray(fnr_2d))
+        np.testing.assert_array_equal(np.asarray(fxq), np.asarray(fxq_2d))
+        np.testing.assert_array_equal(np.asarray(fxs), np.asarray(fxs_2d))
+
+        if k_dim == 5120 and batch in (1, 8):
+            cos_sin = build_rope_cache(64, 128)
+            pos = jnp.arange(batch, dtype=jnp.int32)
+            qw = jnp.ones((128,), dtype=jnp.bfloat16)
+            kw = jnp.ones((128,), dtype=jnp.bfloat16)
+            jaxpr_qkv = jax.make_jaxpr(
+                lambda qkv_i, qwi, kwi: pallas_qkv_norm_rope_pack(
+                    qkv_i,
+                    pos,
+                    cos_sin,
+                    qwi,
+                    kwi,
+                    jnp.float8_e4m3fn,
+                    num_q_heads=32,
+                    num_kv_heads=4,
+                    interpret=True,
+                )
+            )(x, qw, kw)
+            assert not any(
+                e.primitive.name == "reshape" and e.invars[0].aval.shape == (128,)
+                for e in jaxpr_qkv.jaxpr.eqns
+            )
 
 
 class TestPrefillKernels:

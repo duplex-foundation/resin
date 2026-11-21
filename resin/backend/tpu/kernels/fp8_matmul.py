@@ -134,7 +134,9 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
     for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
         table[(bs, 4096, 5120)] = Fp8MatmulTileSizes(bs, 1024, 5120)
         table[(bs, 512, 5120)] = Fp8MatmulTileSizes(bs, 512, 5120)
-        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(bs, 1280, 4096)
+        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(
+            bs, 640 if bs <= 192 else 1280, 4096, 3
+        )
         table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
         table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800, 3)
         table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
@@ -912,7 +914,7 @@ def pallas_fp8_matmul(
         pltpu.VMEM(x_q_scratch_shape, x_q_dtype) if save_x_q else None,
     ]
     grid = (n_batch, n_out, n_in)
-    dim_semantics = ("parallel", "arbitrary", "arbitrary")
+    dim_semantics: tuple[Any, ...] = ("parallel", "arbitrary", "arbitrary")
     kernel_body = functools.partial(
         _fp8_matmul_pallas_kernel,
         x_q_dtype=x_q_dtype,
