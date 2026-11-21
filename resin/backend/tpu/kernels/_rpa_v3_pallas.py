@@ -1633,7 +1633,7 @@ def _batched_decode_rpa_body(
         mask_fill: Any = jnp.asarray(mask_val, dtype=jnp.bfloat16)
         exp_fn = lax.exp2
     else:
-        mask_fill = cfgs.mask_value
+        mask_fill = jnp.asarray(cfgs.mask_value, dtype=qk.dtype)
         exp_fn = jnp.exp
 
     # Finite mask_fill guarantees finite m_next even on all-masked tiles; on the
@@ -1641,13 +1641,7 @@ def _batched_decode_rpa_body(
     # zeros carried-over finite l_prev / o_prev without extra vselect ops.
     skip_lo_reset = use_bf16_qkp
 
-    qk = jnp.stack(
-        [
-            jnp.where(masks[b_idx], qk[b_idx], mask_fill)
-            for b_idx in range(cfgs.batch_size)
-        ],
-        axis=0,
-    )
+    qk = jnp.where(jnp.stack(masks, axis=0), qk, mask_fill)
 
     m_reset = jnp.asarray(-jnp.inf, dtype=acc_dt)
     zero_acc = jnp.asarray(0.0, dtype=acc_dt)
@@ -1733,18 +1727,36 @@ def _init_batched_scratches(
     bkv_x3_ref: Any,
     *,
     interpret_mode: bool,
+    actual_steps: jax.Array | None = None,
 ) -> None:
     m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
     l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
-    if interpret_mode:
-        bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
-        bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
-    else:
-        q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        q_flat[...] = jnp.zeros_like(q_flat)
-        kv_flat[...] = jnp.zeros_like(kv_flat)
+    if actual_steps is None:
+        if interpret_mode:
+            bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
+            bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
+        else:
+            q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            q_flat[...] = jnp.zeros_like(q_flat)
+            kv_flat[...] = jnp.zeros_like(kv_flat)
+        return
+
+    active_slots = jnp.minimum(jnp.maximum(actual_steps, 0), _BATCHED_NUM_INPUT_SLOTS)
+
+    @pl.loop(0, active_slots)
+    def _zero_input_slot(slot: jax.Array) -> None:
+        if interpret_mode:
+            bq_x3_ref[slot] = jnp.zeros_like(bq_x3_ref[slot])
+            bkv_x3_ref[slot] = jnp.zeros_like(bkv_x3_ref[slot])
+        else:
+            q_slot = bq_x3_ref.at[slot].bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            kv_slot = (
+                bkv_x3_ref.at[slot].bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            )
+            q_slot[...] = jnp.zeros_like(q_slot)
+            kv_slot[...] = jnp.zeros_like(kv_slot)
 
 
 def _make_batched_q_o_dma(
@@ -2040,6 +2052,7 @@ def _batched_decode_rpa_pipeline(
         bq_x3_ref,
         bkv_x3_ref,
         interpret_mode=cfgs.interpret_mode,
+        actual_steps=schedule_hbm_ref.actual_steps[0],
     )
     copy_in_q, wait_in_q, copy_out_o, wait_out_o = _make_batched_q_o_dma(
         q_hbm_ref,
