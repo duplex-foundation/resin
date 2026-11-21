@@ -5189,8 +5189,11 @@ class TestTpuHardwareMosaic:
     def test_qwen3_tp2_mosaic_batched_decode_short_kv_and_b_lt_16(
         self, kv_dtype: jnp.dtype, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from resin.backend.tpu.kernels import ragged_paged_attention as rpa_mod
+        import importlib
 
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
         monkeypatch.setattr(rpa_mod, "_BATCHED_DECODE_MIN_SEQS", 1)
         (
             tp,
