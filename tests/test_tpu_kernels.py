@@ -3468,6 +3468,297 @@ class TestDecodeMatmulPath:
         )
         np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
 
+    def test_async_row_all_reduce_vmem_limit_tile_validation_and_fallbacks(
+        self,
+    ) -> None:
+        from unittest import mock
+
+        from resin.backend.tpu.kernels import (
+            MatmulBackend,
+            estimate_async_ar_vmem_bytes,
+            get_async_ar_tile_sizes,
+            pallas_fp8_row_matmul_async_ar,
+            quantize_fp8_act,
+            sharded_fp8_row_matmul_async_ar,
+        )
+        from resin.backend.tpu.kernels.collective_fp8_matmul import (
+            _fp8_row_matmul_async_ar_kernel,
+        )
+
+        devices = jax.devices()
+        if len(devices) < 2:
+            pytest.skip("requires at least 2 devices for tp=2 async all-reduce")
+
+        mesh_tp2 = make_mesh(2, devices[:2])
+        mesh_tp1 = make_mesh(1, devices[:1])
+        rng = np.random.default_rng(2027)
+
+        # 1. Dynamic vmem_limit_bytes sizing (estimate + 4 MiB slack, [8 MiB, 48 MiB] clamp).
+        captured_limits: list[int | None] = []
+
+        def _spy_pallas_call(
+            *args: object,
+            out_shape: jax.ShapeDtypeStruct,
+            compiler_params: object = None,
+            **kwargs: object,
+        ):
+            captured_limits.append(getattr(compiler_params, "vmem_limit_bytes", None))
+            return lambda *k_args: jnp.zeros(out_shape.shape, dtype=out_shape.dtype)
+
+        with (
+            mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.get_tpu_version",
+                return_value=7,
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.pl.pallas_call",
+                side_effect=_spy_pallas_call,
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.pltpu.with_memory_space_constraint",
+                side_effect=lambda arr, _ms: arr,
+            ),
+        ):
+            for bs, n_dim, k_local, tiles_override, exact_clamp in (
+                (8, 256, 128, None, 8 * 1024 * 1024),  # tiny -> 8 MiB floor
+                (160, 5120, 4096, None, None),  # o_proj B=160 (~19.07 MiB)
+                (320, 5120, 4096, None, None),  # o_proj B=320 (~24.64 MiB)
+                (160, 5120, 12800, None, None),  # down_proj B=160 (~29.56 MiB)
+                (320, 5120, 12800, None, None),  # down_proj B=320 (~36.04 MiB)
+                (
+                    320,
+                    4096,
+                    9216,
+                    Fp8MatmulTileSizes(320, 1024, 9216, 4),
+                    48 * 1024 * 1024,
+                ),  # 46.33 MiB + 4 MiB -> clamped to 48 MiB
+            ):
+                captured_limits.clear()
+                eff = (
+                    get_async_ar_tile_sizes(bs, n_dim, k_local)
+                    if tiles_override is None
+                    else tiles_override
+                )
+                n_out = n_dim // eff.out_block_size
+                est = estimate_async_ar_vmem_bytes(
+                    eff.batch_block_size,
+                    eff.out_block_size,
+                    eff.in_block_size,
+                    n_out,
+                    min(eff.w_buffer_count, n_out),
+                )
+                expected_limit = min(
+                    max(est + 4 * 1024 * 1024, 8 * 1024 * 1024), 48 * 1024 * 1024
+                )
+
+                @jax.jit
+                def _trace_vmem() -> jax.Array:
+                    xq = jnp.zeros((bs, 2 * k_local), jnp.float8_e4m3fn)
+                    xs = jnp.ones((2, bs), jnp.float32)
+                    wq = jnp.zeros((n_dim, 2 * k_local), jnp.float8_e4m3fn)
+                    ws = jnp.ones((n_dim,), jnp.float32)
+                    return jax.shard_map(
+                        lambda xql, xsl, wql, wsl: pallas_fp8_row_matmul_async_ar(
+                            xql, xsl, wql, wsl, tile_sizes=tiles_override
+                        ),
+                        mesh=mesh_tp2,
+                        in_specs=(P(None, "tp"), P("tp", None), P(None, "tp"), P()),
+                        out_specs=P(None, None),
+                        check_vma=False,
+                    )(xq, xs, wq, ws)
+
+                _ = _trace_vmem.lower()
+                assert captured_limits == [expected_limit]
+                if exact_clamp is not None:
+                    assert captured_limits == [exact_clamp]
+                if tiles_override is None and n_dim == 5120:
+                    assert expected_limit < 40 * 1024 * 1024
+
+        # 2. Explicit tile_sizes VMEM > 48 MiB and geometry validation.
+        strict_backends: tuple[MatmulBackend, ...] = ("auto", "pallas")
+        for bad_tiles in (
+            Fp8MatmulTileSizes(320, 2048, 12800, 2),  # > 48 MiB VMEM
+            Fp8MatmulTileSizes(8, 100, 128, 2),  # unaligned out_block
+            Fp8MatmulTileSizes(0, 128, 128, 2),  # non-positive batch_block
+            Fp8MatmulTileSizes(8, 128, 128, 1),  # w_buffer_count < 2
+            Fp8MatmulTileSizes(8, 256, 128, 2),  # n_out == 1 for N=256
+            Fp8MatmulTileSizes(8, 128, 128, 2),  # multi-K tile for local_k=256
+        ):
+            n_bad = 4096 if bad_tiles.out_block_size == 2048 else 256
+            k_local_bad = (
+                12800
+                if bad_tiles.in_block_size == 12800
+                else (256 if bad_tiles == Fp8MatmulTileSizes(8, 128, 128, 2) else 128)
+            )
+            bs_bad = max(8, bad_tiles.batch_block_size)
+            xq_b = jnp.zeros((bs_bad, 2 * k_local_bad), jnp.float8_e4m3fn)
+            xs_b = jnp.ones((2, bs_bad), jnp.float32)
+            wq_b = jnp.zeros((n_bad, 2 * k_local_bad), jnp.float8_e4m3fn)
+            ws_b = jnp.ones((n_bad,), jnp.float32)
+            for be in strict_backends:
+                with pytest.raises(ValueError):
+                    jax.jit(
+                        lambda: sharded_fp8_row_matmul_async_ar(
+                            xq_b,
+                            wq_b,
+                            ws_b,
+                            mesh=mesh_tp2,
+                            x_scale=xs_b,
+                            sync_tp_scale=False,
+                            tile_sizes=bad_tiles,
+                            backend=be,
+                            interpret=True,
+                        )
+                    ).lower()
+
+        # 3. Consistent tp != 2 and unsupported-platform fallbacks (with and without tile_sizes).
+        x_tp = jnp.asarray(rng.standard_normal((8, 256)) * 0.3, jnp.bfloat16)
+        w_tp = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((256, 256)) * 0.03, jnp.bfloat16)
+        )
+        ref_tp = xla_fp8_matmul(x_tp, w_tp.qvalue, w_tp.scale)
+
+        for tiles_arg in (None, Fp8MatmulTileSizes(8, 128, 128, 2)):
+            # tp=1 + backend="auto" falls back cleanly whether or not tile_sizes is passed.
+            y_tp1_auto = sharded_fp8_row_matmul_async_ar(
+                jax.device_put(x_tp, NamedSharding(mesh_tp1, P(None, "tp"))),
+                jax.device_put(w_tp.qvalue, NamedSharding(mesh_tp1, P(None, "tp"))),
+                jax.device_put(w_tp.scale, NamedSharding(mesh_tp1, P())),
+                mesh=mesh_tp1,
+                tile_sizes=tiles_arg,
+                backend="auto",
+                interpret=True,
+            )
+            np.testing.assert_allclose(
+                np.asarray(y_tp1_auto, np.float32),
+                np.asarray(ref_tp, np.float32),
+                rtol=1e-2,
+                atol=2e-2,
+            )
+
+            # tp=1 + backend="pallas" raises ValueError whether or not tile_sizes is passed.
+            with pytest.raises(ValueError, match="tp == 2"):
+                sharded_fp8_row_matmul_async_ar(
+                    jax.device_put(x_tp, NamedSharding(mesh_tp1, P(None, "tp"))),
+                    jax.device_put(w_tp.qvalue, NamedSharding(mesh_tp1, P(None, "tp"))),
+                    jax.device_put(w_tp.scale, NamedSharding(mesh_tp1, P())),
+                    mesh=mesh_tp1,
+                    tile_sizes=tiles_arg,
+                    backend="pallas",
+                    interpret=True,
+                )
+
+            # Unsupported platform (tpu_version=0, interpret=False) on tp=2:
+            # backend="auto" falls back cleanly; backend="pallas" raises ValueError.
+            with mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.get_tpu_version",
+                return_value=0,
+            ):
+                y_cpu_auto = sharded_fp8_row_matmul_async_ar(
+                    jax.device_put(x_tp, NamedSharding(mesh_tp2, P(None, "tp"))),
+                    jax.device_put(w_tp.qvalue, NamedSharding(mesh_tp2, P(None, "tp"))),
+                    jax.device_put(w_tp.scale, NamedSharding(mesh_tp2, P())),
+                    mesh=mesh_tp2,
+                    tile_sizes=tiles_arg,
+                    backend="auto",
+                    interpret=False,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(y_cpu_auto, np.float32),
+                    np.asarray(ref_tp, np.float32),
+                    rtol=1e-2,
+                    atol=2e-2,
+                )
+                with pytest.raises(ValueError, match="TPU7x"):
+                    sharded_fp8_row_matmul_async_ar(
+                        jax.device_put(x_tp, NamedSharding(mesh_tp2, P(None, "tp"))),
+                        jax.device_put(
+                            w_tp.qvalue, NamedSharding(mesh_tp2, P(None, "tp"))
+                        ),
+                        jax.device_put(w_tp.scale, NamedSharding(mesh_tp2, P())),
+                        mesh=mesh_tp2,
+                        tile_sizes=tiles_arg,
+                        backend="pallas",
+                        interpret=False,
+                    )
+
+        # n_out == 1 (orig_n = 128, tile_sizes=None): "auto" falls back, "pallas" raises.
+        w_n1 = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((128, 256)) * 0.03, jnp.bfloat16)
+        )
+        y_n1_auto = sharded_fp8_row_matmul_async_ar(
+            jax.device_put(x_tp, NamedSharding(mesh_tp2, P(None, "tp"))),
+            jax.device_put(w_n1.qvalue, NamedSharding(mesh_tp2, P(None, "tp"))),
+            jax.device_put(w_n1.scale, NamedSharding(mesh_tp2, P())),
+            mesh=mesh_tp2,
+            backend="auto",
+            interpret=True,
+        )
+        np.testing.assert_allclose(
+            np.asarray(y_n1_auto, np.float32),
+            np.asarray(xla_fp8_matmul(x_tp, w_n1.qvalue, w_n1.scale), np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
+        with pytest.raises(ValueError, match="at least 2 output tiles"):
+            sharded_fp8_row_matmul_async_ar(
+                jax.device_put(x_tp, NamedSharding(mesh_tp2, P(None, "tp"))),
+                jax.device_put(w_n1.qvalue, NamedSharding(mesh_tp2, P(None, "tp"))),
+                jax.device_put(w_n1.scale, NamedSharding(mesh_tp2, P())),
+                mesh=mesh_tp2,
+                backend="pallas",
+                interpret=True,
+            )
+
+        # 4. Direct pallas_fp8_row_matmul_async_ar and kernel body assert axis_size == 2.
+        xq_1, xs_1 = quantize_fp8_act(x_tp[:, :128])
+        with pytest.raises(ValueError, match="mapped axis"):
+            pallas_fp8_row_matmul_async_ar(
+                xq_1, xs_1, w_tp.qvalue[:, :128], w_tp.scale, interpret=True
+            )
+        with pytest.raises(ValueError, match="axis_size"):
+            jax.shard_map(
+                lambda xql, xsl, wql, wsl: pallas_fp8_row_matmul_async_ar(
+                    xql, xsl, wql, wsl, interpret=True
+                ),
+                mesh=mesh_tp1,
+                in_specs=(P(None, "tp"), P(None, None), P(None, "tp"), P()),
+                out_specs=P(None, None),
+                check_vma=False,
+            )(
+                jax.device_put(xq_1, NamedSharding(mesh_tp1, P(None, "tp"))),
+                jax.device_put(xs_1, NamedSharding(mesh_tp1, P(None, None))),
+                jax.device_put(
+                    w_tp.qvalue[:, :128], NamedSharding(mesh_tp1, P(None, "tp"))
+                ),
+                jax.device_put(w_tp.scale, NamedSharding(mesh_tp1, P())),
+            )
+
+        def _bad_kernel(dummy: jax.Array) -> jax.Array:
+            _fp8_row_matmul_async_ar_kernel(
+                *(None,) * 13,
+                out_block=128,
+                n_out=2,
+                n_w_slots=2,
+                tp_axis="tp",
+                eff_reduce=jnp.dtype(jnp.bfloat16),
+                target_out_dtype=jnp.dtype(jnp.bfloat16),
+            )
+            return dummy
+
+        with pytest.raises(ValueError, match="axis_size"):
+            jax.shard_map(
+                _bad_kernel,
+                mesh=mesh_tp1,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_vma=False,
+            )(
+                jax.device_put(
+                    jnp.zeros((1,), jnp.float32), NamedSharding(mesh_tp1, P(None))
+                )
+            )
+
 
 @pytest.mark.skipif(
     jax.default_backend() != "tpu", reason="requires TPU Mosaic hardware"

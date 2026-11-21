@@ -28,6 +28,8 @@ from resin.backend.tpu.kernels.fp8_matmul import (
 from resin.backend.tpu.mesh import TP_AXIS
 
 _ASYNC_AR_MAX_VMEM_BYTES = 40 * 1024 * 1024
+_ASYNC_AR_VMEM_SLACK_BYTES = 4 * 1024 * 1024
+_ASYNC_AR_MIN_VMEM_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 def estimate_async_ar_vmem_bytes(
@@ -83,8 +85,17 @@ def _validate_async_ar_tiles(
     tiles: Fp8MatmulTileSizes,
 ) -> tuple[int, int, int, int]:
     """Validate single-(batch, K) async all-reduce tiles and return ``(padded_batch, padded_n, padded_k, n_out)``."""
+    if orig_batch <= 0:
+        raise ValueError(f"Expected orig_batch > 0, got {orig_batch}")
     batch_block, out_block, in_block, w_buf = tiles
-    if batch_block % 8 != 0 or out_block % 128 != 0 or in_block % 128 != 0:
+    if (
+        batch_block <= 0
+        or out_block <= 0
+        or in_block <= 0
+        or batch_block % 8 != 0
+        or out_block % 128 != 0
+        or in_block % 128 != 0
+    ):
         raise ValueError(
             f"Invalid async all-reduce tile sizes {(batch_block, out_block, in_block)}"
         )
@@ -148,7 +159,7 @@ def _can_use_async_ar(
     out_dtype: Any,
     reduce_dtype: Any | None,
 ) -> bool:
-    if tp != 2 or local_k < 128:
+    if tp != 2 or orig_batch <= 0 or local_k < 128:
         return False
     tiles = get_async_ar_tile_sizes(orig_batch, orig_n, local_k)
     try:
@@ -194,6 +205,11 @@ def _fp8_row_matmul_async_ar_kernel(
     eff_reduce: jnp.dtype,
     target_out_dtype: jnp.dtype,
 ) -> None:
+    tp_size = jax.lax.axis_size(tp_axis)
+    if tp_size != 2:
+        raise ValueError(
+            f"_fp8_row_matmul_async_ar_kernel requires axis_size({tp_axis!r}) == 2, got {tp_size}"
+        )
     peer_id = 1 - jax.lax.axis_index(tp_axis)
     xs_col = jnp.transpose(xs_ref[...])
 
@@ -302,6 +318,22 @@ def pallas_fp8_row_matmul_async_ar(
         raise ValueError(
             f"pallas_fp8_row_matmul_async_ar expects pre-quantized {w.dtype} x_q, got {x_q.dtype}"
         )
+    is_interpret = bool(interpret)
+    tpu_version = get_tpu_version()
+    if not is_interpret and tpu_version < 7:
+        raise ValueError(
+            f"pallas_fp8_row_matmul_async_ar requires TPU7x+ or interpret=True, got {tpu_version=}"
+        )
+    try:
+        tp_size = jax.lax.axis_size(tp_axis)
+    except NameError as exc:
+        raise ValueError(
+            f"pallas_fp8_row_matmul_async_ar requires mapped axis {tp_axis!r} of size 2"
+        ) from exc
+    if tp_size != 2:
+        raise ValueError(
+            f"pallas_fp8_row_matmul_async_ar requires axis_size({tp_axis!r}) == 2, got {tp_size}"
+        )
 
     leading = x_q.shape[:-1]
     orig_k = x_q.shape[-1]
@@ -322,6 +354,28 @@ def pallas_fp8_row_matmul_async_ar(
     padded_batch, padded_n, padded_k, n_out = _validate_async_ar_tiles(
         orig_batch, orig_n, orig_k, eff_tiles
     )
+    target_out_dtype = jnp.dtype(out_dtype)
+    eff_reduce = jnp.dtype(target_out_dtype if reduce_dtype is None else reduce_dtype)
+    n_w_slots = min(w_buf, n_out)
+    w_itemsize = jnp.dtype(w.dtype).itemsize
+    upper = _DEVICE_VMEM_LIMIT.get(max(tpu_version, 7), 48 * 1024 * 1024)
+    vmem_bytes = estimate_async_ar_vmem_bytes(
+        batch_block,
+        out_block,
+        in_block,
+        n_out,
+        n_w_slots,
+        x_itemsize=w_itemsize,
+        w_itemsize=w_itemsize,
+        reduce_itemsize=eff_reduce.itemsize,
+        out_itemsize=target_out_dtype.itemsize,
+    )
+    if vmem_bytes > upper:
+        raise ValueError(
+            f"Async all-reduce VMEM estimate {vmem_bytes} bytes exceeds limit {upper} bytes "
+            f"for tiles={eff_tiles}, shape=({orig_batch}, {orig_n}, {orig_k})"
+        )
+
     x_2d, x_scale_row, w_in, ws_2d = _pad_async_ar_inputs(
         x_2d,
         x_scale_row,
@@ -332,20 +386,20 @@ def pallas_fp8_row_matmul_async_ar(
         padded_k=padded_k,
     )
 
-    target_out_dtype = jnp.dtype(out_dtype)
-    eff_reduce = jnp.dtype(target_out_dtype if reduce_dtype is None else reduce_dtype)
-    n_w_slots = min(w_buf, n_out)
-
-    is_interpret = bool(interpret)
     interpret_arg: bool | pltpu.InterpretParams = (
         interpret
         if isinstance(interpret, pltpu.InterpretParams)
         else (pltpu.InterpretParams() if interpret else False)
     )
-    tpu_version = get_tpu_version()
     vmem_limit_bytes = (
-        _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
-        if (tpu_version >= 6 and not is_interpret)
+        min(
+            max(
+                vmem_bytes + _ASYNC_AR_VMEM_SLACK_BYTES,
+                _ASYNC_AR_MIN_VMEM_LIMIT_BYTES,
+            ),
+            upper,
+        )
+        if not is_interpret
         else None
     )
 
@@ -390,7 +444,7 @@ def pallas_fp8_row_matmul_async_ar(
         name=f"fp8_w8a8_async_ar_{batch_block}_{out_block}_{in_block}{buf_sfx}",
     )
 
-    if tpu_version >= 6 and not is_interpret:
+    if not is_interpret:
         w_in = pltpu.with_memory_space_constraint(w_in, pltpu.HBM)
         ws_2d = pltpu.with_memory_space_constraint(ws_2d, pltpu.HBM)
 
@@ -419,6 +473,9 @@ def sharded_fp8_row_matmul_async_ar(
     quantize_activation = jnp.dtype(x.dtype) != jnp.dtype(w.dtype)
     _validate_x_scale_args(quantize_activation, x_scale, x_abs_max)
 
+    if backend not in ("auto", "pallas", "xla"):
+        raise ValueError(f"Unsupported backend {backend!r}")
+
     tp = int(mesh.shape[tp_axis])
     is_interpret = bool(interpret)
     orig_batch = x.reshape(-1, x.shape[-1]).shape[0]
@@ -426,21 +483,36 @@ def sharded_fp8_row_matmul_async_ar(
     local_k = w.shape[1] // max(tp, 1)
 
     is_supported_tpu = is_interpret or get_tpu_version() >= 7
-    should_fallback = backend == "xla" or (
-        tile_sizes is None
-        and (
-            (backend == "auto" and not is_supported_tpu)
-            or not _can_use_async_ar(
-                tp=tp,
-                orig_batch=orig_batch,
-                orig_n=orig_n,
-                local_k=local_k,
-                w_dtype=w.dtype,
-                out_dtype=out_dtype,
-                reduce_dtype=reduce_dtype,
+    if backend == "xla":
+        should_fallback = True
+    elif backend == "auto":
+        should_fallback = (
+            not is_supported_tpu
+            or tp != 2
+            or (
+                tile_sizes is None
+                and not _can_use_async_ar(
+                    tp=tp,
+                    orig_batch=orig_batch,
+                    orig_n=orig_n,
+                    local_k=local_k,
+                    w_dtype=w.dtype,
+                    out_dtype=out_dtype,
+                    reduce_dtype=reduce_dtype,
+                )
             )
         )
-    )
+    else:
+        if not is_supported_tpu:
+            raise ValueError(
+                "sharded_fp8_row_matmul_async_ar(backend='pallas') requires TPU7x+ or interpret=True"
+            )
+        if tp != 2:
+            raise ValueError(
+                f"sharded_fp8_row_matmul_async_ar requires tp == 2 when backend='pallas', got tp={tp}"
+            )
+        should_fallback = False
+
     if should_fallback:
         return sharded_fp8_matmul(
             x,
@@ -456,11 +528,6 @@ def sharded_fp8_row_matmul_async_ar(
             tile_sizes=tile_sizes,
             backend=backend,
             interpret=is_interpret,
-        )
-
-    if tp != 2:
-        raise ValueError(
-            f"sharded_fp8_row_matmul_async_ar requires tp == 2 when backend='pallas', got tp={tp}"
         )
 
     prefix_none = (None,) * (x.ndim - 1)
