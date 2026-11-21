@@ -700,7 +700,16 @@ class TestFp8Weights:
                     )
                     if mode == "auto"
                     else (
-                        ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320))
+                        (
+                            (1, 1),
+                            (8, 8),
+                            (16, 16),
+                            (96, 96),
+                            (160, 160),
+                            (192, 192),
+                            (256, 256),
+                            (320, 320),
+                        )
                         if mode == "pallas"
                         else ((8, 8), (320, 320))
                     )
@@ -749,14 +758,15 @@ class TestFp8Weights:
                         assert "fp8_w8a8_async_ar_" not in mlir_txt
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode in ("auto", "pallas") and tokens <= 320:
-                        o_blk = 640 if tokens <= 192 else 1280
-                        if tokens <= 96:
+                        padded_b = max(8, ((tokens + 7) // 8) * 8)
+                        o_blk = 640 if padded_b <= 192 else 1280
+                        if padded_b <= 96:
                             assert (
-                                f"fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3_add_norm_q"
+                                f"fp8_w8a8_async_ar_{padded_b}_{o_blk}_4096_b3_add_norm_q"
                                 in mlir_txt
                             )
                             assert (
-                                f"fp8_w8a8_async_ar_{tokens}_512_12800_b3_add_norm_q"
+                                f"fp8_w8a8_async_ar_{padded_b}_512_12800_b3_add_norm_q"
                                 in mlir_txt
                             )
                             assert (
@@ -765,24 +775,29 @@ class TestFp8Weights:
                             )
                         else:
                             assert (
-                                f'kernel_name = "fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3"'
+                                f'kernel_name = "fp8_w8a8_async_ar_{padded_b}_{o_blk}_4096_b3"'
                                 in mlir_txt
                             )
                             assert (
-                                f'kernel_name = "fused_add_rms_norm_fp8_quant_{tokens}_5120"'
+                                f'kernel_name = "fused_add_rms_norm_fp8_quant_{padded_b}_5120"'
                                 in mlir_txt
                             )
-                        assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
                         assert (
-                            f'kernel_name = "fp8_w8a8_async_ar_{tokens}_512_12800_b3"'
+                            f"fp8_qkv_norm_rope_pack_{padded_b}_1024_5120_b3"
+                            in mlir_txt
+                        )
+                        assert 'kernel_name = "qkv_norm_rope_pack_' not in mlir_txt
+                        assert f"fp8_w8a8_matmul_{padded_b}_" not in mlir_txt
+                        assert (
+                            f'kernel_name = "fp8_w8a8_async_ar_{padded_b}_512_12800_b3"'
                             in mlir_txt
                         )
                         assert mlir_txt.count('kernel_name = "rms_norm_fp8_quant_') <= 1
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
-                        gu_blk = 1280 if tokens >= 288 else 640
-                        gu_suffix = "" if tokens >= 288 else "_b3"
+                        gu_blk = 1280 if padded_b >= 288 else 640
+                        gu_suffix = "" if padded_b >= 288 else "_b3"
                         assert (
-                            f"fp8_gate_up_swiglu_quant_{tokens}_{gu_blk}_5120{gu_suffix}"
+                            f"fp8_gate_up_swiglu_quant_{padded_b}_{gu_blk}_5120{gu_suffix}"
                             in mlir_txt
                         )
                         scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
@@ -794,7 +809,7 @@ class TestFp8Weights:
                         sizes = [
                             int(m.group(1))
                             for line in custom_calls
-                            if f'kernel_name = "fp8_gate_up_swiglu_quant_{tokens}_'
+                            if f'kernel_name = "fp8_gate_up_swiglu_quant_{padded_b}_'
                             in line
                             and (m := scoped_vmem_re.search(line))
                         ]
@@ -916,6 +931,112 @@ class TestFp8Weights:
         np.testing.assert_array_equal(tp2_async_lps, tp2_psum_lps)
         for lps in (tp2_async_lps, _run_mode(2, "xla")):
             np.testing.assert_allclose(lps, tp1_ref, rtol=2e-2, atol=5e-2)
+
+        # Direct full-vocab logit KL budget (<= 0.002) and greedy top-1 parity
+        # across unaligned (1) and aligned (8, 16) decode buckets on TP=2.
+        from resin.backend.tpu.metadata import AttentionMetadata, ModelInputs
+
+        mesh2 = make_mesh(2, devices)
+        m_fused, p_fused = load_model(
+            hd128_dir,
+            mesh2,
+            page_tokens=8,
+            quantization="fp8",
+            kv_dtype=jnp.float8_e4m3fn,
+        )
+        m_fused.decode_matmul_mode = "pallas"
+        m_fused.decode_async_all_reduce = True
+        m_fused._force_fused_qkv_pack_interpret = True
+        m_fused._force_decode_pallas_interpret = True
+        m_fused.impl = _ft.partial(
+            ragged_paged_attention,
+            d_block_sizes=(1, 8, 1, 8),
+            m_block_sizes=(4, 8, 4, 8),
+            interpret=True,
+        )
+
+        m_xla, p_xla = load_model(
+            hd128_dir,
+            mesh2,
+            page_tokens=8,
+            quantization="fp8",
+            kv_dtype=jnp.float8_e4m3fn,
+        )
+        m_xla.decode_matmul_mode = "xla"
+        m_xla.decode_async_all_reduce = False
+        m_xla._force_fused_qkv_pack_interpret = True
+        m_xla.impl = m_fused.impl
+
+        from resin.backend.tpu.arena import KV_PARTITION, KvCacheSpec
+
+        spec = KvCacheSpec(
+            values["num_hidden_layers"],
+            values["num_key_value_heads"],
+            128,
+            8,
+            jnp.float8_e4m3fn,
+        )
+        cache_sh = jax.sharding.NamedSharding(mesh2, KV_PARTITION)
+        rep_sh = jax.sharding.NamedSharding(mesh2, jax.sharding.PartitionSpec())
+        pps = spec.pages_per_seq(32)
+        caches_f = (
+            tuple(
+                jnp.zeros(
+                    (64, *spec.page_shape(2)), dtype=jnp.float8_e4m3fn, device=cache_sh
+                )
+                for _ in range(spec.layers)
+            ),
+        )
+        caches_x = (
+            tuple(
+                jnp.zeros(
+                    (64, *spec.page_shape(2)), dtype=jnp.float8_e4m3fn, device=cache_sh
+                )
+                for _ in range(spec.layers)
+            ),
+        )
+        rng = np.random.default_rng(20261125)
+        for bsz in (1, 8, 16):
+            ids = jax.device_put(
+                jnp.asarray(
+                    rng.integers(0, values["vocab_size"], size=(bsz,), dtype=np.int32)
+                ),
+                rep_sh,
+            )
+            pos = jax.device_put(jnp.zeros((bsz,), dtype=jnp.int32), rep_sh)
+            lidx = jax.device_put(jnp.arange(bsz, dtype=jnp.int32), rep_sh)
+            kv_lens = jax.device_put(jnp.ones((bsz,), dtype=jnp.int32), rep_sh)
+            pages_np = np.zeros((bsz * pps,), dtype=np.int32)
+            pages_np[::pps] = np.arange(1, bsz + 1, dtype=np.int32)
+            pages = jax.device_put(jnp.asarray(pages_np), rep_sh)
+            cu_q = jax.device_put(jnp.arange(bsz + 1, dtype=jnp.int32), rep_sh)
+            dist = jax.device_put(jnp.array([bsz, bsz, bsz], dtype=jnp.int32), rep_sh)
+            inp = ModelInputs(
+                input_ids=ids,
+                positions=pos,
+                logits_indices=lidx,
+                attention=AttentionMetadata(kv_lens, (pages,), cu_q, dist),
+            )
+            hs_f, _ = m_fused.hidden_states(p_fused, caches_f, inp)
+            logits_f = np.asarray(m_fused.logits(p_fused, hs_f), dtype=np.float32)
+            hs_x, _ = m_xla.hidden_states(p_xla, caches_x, inp)
+            logits_x = np.asarray(m_xla.logits(p_xla, hs_x), dtype=np.float32)
+
+            logp_x = np.asarray(jax.nn.log_softmax(logits_x, axis=-1))
+            logp_f = np.asarray(jax.nn.log_softmax(logits_f, axis=-1))
+            kl = float(np.mean(np.sum(np.exp(logp_x) * (logp_x - logp_f), axis=-1)))
+            assert kl <= 0.002, f"bucket={bsz} mean KL {kl:.6f} > 0.002"
+            assert float(np.max(np.abs(logits_f - logits_x))) <= 0.05
+            part_x = np.partition(logits_x, -2, axis=-1)
+            clear_margin = (part_x[:, -1] - part_x[:, -2]) >= 0.05
+            if np.any(clear_margin):
+                top1_agree = float(
+                    np.mean(
+                        logits_f[clear_margin].argmax(axis=-1)
+                        == logits_x[clear_margin].argmax(axis=-1)
+                    )
+                )
+                assert top1_agree >= 0.98, f"bucket={bsz} top1_agree={top1_agree:.4f}"
 
     def test_logits_track_the_reference(self, checkpoint) -> None:
         directory, reference = checkpoint

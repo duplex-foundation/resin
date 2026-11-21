@@ -49,9 +49,11 @@ from resin.backend.tpu.kernels import (
     sharded_fp8_matmul,
     sharded_fp8_matmul_all_gather,
     sharded_fp8_matmul_reduce_scatter,
+    sharded_fp8_qkv_norm_rope_pack,
     sharded_fp8_row_matmul_async_ar,
 )
 from resin.backend.tpu.kernels._rpa_v3_pallas import get_tpu_version
+from resin.backend.tpu.kernels.norm_rope import _half_swap_perm, _slice_rope_cache_128
 from resin.backend.tpu.mesh import TP_AXIS, tp_size
 from resin.backend.tpu.metadata import ModelInputs
 from resin.models.qwen3.config import Qwen3Config
@@ -218,6 +220,8 @@ class Qwen3Model:
         inputs: ModelInputs,
         rope_cache: tuple[jax.Array, jax.Array] | None,
         *,
+        cos_sin_pos: tuple[jax.Array, jax.Array] | None = None,
+        perm_128: jax.Array | None = None,
         return_packed: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         config = self.config
@@ -233,26 +237,37 @@ class Qwen3Model:
         use_fused_pack = self._can_use_fused_qkv_pack(qkv_out.dtype, rope_cache)
         if use_fused_pack:
             assert rope_cache is not None
-            cos_full, sin_signed = rope_cache
+            cos_pos, sin_pos = (
+                _slice_rope_cache_128(inputs.positions, rope_cache)
+                if cos_sin_pos is None
+                else cos_sin_pos
+            )
+            eff_perm = (
+                _half_swap_perm(128, dtype=jnp.bfloat16)
+                if perm_128 is None
+                else perm_128
+            )
 
             def _pack_local(
                 qkv_local: jax.Array,
-                pos: Any,
-                cos_t: jax.Array,
-                sin_t: jax.Array,
+                cos_p: jax.Array,
+                sin_p: jax.Array,
                 qw: jax.Array,
                 kw: jax.Array,
+                perm_l: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
                 return pallas_qkv_norm_rope_pack(
                     qkv_local,
-                    pos,
-                    (cos_t, sin_t),
+                    None,
+                    None,
                     qw,
                     kw,
                     kv_cache.dtype,
                     num_q_heads=local_heads,
                     num_kv_heads=local_kv_heads,
                     eps=eps,
+                    cos_sin_pos=(cos_p, sin_p),
+                    perm_128=perm_l,
                     interpret=self._force_fused_qkv_pack_interpret,
                 )
 
@@ -264,11 +279,11 @@ class Qwen3Model:
                 check_vma=False,
             )(
                 qkv_out,
-                inputs.positions,
-                cos_full,
-                sin_signed,
+                cos_pos,
+                sin_pos,
                 weights.q_norm,
                 weights.k_norm,
+                eff_perm,
             )
             return paged_attention(
                 q_packed,
@@ -702,6 +717,17 @@ class Qwen3Model:
             )
             return _rep_add_norm_quant(row_out, res, norm_w)
 
+        if params.rope_cache is not None and self._can_use_fused_qkv_pack(
+            act_dtype, params.rope_cache
+        ):
+            hoisted_cos_sin: tuple[jax.Array, jax.Array] | None = _slice_rope_cache_128(
+                inputs.positions, params.rope_cache
+            )
+            hoisted_perm: jax.Array | None = _half_swap_perm(128, dtype=jnp.bfloat16)
+        else:
+            hoisted_cos_sin = None
+            hoisted_perm = None
+
         h_q, h_scale = _rep_norm_quant(x, layers[0].input_norm)
         layer_caches = []
         num_layers = len(layers)
@@ -712,23 +738,40 @@ class Qwen3Model:
             assert isinstance(weights.gate_up, Fp8Weight)
             assert isinstance(weights.down, Fp8Weight)
 
-            qkv_out = self._linear(
-                h_q,
-                weights.qkv,
-                COLUMN,
-                x_scale=h_scale,
-                out_dtype=act_dtype,
-                backend=proj_backend,
-                interpret=dec_interp,
-            )
             if use_fused_unpack_quant:
-                att_packed, kv_cache = self._attend_qkv(
-                    qkv_out,
-                    weights,
-                    kv_cache,
-                    inputs,
+                q_packed, kv_merged = sharded_fp8_qkv_norm_rope_pack(
+                    h_q,
+                    h_scale,
+                    weights.qkv.qvalue,
+                    weights.qkv.scale,
+                    inputs.positions,
                     params.rope_cache,
+                    weights.q_norm,
+                    weights.k_norm,
+                    kv_cache.dtype,
+                    mesh=self.mesh,
+                    num_q_heads=config.num_attention_heads,
+                    num_kv_heads=config.num_key_value_heads,
+                    eps=eps,
+                    cos_sin_pos=hoisted_cos_sin,
+                    perm_128=hoisted_perm,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                    pack_interpret=self._force_fused_qkv_pack_interpret,
+                )
+                att_packed, kv_cache = paged_attention(
+                    q_packed,
+                    kv_merged,
+                    None,
+                    kv_cache,
+                    inputs.attention,
+                    mesh=self.mesh,
+                    sm_scale=config.head_dim**-0.5,
+                    prepared=True,
                     return_packed=True,
+                    actual_num_q_heads=config.num_attention_heads,
+                    actual_head_dim=config.head_dim,
+                    impl=self.impl,
                 )
                 layer_caches.append(kv_cache)
                 o_q_dtype = weights.o.qvalue.dtype
@@ -755,8 +798,23 @@ class Qwen3Model:
                     sync_scale=False,
                 )
             else:
+                qkv_out = self._linear(
+                    h_q,
+                    weights.qkv,
+                    COLUMN,
+                    x_scale=h_scale,
+                    out_dtype=act_dtype,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                )
                 attended, kv_cache = self._attend_qkv(
-                    qkv_out, weights, kv_cache, inputs, params.rope_cache
+                    qkv_out,
+                    weights,
+                    kv_cache,
+                    inputs,
+                    params.rope_cache,
+                    cos_sin_pos=hoisted_cos_sin,
+                    perm_128=hoisted_perm,
                 )
                 layer_caches.append(kv_cache)
                 mlp_q, mlp_scale, x = _row_proj_add_norm_quant(
