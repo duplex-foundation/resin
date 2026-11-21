@@ -2944,6 +2944,161 @@ class TestDecodeMatmulPath:
         np.testing.assert_array_equal(np.asarray(exact_gq), np.asarray(ref_gq))
         np.testing.assert_array_equal(np.asarray(exact_gs.T), np.asarray(ref_gs))
 
+    @pytest.mark.parametrize("batch", [1, 5, 8, 16, 96, 192, 313, 320])
+    def test_pallas_fp8_gate_up_swiglu_quant_interpret(self, batch: int) -> None:
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            fp8_matmul_prequantized,
+            pallas_fp8_gate_up_swiglu,
+            pallas_fp8_gate_up_swiglu_quant,
+            quantize_fp8_act,
+            quantize_fp8_weight,
+            sharded_fp8_gate_up_swiglu,
+        )
+        from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax
+
+        rng = np.random.default_rng(4200 + batch)
+        ffn, k_dim = (300, 192) if batch in (5, 313) else (1280, 256)
+        x = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        xq, xs = quantize_fp8_act(x)
+        xs_row = jnp.transpose(xs)
+        w_gate = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((ffn, k_dim)) * 0.04, jnp.bfloat16)
+        )
+        w_up = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((ffn, k_dim)) * 0.04, jnp.bfloat16)
+        )
+        w_gu_q = jnp.concatenate([w_gate.qvalue, w_up.qvalue], axis=0)
+        w_gu_s = jnp.concatenate([w_gate.scale, w_up.scale], axis=0)
+
+        gq, gs = pallas_fp8_gate_up_swiglu_quant(
+            xq,
+            xs_row,
+            w_gu_q,
+            w_gu_s,
+            transposed_scale=True,
+            interpret=pltpu.InterpretParams(detect_races=True),
+        )
+        assert interpret_pallas_call.races is not None
+        assert not interpret_pallas_call.races.races_found
+
+        assert gq.shape == (batch, ffn)
+        assert gq.dtype == jnp.float8_e4m3fn
+        assert gs.shape == (1, batch)
+        deq_got = np.asarray(
+            gq.astype(jnp.float32) * jnp.transpose(gs), dtype=np.float32
+        )
+
+        unfused_gated, unfused_abs = pallas_fp8_gate_up_swiglu(
+            xq, xs_row, w_gu_q, w_gu_s, interpret=True
+        )
+        unfused_q, unfused_s = quantize_fp8_with_absmax(
+            unfused_gated,
+            jnp.max(unfused_abs, axis=0, keepdims=True),
+            dtype=w_gu_q.dtype,
+            transposed_scale=True,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(gq), np.asarray(unfused_q))
+        np.testing.assert_allclose(
+            np.asarray(gs), np.asarray(unfused_s), rtol=1e-6, atol=0.0
+        )
+
+        gate_f32 = fp8_matmul_prequantized(
+            xq, xs, w_gate.qvalue, w_gate.scale, out_dtype=jnp.float32
+        )
+        up_f32 = fp8_matmul_prequantized(
+            xq, xs, w_up.qvalue, w_up.scale, out_dtype=jnp.float32
+        )
+        ref_swiglu = (jax.nn.silu(gate_f32) * up_f32).astype(jnp.bfloat16)
+        ref_q, ref_s = quantize_fp8_act(ref_swiglu)
+        deq_ref = np.asarray(ref_q.astype(jnp.float32) * ref_s, dtype=np.float32)
+
+        np.testing.assert_allclose(deq_got, deq_ref, rtol=2e-2, atol=4e-2)
+        cos = float(
+            np.dot(deq_got.ravel(), deq_ref.ravel())
+            / (np.linalg.norm(deq_got.ravel()) * np.linalg.norm(deq_ref.ravel()))
+        )
+        assert cos >= 0.9995
+
+        if batch in (1, 8):
+            zero_xq = jnp.zeros_like(xq)
+            zero_xs = jnp.ones((1, batch), dtype=jnp.float32)
+            zq, zs = pallas_fp8_gate_up_swiglu_quant(
+                zero_xq, zero_xs, w_gu_q, w_gu_s, interpret=True
+            )
+            assert not np.any(np.isnan(np.asarray(zq, np.float32)))
+            np.testing.assert_array_equal(
+                np.asarray(zs), np.ones((1, batch), dtype=np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(zq, np.float32), np.zeros((batch, ffn), dtype=np.float32)
+            )
+
+        if len(jax.devices()) >= 2 and ffn % 256 == 0 and k_dim == 256:
+            mesh = Mesh(np.array(jax.devices()[:2]), ("tp",))
+            half = ffn // 2
+            w_sh_q = jax.device_put(
+                jnp.concatenate(
+                    [
+                        w_gate.qvalue[:half],
+                        w_up.qvalue[:half],
+                        w_gate.qvalue[half:],
+                        w_up.qvalue[half:],
+                    ],
+                    axis=0,
+                ),
+                NamedSharding(mesh, P("tp", None)),
+            )
+            w_sh_s = jax.device_put(
+                jnp.concatenate(
+                    [
+                        w_gate.scale[:half],
+                        w_up.scale[:half],
+                        w_gate.scale[half:],
+                        w_up.scale[half:],
+                    ],
+                    axis=0,
+                ),
+                NamedSharding(mesh, P("tp")),
+            )
+            xq_rep = jax.device_put(xq, NamedSharding(mesh, P(None, None)))
+            xs_rep = jax.device_put(xs_row, NamedSharding(mesh, P(None, None)))
+            sh_gq, sh_gs = sharded_fp8_gate_up_swiglu(
+                xq_rep,
+                xs_rep,
+                w_sh_q,
+                w_sh_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                quantize_output=True,
+                backend="pallas",
+                interpret=True,
+            )
+            assert sh_gs is not None and sh_gs.shape == (2, batch)
+            sh_deq = np.concatenate(
+                [
+                    np.asarray(
+                        sh_gq[:, :half].astype(jnp.float32) * sh_gs[0:1].T,
+                        dtype=np.float32,
+                    ),
+                    np.asarray(
+                        sh_gq[:, half:].astype(jnp.float32) * sh_gs[1:2].T,
+                        dtype=np.float32,
+                    ),
+                ],
+                axis=-1,
+            )
+            ref_f32 = np.asarray(jax.nn.silu(gate_f32) * up_f32, dtype=np.float32)
+            sh_cos = float(
+                np.dot(sh_deq.ravel(), ref_f32.ravel())
+                / (np.linalg.norm(sh_deq.ravel()) * np.linalg.norm(ref_f32.ravel()))
+            )
+            assert sh_cos >= 0.999
+
     def test_quantize_fp8_with_absmax_k_tiling_and_xla_fallback(self) -> None:
         from resin.backend.tpu.kernels import quantize_fp8_act
         from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax

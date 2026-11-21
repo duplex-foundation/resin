@@ -1056,6 +1056,323 @@ def _gate_up_swiglu_pallas_kernel(
     _unfold_bools((is_first, is_last), (), body)
 
 
+def _fp8_gate_up_swiglu_quant_kernel(
+    x_q_ref: Any,
+    w_in_hbm: Any,
+    ws_2d_hbm: Any,
+    x_scale_ref: Any,
+    gated_q_ref: Any,
+    gated_scale_ref: Any,
+    w_gate_buf: Any,
+    w_up_buf: Any,
+    ws_gate_buf: Any,
+    ws_up_buf: Any,
+    gated_bf16_scratch: Any,
+    absmax_scratch: Any,
+    w_gate_sems: Any,
+    w_up_sems: Any,
+    ws_gate_sems: Any,
+    ws_up_sems: Any,
+    *,
+    n_out: int,
+    n_w_slots: int,
+    out_block: int,
+    bound: float,
+) -> None:
+    batch_block = x_q_ref.shape[0]
+    target_q_dtype = gated_q_ref.dtype
+    xs_col = jnp.transpose(x_scale_ref[...])
+
+    def _start_w_dma(tile_idx: Any, slot: Any) -> None:
+        g_slice = pl.ds(tile_idx * out_block, out_block)
+        u_slice = pl.ds((n_out + tile_idx) * out_block, out_block)
+        pltpu.make_async_copy(
+            w_in_hbm.at[g_slice, :],
+            w_gate_buf.at[slot],
+            w_gate_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            w_in_hbm.at[u_slice, :],
+            w_up_buf.at[slot],
+            w_up_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, g_slice],
+            ws_gate_buf.at[slot],
+            ws_gate_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, u_slice],
+            ws_up_buf.at[slot],
+            ws_up_sems.at[slot],
+        ).start()
+
+    def _wait_w_dma(tile_idx: Any, slot: Any) -> None:
+        g_slice = pl.ds(tile_idx * out_block, out_block)
+        u_slice = pl.ds((n_out + tile_idx) * out_block, out_block)
+        pltpu.make_async_copy(
+            w_in_hbm.at[g_slice, :],
+            w_gate_buf.at[slot],
+            w_gate_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            w_in_hbm.at[u_slice, :],
+            w_up_buf.at[slot],
+            w_up_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, g_slice],
+            ws_gate_buf.at[slot],
+            ws_gate_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, u_slice],
+            ws_up_buf.at[slot],
+            ws_up_sems.at[slot],
+        ).wait()
+
+    for slot in range(n_w_slots):
+        _start_w_dma(slot, slot)
+
+    absmax_scratch[...] = jnp.zeros((batch_block, 128), dtype=jnp.float32)
+
+    def _tile_step(t: jax.Array, _: None) -> None:
+        slot = jax.lax.rem(t, n_w_slots)
+        _wait_w_dma(t, slot)
+        lhs = x_q_ref[...]
+        g_acc = jax.lax.dot_general(
+            lhs,
+            w_gate_buf[slot],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        u_acc = jax.lax.dot_general(
+            lhs,
+            w_up_buf[slot],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        gate = ((g_acc * ws_gate_buf[slot]) * xs_col).astype(jnp.bfloat16)
+        up = ((u_acc * ws_up_buf[slot]) * xs_col).astype(jnp.bfloat16)
+        if n_out > n_w_slots:
+            next_t = t + n_w_slots
+
+            @pl.when(next_t < n_out)
+            def _prefetch_next() -> None:
+                _start_w_dma(next_t, slot)
+
+        gated_bf16 = (jax.nn.silu(gate) * up).astype(jnp.bfloat16)
+        gated_bf16_scratch[t] = gated_bf16
+        tile_max = jnp.max(
+            jnp.abs(gated_bf16.astype(jnp.float32)), axis=-1, keepdims=True
+        )
+        absmax_scratch[...] = jnp.maximum(
+            absmax_scratch[...],
+            jnp.broadcast_to(tile_max, (batch_block, 128)),
+        )
+        return None
+
+    if n_out == 1:
+        _tile_step(jnp.int32(0), None)
+    else:
+        jax.lax.fori_loop(0, n_out, _tile_step, None)
+
+    row_absmax = jnp.max(absmax_scratch[...], axis=-1, keepdims=True)
+    scale_col = safe_fp8_scale(row_absmax, bound)
+    gated_scale_ref[...] = jnp.transpose(scale_col)
+    inv_scale = 1.0 / scale_col
+    for t in range(n_out):
+        gated_q_ref[:, pl.ds(t * out_block, out_block)] = jnp.clip(
+            gated_bf16_scratch[t].astype(jnp.float32) * inv_scale,
+            -bound,
+            bound,
+        ).astype(target_q_dtype)
+
+
+def _pick_gate_up_quant_tiles(
+    orig_batch: int, orig_ffn: int, orig_k: int
+) -> Fp8MatmulTileSizes:
+    batch_block = align_to(max(8, orig_batch), 8)
+    target_out = 1280 if batch_block >= 288 else 640
+    w_buf = 2 if batch_block >= 288 else 3
+    if orig_ffn % target_out == 0:
+        out_block = target_out
+    elif orig_ffn % 128 == 0:
+        out_block = next(
+            blk
+            for blk in range(min(target_out, orig_ffn), 127, -128)
+            if orig_ffn % blk == 0
+        )
+    else:
+        out_block = min(align_to(max(128, orig_ffn), 128), target_out)
+    in_block = align_to(max(128, orig_k), 128)
+    return Fp8MatmulTileSizes(batch_block, out_block, in_block, w_buf)
+
+
+def pallas_fp8_gate_up_swiglu_quant(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_gate_up: jax.Array,
+    w_scale: jax.Array,
+    *,
+    out_dtype: Any | None = None,
+    transposed_scale: bool = True,
+    tile_sizes: Fp8MatmulTileSizes | None = None,
+    interpret: bool | pltpu.InterpretParams = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Single-kernel Pallas W8A8 ``gate_up`` + SwiGLU + per-token FP8 quant."""
+    _validate_matmul_shapes(x_q.shape[-1], w_gate_up, w_scale)
+    if x_q.dtype != w_gate_up.dtype:
+        raise ValueError(
+            f"pallas_fp8_gate_up_swiglu_quant expects pre-quantized {w_gate_up.dtype} x_q, got {x_q.dtype}"
+        )
+    if w_gate_up.shape[0] % 2 != 0:
+        raise ValueError(f"Expected even gate_up rows, got {w_gate_up.shape[0]}")
+
+    leading = x_q.shape[:-1]
+    orig_k = x_q.shape[-1]
+    orig_ffn = w_gate_up.shape[0] // 2
+    x_2d = x_q if x_q.ndim == 2 else x_q.reshape(-1, orig_k)
+    orig_batch = x_2d.shape[0]
+    if orig_batch > 320:
+        raise ValueError(
+            f"pallas_fp8_gate_up_swiglu_quant expects orig_batch <= 320, got {orig_batch}"
+        )
+
+    target_q_dtype = jnp.dtype(w_gate_up.dtype if out_dtype is None else out_dtype)
+    bound = _fp8_bound(target_q_dtype)
+
+    if x_scale.shape == (1, orig_batch) and x_scale.dtype == jnp.float32:
+        x_scale_row = x_scale
+    else:
+        x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
+
+    resolved_tiles = (
+        _pick_gate_up_quant_tiles(orig_batch, orig_ffn, orig_k)
+        if tile_sizes is None
+        else tile_sizes
+    )
+    batch_block, out_block, in_block, w_buffer_count = resolved_tiles
+    if batch_block < orig_batch or batch_block % 8 != 0:
+        raise ValueError(
+            f"Expected batch_block >= {orig_batch} and multiple of 8, got {batch_block}"
+        )
+    if out_block % 128 != 0 or in_block < orig_k or in_block % 128 != 0:
+        raise ValueError(
+            f"Invalid gate_up_swiglu_quant tiles {resolved_tiles} for (ffn={orig_ffn}, k={orig_k})"
+        )
+    if w_buffer_count < 1:
+        raise ValueError(f"Expected w_buffer_count >= 1, got {w_buffer_count}")
+
+    padded_batch = batch_block
+    padded_ffn = align_to(orig_ffn, out_block)
+    padded_k = in_block
+
+    if orig_batch < padded_batch:
+        pad_b = padded_batch - orig_batch
+        x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
+        x_scale_row = jnp.pad(x_scale_row, ((0, 0), (0, pad_b)), constant_values=1.0)
+    if orig_k < padded_k:
+        x_2d = jnp.pad(x_2d, ((0, 0), (0, padded_k - orig_k)))
+
+    if orig_ffn == padded_ffn and orig_k == padded_k:
+        w_in = w_gate_up
+        ws_2d = jnp.expand_dims(w_scale.astype(jnp.float32), axis=0)
+    else:
+        pad_n = padded_ffn - orig_ffn
+        pad_k = padded_k - orig_k
+        w_gate = jnp.pad(w_gate_up[:orig_ffn], ((0, pad_n), (0, pad_k)))
+        w_up = jnp.pad(w_gate_up[orig_ffn:], ((0, pad_n), (0, pad_k)))
+        w_in = jnp.concatenate([w_gate, w_up], axis=0)
+        ws_gate = jnp.pad(w_scale[:orig_ffn].astype(jnp.float32), (0, pad_n))
+        ws_up = jnp.pad(w_scale[orig_ffn:].astype(jnp.float32), (0, pad_n))
+        ws_2d = jnp.expand_dims(jnp.concatenate([ws_gate, ws_up], axis=0), axis=0)
+
+    n_out = padded_ffn // out_block
+    n_w_slots = min(w_buffer_count, n_out)
+    is_interpret = bool(interpret)
+    tpu_version = get_tpu_version()
+
+    if tpu_version >= 6 and not is_interpret:
+        row_scale_bytes = _row_scale_vmem_bytes(batch_block)
+        est_bytes = (
+            batch_block * padded_k * x_2d.dtype.itemsize
+            + row_scale_bytes
+            + 2 * n_w_slots * out_block * (padded_k * w_in.dtype.itemsize + 8 * 4)
+            + n_out * batch_block * out_block * 2
+            + batch_block * 128 * 4
+            + batch_block * padded_ffn * target_q_dtype.itemsize
+            + row_scale_bytes
+        )
+        vmem_limit_bytes: int | None = min(
+            max(est_bytes + 4 * 1024 * 1024, 8 * 1024 * 1024),
+            _device_vmem_limit_bytes(tpu_version),
+        )
+        w_in = pltpu.with_memory_space_constraint(w_in, pltpu.HBM)
+        ws_2d = pltpu.with_memory_space_constraint(ws_2d, pltpu.HBM)
+    else:
+        vmem_limit_bytes = None
+
+    interpret_arg = (
+        interpret
+        if isinstance(interpret, pltpu.InterpretParams)
+        else (pltpu.InterpretParams() if interpret else False)
+    )
+    kernel = pl.pallas_call(
+        functools.partial(
+            _fp8_gate_up_swiglu_quant_kernel,
+            n_out=n_out,
+            n_w_slots=n_w_slots,
+            out_block=out_block,
+            bound=bound,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec((batch_block, padded_k), lambda: (0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((1, batch_block), lambda: (0, 0)),
+            ],
+            out_specs=[
+                pl.BlockSpec((batch_block, padded_ffn), lambda: (0, 0)),
+                pl.BlockSpec((1, batch_block), lambda: (0, 0)),
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((n_w_slots, out_block, padded_k), w_in.dtype),
+                pltpu.VMEM((n_w_slots, out_block, padded_k), w_in.dtype),
+                pltpu.VMEM((n_w_slots, 1, out_block), jnp.float32),
+                pltpu.VMEM((n_w_slots, 1, out_block), jnp.float32),
+                pltpu.VMEM((n_out, batch_block, out_block), jnp.bfloat16),
+                pltpu.VMEM((batch_block, 128), jnp.float32),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+            ],
+            grid=(),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((padded_batch, padded_ffn), target_q_dtype),
+            jax.ShapeDtypeStruct((1, padded_batch), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
+        interpret=interpret_arg,
+        name=(
+            f"fp8_gate_up_swiglu_quant_{batch_block}_{out_block}_{padded_k}"
+            if n_w_slots == 2
+            else f"fp8_gate_up_swiglu_quant_{batch_block}_{out_block}_{padded_k}_b{n_w_slots}"
+        ),
+    )
+
+    gated_q_padded, scale_padded = kernel(x_2d, w_in, ws_2d, x_scale_row)
+    gated_q = gated_q_padded[:orig_batch, :orig_ffn].reshape(*leading, orig_ffn)
+    scale_row = scale_padded[:, :orig_batch]
+    if transposed_scale:
+        return gated_q, scale_row
+    return gated_q, jnp.transpose(scale_row).reshape(*leading, 1)
+
+
 def pallas_fp8_gate_up_swiglu(
     x_q: jax.Array,
     x_scale: jax.Array,
@@ -1465,6 +1782,7 @@ def sharded_fp8_gate_up_swiglu(
     sequence_parallel: bool = True,
     sync_tp_scale: bool = True,
     quantize_output: bool = False,
+    fuse_quant_epilogue: bool = True,
     out_dtype: Any = jnp.bfloat16,
     backend: MatmulBackend = "auto",
     interpret: bool = False,
@@ -1481,6 +1799,39 @@ def sharded_fp8_gate_up_swiglu(
     scale_out_spec = P(None, None) if sync_tp_scale else P(TP_AXIS, None)
 
     if use_pallas:
+        n_rows = x_q.reshape(-1, x_q.shape[-1]).shape[0]
+        if (
+            quantize_output
+            and fuse_quant_epilogue
+            and not sequence_parallel
+            and not sync_tp_scale
+            and n_rows <= 320
+        ):
+
+            def _pallas_fused_quant_local(
+                xq_local: jax.Array,
+                xs_local: jax.Array,
+                w_local: jax.Array,
+                ws_local: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                return pallas_fp8_gate_up_swiglu_quant(
+                    xq_local,
+                    xs_local,
+                    w_local,
+                    ws_local,
+                    out_dtype=w_local.dtype,
+                    transposed_scale=True,
+                    interpret=interpret,
+                )
+
+            return jax.shard_map(
+                _pallas_fused_quant_local,
+                mesh=mesh,
+                in_specs=(x_spec, x_spec, P(TP_AXIS, None), P(TP_AXIS)),
+                out_specs=(P(None, TP_AXIS), scale_out_spec),
+                check_vma=False,
+            )(x_q, x_scale, w_gate_up, w_scale)
+
         aux_out_spec = (
             scale_out_spec
             if quantize_output
@@ -1699,6 +2050,7 @@ __all__ = [
     "fp8_matmul_prequantized",
     "get_tuned_block_sizes",
     "pallas_fp8_gate_up_swiglu",
+    "pallas_fp8_gate_up_swiglu_quant",
     "pallas_fp8_matmul",
     "quantize_fp8_act",
     "quantize_fp8_weight",

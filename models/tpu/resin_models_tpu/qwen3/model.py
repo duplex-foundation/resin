@@ -740,6 +740,7 @@ class Qwen3Model:
                 sequence_parallel=False,
                 sync_tp_scale=row_sync_tp_scale,
                 quantize_output=prequantize_gated,
+                fuse_quant_epilogue=proj_backend != "xla",
                 out_dtype=act_dtype,
                 backend=gu_backend,
                 interpret=dec_interp,
