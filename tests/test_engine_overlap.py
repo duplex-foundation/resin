@@ -460,29 +460,47 @@ def test_cancel_survivor_drains_terminal_peer_without_losing_other_events():
     runner.shutdown()
 
 
-def test_tight_pool_pins_boundary_row_without_stranding_non_boundary_rows():
+class OneTokenRunner(AsyncRunner):
+    runner_config = RunnerConfig(
+        cache_layout=CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(16)]),
+        max_accepted_per_step=1,
+    )
+
+    def enqueue(self, plan, *, feedback=None):
+        self.plans.append(plan)
+        tokens = plan.token_ids.tolist() if feedback is None else feedback.tokens
+        positions = plan.positions.tolist() if feedback is None else feedback.positions
+        rows = [[int(token) + 1] for token in tokens]
+        completion = Completion(
+            forward_output(rows),
+            Feedback(
+                [row[-1] for row in rows], [position + 1 for position in positions]
+            ),
+        )
+        self.pending.append(completion)
+        return completion
+
+
+def test_tight_pool_pins_only_boundary_rows_and_keeps_the_chain_running():
+    # Rows sit 1, 2, 3, 4 and 12 tokens short of a 16-token page boundary, and
+    # three of the eight pages are free. A lease that asked every row for a
+    # spare page would not fit, so the lease must reach only the boundary rows.
     outputs = []
     for overlap in (False, True):
-        runner = AsyncRunner()
-        runner.runner_config = RunnerConfig(
-            cache_layout=CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(128)]),
-            max_accepted_per_step=2,
-        )
-        engine = Engine(runner, enable_overlap=overlap, max_running_requests=2)
+        runner = OneTokenRunner()
+        engine = Engine(runner, enable_overlap=overlap, max_running_requests=8)
         requests = [
             engine.submit(
-                [1] * length, sampling_params=SamplingParams(max_output_tokens=20)
+                [1] * length, sampling_params=SamplingParams(max_output_tokens=5)
             )
-            for length in (127, 100)
+            for length in (15, 14, 13, 12, 4)
         ]
         while engine.has_work():
             engine.step()
         outputs.append([request.take_result() for request in requests])
         if overlap:
-            # One row starts on a page boundary and the other 27 tokens short
-            # of one. Three pages are enough for both, so overlap continues.
-            assert engine.overlap_stats[1] >= 8
-        assert engine.cache_free_parent_count == 3
+            assert engine.overlap_stats[1] >= 3
+        assert engine.cache_free_parent_count == 8
         engine.close()
         runner.shutdown()
     assert outputs[0] == outputs[1]

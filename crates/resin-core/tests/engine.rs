@@ -937,19 +937,11 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
 }
 
 fn cross_page_engine(prefix_cache: bool) -> EngineCore<&'static str> {
-    cross_page_engine_with(64, prefix_cache)
-}
-
-fn cross_page_engine_with_capacity(capacity: u32) -> EngineCore<&'static str> {
-    cross_page_engine_with(capacity, false)
-}
-
-fn cross_page_engine_with(capacity: u32, prefix_cache: bool) -> EngineCore<&'static str> {
     EngineCore::new(
         RunnerConfig {
             cache_layout: Some(
                 KvLayout::new(
-                    capacity,
+                    64,
                     vec![
                         KvGroupLayout::new(4, 2, KvRetention::FullContext).unwrap(),
                         KvGroupLayout::new(
@@ -2920,10 +2912,10 @@ fn a_continuation_lease_ends_at_its_owned_pages_and_the_chain_drains() {
         .unwrap()
         .unwrap();
     assert_eq!(plan.cache_groups[0].block_indptr, [0, 2]);
-    assert!(engine.retain_continuation(&plan));
+    let chained = engine.retain_continuation(&plan);
     let mut output = model.forward(plan).unwrap();
     let mut chain = 0;
-    while engine.has_continuation() {
+    while chained && engine.has_continuation() {
         let mut next = engine.continuation_plan().unwrap().unwrap();
         next.token_ids = vec![*output.view().row(0).last().unwrap()];
         let following = model.forward(next).unwrap();
@@ -2958,10 +2950,11 @@ fn a_continuation_lease_steps_down_from_a_full_page_as_the_pool_tightens() {
         // A spare page is available: a full page of look-ahead crosses two
         // boundaries from the last position of a page.
         (127, 64, 3),
-        // No spare page: one continuation step still crosses one boundary.
+        // One spare page: the row on a boundary takes it, and a row with
+        // 27 tokens left in its page takes it for the widest span that fits.
         (127, 2, 2),
         (100, 2, 2),
-        // Nothing spare: the narrow lease stays inside the owned page.
+        // No spare page: the narrow lease stays inside the owned page.
         (100, 1, 1),
     ] {
         let mut engine = paged_overlap_engine(128, capacity, 4);
@@ -3041,16 +3034,17 @@ fn first_overlapped_plan(
     engine.prepare_overlap_step(model, None).unwrap().unwrap()
 }
 
-/// Drains the first chain of overlapped steps and returns its continuations.
+/// Drains the first chain of overlapped steps, if the plan allows one, and returns
+/// its continuations.
 fn run_first_chain(
     engine: &mut EngineCore<&'static str>,
     model: &mut Model,
     plan: ExecutionPlan<&'static str>,
 ) -> usize {
-    assert!(engine.retain_continuation(&plan));
+    let chained = engine.retain_continuation(&plan);
     let mut output = model.forward(plan).unwrap();
     let mut chain = 0;
-    while engine.has_continuation() {
+    while chained && engine.has_continuation() {
         let mut next = engine.continuation_plan().unwrap().unwrap();
         next.token_ids = (0..output.view().len())
             .map(|row| *output.view().row(row).last().unwrap())
@@ -3071,10 +3065,10 @@ fn run_first_chain(
 
 #[test]
 fn a_continuation_lease_pins_only_boundary_rows_when_a_fixed_span_exceeds_capacity() {
-    // One row sits on a page boundary and one is 27 tokens short of it. Three
-    // pages remain after prefill, so a 32-token span needs four and fails. The
-    // widest span that fits, 27 tokens, still gives the first row its next page
-    // and keeps the second inside the page it owns.
+    // One row sits on a page boundary and one is 27 tokens short of it. The pool
+    // has three pages, each row owns one, and one is free. A 32-token span needs
+    // a page for both rows and fails. The widest span that fits, 27 tokens, gives
+    // the first row its next page and keeps the second inside the page it owns.
     let mut engine = paged_overlap_engine(128, 3, 2);
     let mut model = Model::default();
     let plan = first_overlapped_plan(&mut engine, &mut model, &[127, 100], 400);
@@ -3092,38 +3086,42 @@ fn binary_search_continuation_lease_uses_all_available_headroom_across_staggered
     // Rows sit 1, 2, 3, 4 and 12 tokens short of a 16-token page boundary.
     // Three pages are free: enough to pin the three rows closest to a boundary,
     // not the fourth.
+    let prompts = [15, 14, 13, 12, 4];
     let run = |overlap: bool| {
         let mut engine = paged_overlap_engine(16, 8, 8);
         let mut model = Model::default();
-        let prompts = [15, 14, 13, 12, 4];
-        if !overlap {
-            let requests: Vec<_> = prompts
-                .iter()
-                .map(|&prompt| engine.submit(input(vec![1; prompt], 40)).unwrap())
-                .collect();
-            while engine.has_work() {
+        let requests: Vec<_> = prompts
+            .iter()
+            .map(|&prompt| engine.submit(input(vec![1; prompt], 40)).unwrap())
+            .collect();
+        let mut chain = 0;
+        if overlap {
+            while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
                 engine.step(&mut model).unwrap();
             }
-            return (
-                requests
-                    .iter()
-                    .map(|request| request.take_result().unwrap())
-                    .collect::<Vec<_>>(),
-                0,
-            );
+            let plan = engine
+                .prepare_overlap_step(&mut model, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(pages_per_row(&plan), [2, 2, 2, 1, 1]);
+            assert_eq!(engine.cache_free_parent_count(), Some(0));
+            // The unpinned row at 12 reaches the end of its page after three steps.
+            chain = run_first_chain(&mut engine, &mut model, plan);
+            run_overlapped(&mut engine, &mut model);
         }
-        let plan = first_overlapped_plan(&mut engine, &mut model, &prompts, 40);
-        assert_eq!(pages_per_row(&plan), [2, 2, 2, 1, 1]);
-        assert_eq!(engine.cache_free_parent_count(), Some(0));
-        // The unpinned row at 12 reaches the end of its page after three steps.
-        let chain = run_first_chain(&mut engine, &mut model, plan);
-        assert_eq!(chain, 3);
-        let continued = chain + run_overlapped(&mut engine, &mut model);
-        (Vec::new(), continued)
+        while engine.has_work() {
+            engine.step(&mut model).unwrap();
+        }
+        assert_eq!(engine.cache_free_parent_count(), Some(8));
+        let results = requests
+            .iter()
+            .map(|request| request.take_result().unwrap())
+            .collect::<Vec<_>>();
+        (results, chain)
     };
-    let (expected, _) = run(false);
-    assert_eq!(expected.len(), 5);
-    assert!(run(true).1 > 3);
+    let (overlapped, chain) = run(true);
+    assert_eq!(chain, 3);
+    assert_eq!(overlapped, run(false).0);
 }
 
 #[test]
@@ -3137,106 +3135,21 @@ fn the_lease_never_asks_for_a_page_a_full_pool_cannot_give() {
     assert_eq!(engine.cache_free_parent_count(), Some(0));
 }
 
-fn admission_reserve_engine(capacity: u32) -> EngineCore<&'static str> {
-    EngineCore::new(
-        RunnerConfig {
-            cache_layout: Some(
-                KvLayout::new(
-                    capacity,
-                    vec![KvGroupLayout::new(4, 1, KvRetention::FullContext).unwrap()],
-                )
-                .unwrap(),
-            ),
-            continuation_prefill: true,
-            max_accepted_per_step: 1,
-            ..Default::default()
-        },
-        4,
-        1 << 16,
-        SchedulerConfig {
-            schedule_conservativeness: 0.0,
-            ..Default::default()
-        },
-        false,
-    )
-    .unwrap()
-}
-
-/// Starts one running request that estimates `running_pages` parents, submits
-/// a waiting request that estimates `waiting_pages` more, and returns whether
-/// the continuation survives the arrival, and whether the next step admits it.
-fn admission_blocked_by_reserve(
-    capacity: u32,
-    running_pages: u32,
-    waiting_pages: u32,
-) -> (bool, bool) {
-    let mut engine = admission_reserve_engine(capacity);
-    let mut model = Model::default();
-    let mut running = input(vec![1; running_pages as usize * 4 - 2], 8);
-    running.stop_token_ids = vec![u32::MAX];
-    engine.submit(running).unwrap();
-    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
-        engine.step(&mut model).unwrap();
-    }
-    let plan = engine
-        .prepare_overlap_step(&mut model, None)
-        .unwrap()
-        .unwrap();
-    assert!(engine.retain_continuation(&plan));
-    engine.continuation_plan().unwrap().unwrap();
-    engine
-        .submit(input(vec![5; waiting_pages as usize * 4 - 2], 2))
-        .unwrap();
-    let blocked = engine.has_continuation();
-    engine
-        .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
-        .unwrap();
-    engine
-        .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
-        .unwrap();
-    let next = engine
-        .prepare_overlap_step(&mut model, None)
-        .unwrap()
-        .unwrap();
-    (blocked, next.phase == resin_core::Phase::Prefill)
-}
-
 #[test]
-fn admission_lookahead_reserve_scales_with_the_pool_and_both_admission_checks_agree() {
-    // The reserve is capacity / 128, at most 24. The running request here
-    // estimates one page more than its prompt, for the token it has generated.
-    let running = 1_000;
-    // A 4,868-slab pool keeps 24 slabs back: 4,844 are admissible.
-    let fits = 4844 - (running + 1);
-    assert_eq!(
-        admission_blocked_by_reserve(4868, running, fits),
-        (false, true)
-    );
-    assert_eq!(
-        admission_blocked_by_reserve(4868, running, fits + 1),
-        (true, false),
-        "a request that only fits in the reserve stays out of the cohort"
-    );
-
-    // A pool under 128 slabs has no reserve.
-    assert_eq!(admission_blocked_by_reserve(100, 20, 79), (false, true));
-    assert_eq!(admission_blocked_by_reserve(100, 20, 80), (true, false));
-}
-
-#[test]
-fn speculative_boundary_leases_across_pool_sizes_match_synchronous_output() {
-    // `cross_page_engine` accepts up to four tokens per step and mixes a
-    // full-context group with a sliding window. Tighten the pool and check that
-    // the lease never shrinks as capacity grows, never fails a write guard, and
-    // leaves the output unchanged.
+fn speculative_boundary_leases_between_the_floor_and_a_full_page_match_synchronous_output() {
+    // Four-token acceptance with a sliding window and 16-token pages. Five rows
+    // sit 1, 4, 8, 12 and 16 tokens short of a page boundary. A full lease needs
+    // 27 pages and the floor needs 20, so pools between the two can pin some rows
+    // and not others. PR #24's ladder offers only those two extremes.
+    const PROMPTS: [usize; 5] = [63, 60, 56, 52, 48];
     let run = |capacity: u32, overlap: bool| {
-        let mut engine = cross_page_engine_with_capacity(capacity);
+        let mut engine = speculative_window_engine(capacity);
         let mut model = Model::default();
-        let requests: Vec<_> = [31, 32]
-            .into_iter()
-            .map(|length| engine.submit(input(vec![1; length], 30)).unwrap())
+        let requests: Vec<_> = PROMPTS
+            .iter()
+            .map(|&prompt| engine.submit(input(vec![1; prompt], 12)).unwrap())
             .collect();
-        let mut leased = 0;
+        let mut leased = Vec::new();
         if overlap {
             while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
                 engine.step(&mut model).unwrap();
@@ -3245,7 +3158,7 @@ fn speculative_boundary_leases_across_pool_sizes_match_synchronous_output() {
                 .prepare_overlap_step(&mut model, None)
                 .unwrap()
                 .unwrap();
-            leased = *plan.cache_groups[0].block_indptr.last().unwrap();
+            leased = pages_per_row(&plan);
             run_first_chain(&mut engine, &mut model, plan);
             run_overlapped(&mut engine, &mut model);
         }
@@ -3260,15 +3173,29 @@ fn speculative_boundary_leases_across_pool_sizes_match_synchronous_output() {
         (results, leased)
     };
     let mut leases = Vec::new();
-    for capacity in 14..=40 {
+    for capacity in 42..=52 {
         let (overlapped, leased) = run(capacity, true);
         assert_eq!(overlapped, run(capacity, false).0, "capacity {capacity}");
+        assert_eq!(leased.len(), PROMPTS.len(), "capacity {capacity}");
         leases.push(leased);
     }
-    assert!(leases.is_sorted(), "{leases:?}");
-    let mut distinct = leases.clone();
-    distinct.dedup();
-    assert!(distinct.len() >= 2, "the lease never widened: {leases:?}");
+    for pair in leases.windows(2) {
+        assert!(
+            pair[0]
+                .iter()
+                .zip(&pair[1])
+                .all(|(narrow, wide)| narrow <= wide),
+            "{pair:?}"
+        );
+    }
+    let narrowest = leases.first().unwrap();
+    let widest = leases.last().unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease != narrowest && lease != widest),
+        "no pool size produced a partial lease: {leases:?}"
+    );
 }
 
 fn pressure_engine(
@@ -3618,7 +3545,7 @@ fn saturated_overlap_report() {
     let report = saturated_workload(4900, 9216, (6554, 8192), (819, 1024), |rows, _| {
         rows >= SATURATED_ROWS
     });
-    assert!(report.overlapped_percent() >= 91.0);
+    assert!(report.overlapped_percent() >= 93.0);
 }
 
 /// The 1k-prompt, 8k-output counterpart: the pool fills with decoders, nothing
@@ -3634,4 +3561,41 @@ fn saturated_1k8k_overlap_report() {
         free <= SATURATED_FREE_SLABS
     });
     assert!(report.overlapped_percent() >= 94.0);
+}
+
+fn speculative_window_engine(capacity: u32) -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    capacity,
+                    vec![
+                        KvGroupLayout::new(16, 1, KvRetention::FullContext).unwrap(),
+                        KvGroupLayout::new(
+                            16,
+                            1,
+                            KvRetention::SlidingWindow {
+                                tokens: NonZeroU32::new(60).unwrap(),
+                            },
+                        )
+                        .unwrap()
+                        .with_read_window_tokens(16)
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            max_accepted_per_step: 4,
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        8,
+        512,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap()
 }

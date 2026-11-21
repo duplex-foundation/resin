@@ -93,7 +93,10 @@ estimate keeps out do not stop overlap. A request that becomes admissible, a
 stop token or output limit, cancellation, close and the end of the continuation
 lease drain before changing ownership. The lease covers a full history page of
 progress plus the write envelope, rounded up to whole pages. If the pool cannot
-reserve that for every row, it reserves the widest span the free pool covers, down to one continuation step and then only the write envelope. A wider span adds a page only to rows near a page boundary. While work is running, admission leaves 1/128 of the pool, at most 24 pages, unassigned for this. Failures after enqueue retain owners in quarantine.
+reserve that for every row, it reserves the widest span the free pool covers,
+down to one continuation step and then only the write envelope. A wider span
+adds a page only to rows near a page boundary. Failures after enqueue retain
+owners in quarantine.
 
 The fast path requires a stable decode cohort, sufficient context budget, and
 both write spans inside the same owned blocks in every cache group. Stop tokens,

@@ -202,8 +202,7 @@ covers a full history page of progress plus the write envelope, rounded up to
 whole pages. If the pool cannot reserve that for every row, the lease covers the
 widest span the free pool allows, down to one continuation step and then only
 the write envelope. A wider span adds a page only to rows near a page boundary.
-While work is running, admission leaves 1/128 of the pool, at most 24 pages,
-unassigned for this. A request that reaches
+A request that reaches
 `max_output_tokens` finishes like a stop token: its successor step still runs and
 the Engine discards that step's output. Other steps, including prefill, use the
 synchronous path. `enable_overlap=False` disables

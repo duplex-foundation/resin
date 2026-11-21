@@ -127,12 +127,6 @@ const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
 const MIN_NEW_TOKEN_RATIO_FACTOR: f64 = 0.14;
 const NEW_TOKEN_RATIO_DECAY_STEPS: f64 = 600.0;
 const RETRACTION_DECODE_HEADROOM: usize = 20;
-/// Parent slabs withheld from waiting admission while work is already active,
-/// so a near-full decode cohort keeps boundary-lookahead headroom.
-const ADMISSION_LOOKAHEAD_RESERVE_PARENTS: u32 = 24;
-/// Caps the admission reserve at 1/128 of the pool, so small pools keep their
-/// full admission capacity.
-const ADMISSION_LOOKAHEAD_RESERVE_DIVISOR: u32 = 128;
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -1247,18 +1241,7 @@ impl<P: Clone> EngineCore<P> {
         }
         estimate
             .include(candidate.cache.as_ref(), self.estimated_context(candidate))
-            .is_ok_and(|parents| parents > self.admission_parent_budget(resources))
-    }
-
-    /// Parents admission may commit while work is active. The reserve stays
-    /// free for continuation leases; `admission_blocked` and
-    /// `admission_prefix_len` must agree on it, or a chain would drain for a
-    /// candidate that admission then rejects.
-    fn admission_parent_budget(&self, resources: &PagedKvResources) -> u64 {
-        let capacity = resources.parent_capacity();
-        let reserve = (capacity / ADMISSION_LOOKAHEAD_RESERVE_DIVISOR)
-            .min(ADMISSION_LOOKAHEAD_RESERVE_PARENTS);
-        u64::from(capacity - reserve)
+            .is_ok_and(|parents| parents > u64::from(resources.parent_capacity()))
     }
 
     /// A conservative host plan reserves the longest possible previous output;
@@ -2237,12 +2220,13 @@ impl<P: Clone> EngineCore<P> {
             .take_while(|request| request.is_running())
             .count();
         let mut admitted = selected_running;
-        let budget = self.admission_parent_budget(resources);
         for request in &selected[selected_running..] {
             let parents = estimate
                 .include(request.cache.as_ref(), self.estimated_context(request))
                 .map_err(Error::from)?;
-            if parents > budget && (running_count != 0 || admitted != 0) {
+            if parents > u64::from(resources.parent_capacity())
+                && (running_count != 0 || admitted != 0)
+            {
                 break;
             }
             admitted += 1;
