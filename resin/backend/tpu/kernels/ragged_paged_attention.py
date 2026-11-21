@@ -69,7 +69,7 @@ _BATCHED_DECODE_MIN_SCOPED_VMEM_BYTES = 20 * 1024 * 1024
 _BATCHED_DECODE_SCOPED_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
 _BATCHED_DECODE_MIN_HIGH_BATCH_STEPS_UB = 256
 _BATCHED_DECODE_DEFAULT_BATCH_SIZE = 8
-_BATCHED_DECODE_MIN_SEQS = 1
+_BATCHED_DECODE_MIN_SEQS = 16
 _BATCHED_MIXED_VMEM_FRACTION = 0.80
 _BATCHED_MIXED_DEFAULT_BATCH_SIZE = 2
 _BATCHED_MIXED_STEP2B_MAX_BKV_SZ = 512
@@ -960,19 +960,12 @@ def _batched_decode_candidates(
     if max_num_seqs <= 8 or (max_num_seqs <= 16 and horizon_kv <= 4096):
         return small_batch
     if max_num_seqs <= 16:
-        return ((16, 512), (8, 1024), *small_batch)
+        return ((16, 512), *small_batch)
     long_kv = ((8, 1280),) if horizon_kv > 4096 and max_num_seqs >= 32 else ()
-    long_kv_fb = ((8, 1024),) if horizon_kv > 4096 else ()
     return (
         *long_kv,
         (16, 512),
-        (12, 512),
-        *long_kv_fb,
-        (8, 512),
-        (16, 256),
-        (8, 256),
-        (4, 512),
-        (4, 256),
+        *small_batch,
     )
 
 
@@ -1008,17 +1001,14 @@ def _select_batched_decode_config(
     version = get_tpu_version() if tpu_version is None else tpu_version
     eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
 
-    table_kv = pages_per_seq * page_size
-    horizon_kv = (
-        table_kv
-        if sliding_window is None
-        else min(table_kv, align_to(sliding_window + page_size, page_size))
-    )
+    horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
     min_unit = math.lcm(page_size, 128)
     max_useful_bkv = max(256, min_unit, align_to(horizon_kv, min_unit))
     q_per_kv = actual_num_q_heads // actual_num_kv_heads
     q_dt_name = jnp.dtype(q_dtype).name
     kv_dt_name = jnp.dtype(kv_dtype).name
+    kv_itemsize = jnp.dtype(kv_dtype).itemsize
+    aligned_hd = align_to(head_dim, 128)
 
     env_bsz = os.environ.get("RESIN_TPU_BATCHED_DECODE_BATCH_SIZE")
     env_bkv = os.environ.get("RESIN_TPU_BATCHED_DECODE_BKV_SZ")
@@ -1027,6 +1017,7 @@ def _select_batched_decode_config(
             "set both RESIN_TPU_BATCHED_DECODE_BATCH_SIZE and RESIN_TPU_BATCHED_DECODE_BKV_SZ"
         )
     has_env_override = bool(env_bsz and env_bkv)
+    bsz_ov = bkv_ov = 0
     if has_env_override:
         assert env_bsz is not None and env_bkv is not None
         bsz_ov, bkv_ov = int(env_bsz), int(env_bkv)
@@ -1060,6 +1051,8 @@ def _select_batched_decode_config(
             and (batch_size, bkv_sz) == (8, 1280)
             and horizon_kv > 4096
             and max_num_seqs >= 32
+            and kv_itemsize == 1
+            and actual_num_kv_heads * aligned_hd <= 512
             else vmem_budget
         )
         if est_bytes > cand_budget:
@@ -1107,6 +1100,11 @@ def _select_batched_decode_config(
         ):
             continue
         return cfg
+    if has_env_override:
+        raise ValueError(
+            f"batched decode override ({bsz_ov}, {bkv_ov}) rejected for "
+            f"max_num_seqs={max_num_seqs}, min_unit={min_unit}, vmem_budget={vmem_budget}"
+        )
     return None
 
 
