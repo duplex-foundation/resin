@@ -1727,18 +1727,36 @@ def _init_batched_scratches(
     bkv_x3_ref: Any,
     *,
     interpret_mode: bool,
+    actual_steps: jax.Array | None = None,
 ) -> None:
     m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
     l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
     acc_scratch_ref[...] = jnp.zeros_like(acc_scratch_ref)
-    if interpret_mode:
-        bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
-        bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
-    else:
-        q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
-        q_flat[...] = jnp.zeros_like(q_flat)
-        kv_flat[...] = jnp.zeros_like(kv_flat)
+    if actual_steps is None:
+        if interpret_mode:
+            bq_x3_ref[...] = jnp.zeros_like(bq_x3_ref)
+            bkv_x3_ref[...] = jnp.zeros_like(bkv_x3_ref)
+        else:
+            q_flat = bq_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            kv_flat = bkv_x3_ref.bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            q_flat[...] = jnp.zeros_like(q_flat)
+            kv_flat[...] = jnp.zeros_like(kv_flat)
+        return
+
+    active_slots = jnp.minimum(jnp.maximum(actual_steps, 0), _BATCHED_NUM_INPUT_SLOTS)
+
+    @pl.loop(0, active_slots)
+    def _zero_input_slot(slot: jax.Array) -> None:
+        if interpret_mode:
+            bq_x3_ref[slot] = jnp.zeros_like(bq_x3_ref[slot])
+            bkv_x3_ref[slot] = jnp.zeros_like(bkv_x3_ref[slot])
+        else:
+            q_slot = bq_x3_ref.at[slot].bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            kv_slot = (
+                bkv_x3_ref.at[slot].bitcast(jnp.uint32).reshape(-1, _TPU_NUM_LANES)
+            )
+            q_slot[...] = jnp.zeros_like(q_slot)
+            kv_slot[...] = jnp.zeros_like(kv_slot)
 
 
 def _make_batched_q_o_dma(
@@ -2034,6 +2052,7 @@ def _batched_decode_rpa_pipeline(
         bq_x3_ref,
         bkv_x3_ref,
         interpret_mode=cfgs.interpret_mode,
+        actual_steps=schedule_hbm_ref.actual_steps[0],
     )
     copy_in_q, wait_in_q, copy_out_o, wait_out_o = _make_batched_q_o_dma(
         q_hbm_ref,
