@@ -3769,12 +3769,15 @@ class TestDecodeMatmulPath:
         )
         np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
 
-    @pytest.mark.parametrize("batch", [1, 8, 16, 64, 192, 224, 313, 320])
+    @pytest.mark.parametrize("batch", [1, 8, 16, 64, 89, 96, 128, 192, 224, 313, 320])
     @pytest.mark.parametrize("n_dim,k_global", [(256, 256), (512, 256), (384, 256)])
     def test_async_ar_fused_add_rms_norm_fp8_quant_interpret(
         self, batch: int, n_dim: int, k_global: int
     ) -> None:
+        from unittest import mock
+
         from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
 
         from resin.backend.tpu.kernels import (
@@ -3782,13 +3785,14 @@ class TestDecodeMatmulPath:
             fp8_matmul_prequantized,
             fused_add_rms_norm_fp8_quant,
             get_async_ar_tile_sizes,
+            pallas_fp8_row_matmul_async_ar,
             quantize_fp8_act,
             quantize_fp8_weight,
             sharded_fp8_row_matmul_async_ar,
         )
         from resin.backend.tpu.kernels._rpa_v3_pallas import align_to
 
-        if batch in (64, 192, 224, 320) and (n_dim, k_global) != (512, 256):
+        if batch in (64, 96, 128, 192, 224, 320) and (n_dim, k_global) != (512, 256):
             return
 
         if batch == 320 and (n_dim, k_global) == (512, 256):
@@ -3849,24 +3853,38 @@ class TestDecodeMatmulPath:
         tiles = Fp8MatmulTileSizes(align_to(max(8, batch), 8), 128, 128, 2)
         interp_params = pltpu.InterpretParams(detect_races=True)
 
-        xq_got, xs_got, res_got = sharded_fp8_row_matmul_async_ar(
-            xq,
-            wq,
-            ws,
-            mesh=mesh,
-            x_scale=xs,
-            sync_tp_scale=False,
-            residual=res_bf16,
-            norm_weight=norm_w,
-            eps=1e-6,
-            quantize_output_dtype=jnp.float8_e4m3fn,
-            transposed_scale=True,
-            tile_sizes=tiles,
-            backend="pallas",
-            interpret=interp_params,
-        )
-        assert interpret_pallas_call.races is not None
-        assert not interpret_pallas_call.races.races_found
+        with mock.patch(
+            "resin.backend.tpu.kernels.collective_fp8_matmul.pl.pallas_call",
+            wraps=pl.pallas_call,
+        ) as ar_pallas_spy:
+            xq_got, xs_got, res_got = sharded_fp8_row_matmul_async_ar(
+                xq,
+                wq,
+                ws,
+                mesh=mesh,
+                x_scale=xs,
+                sync_tp_scale=False,
+                residual=res_bf16,
+                norm_weight=norm_w,
+                eps=1e-6,
+                quantize_output_dtype=jnp.float8_e4m3fn,
+                transposed_scale=True,
+                tile_sizes=tiles,
+                backend="pallas",
+                interpret=interp_params,
+            )
+        ar_names = [
+            str(call.kwargs.get("name", "")) for call in ar_pallas_spy.call_args_list
+        ]
+        if batch <= 96:
+            assert len(ar_names) == 1
+            assert ar_names[0].endswith("_add_norm_q")
+            assert interpret_pallas_call.races is not None
+            assert not interpret_pallas_call.races.races_found
+        else:
+            assert len(ar_names) == 2
+            assert not ar_names[0].endswith("_add_norm_q")
+            assert ar_names[1].startswith("fused_add_rms_norm_fp8_quant_")
 
         delta_ref = sharded_fp8_row_matmul_async_ar(
             xq,
@@ -3943,6 +3961,63 @@ class TestDecodeMatmulPath:
             )
             assert fb_q.shape == (batch, n_dim)
             assert fb_s.shape == (1, batch)
+
+            big_tiles = Fp8MatmulTileSizes(128, 128, 128, 2)
+            with mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.pl.pallas_call",
+                wraps=pl.pallas_call,
+            ) as big_tile_spy:
+                bt_q, bt_s, bt_r = sharded_fp8_row_matmul_async_ar(
+                    xq,
+                    wq,
+                    ws,
+                    mesh=mesh,
+                    x_scale=xs,
+                    sync_tp_scale=False,
+                    residual=res_bf16,
+                    norm_weight=norm_w,
+                    eps=1e-6,
+                    quantize_output_dtype=jnp.float8_e4m3fn,
+                    transposed_scale=True,
+                    tile_sizes=big_tiles,
+                    backend="pallas",
+                    interpret=True,
+                )
+            big_names = [
+                str(call.kwargs.get("name", "")) for call in big_tile_spy.call_args_list
+            ]
+            assert len(big_names) == 2
+            assert not big_names[0].endswith("_add_norm_q")
+            assert big_names[1].startswith("fused_add_rms_norm_fp8_quant_")
+            np.testing.assert_array_equal(np.asarray(bt_r), np.asarray(res_ref))
+            np.testing.assert_array_equal(np.asarray(bt_s), np.asarray(xs_ref))
+            np.testing.assert_array_equal(np.asarray(bt_q), np.asarray(xq_ref))
+
+            with pytest.raises(ValueError, match="<= 96"):
+                jax.shard_map(
+                    lambda xql, xsl, wql, wsl, rl, nwl: pallas_fp8_row_matmul_async_ar(
+                        xql,
+                        xsl,
+                        wql,
+                        wsl,
+                        residual=rl,
+                        norm_weight=nwl,
+                        quantize_output_dtype=jnp.float8_e4m3fn,
+                        tile_sizes=big_tiles,
+                        interpret=True,
+                    ),
+                    mesh=mesh,
+                    in_specs=(
+                        P(None, "tp"),
+                        P("tp", None),
+                        P(None, "tp"),
+                        P(),
+                        P(None, None),
+                        P(),
+                    ),
+                    out_specs=(P(None, None), P(None, None), P(None, None)),
+                    check_vma=False,
+                )(xq, xs, wq, ws, res_bf16, norm_w)
 
     def test_async_row_all_reduce_vmem_limit_tile_validation_and_fallbacks(
         self,

@@ -600,6 +600,15 @@ def pallas_fp8_row_matmul_async_ar(
     padded_batch, padded_n, padded_k, n_out = _validate_async_ar_tiles(
         orig_batch, orig_n, orig_k, eff_tiles
     )
+    if fuse_norm_quant and (
+        orig_batch > _ASYNC_AR_FUSED_NORM_MAX_BATCH
+        or batch_block > _ASYNC_AR_FUSED_NORM_MAX_BATCH
+    ):
+        raise ValueError(
+            "pallas_fp8_row_matmul_async_ar fused norm epilogue requires "
+            f"orig_batch and batch_block_size <= {_ASYNC_AR_FUSED_NORM_MAX_BATCH}, "
+            f"got orig_batch={orig_batch}, batch_block_size={batch_block}"
+        )
     target_out_dtype = jnp.dtype(out_dtype)
     eff_reduce = jnp.dtype(target_out_dtype if reduce_dtype is None else reduce_dtype)
     n_w_slots = min(w_buf, n_out)
@@ -903,6 +912,14 @@ def sharded_fp8_row_matmul_async_ar(
     local_k = w.shape[1] // max(tp, 1)
 
     is_supported_tpu = is_interpret or get_tpu_version() >= 7
+    use_fused_epilogue = (
+        fuse_norm_quant
+        and orig_batch <= _ASYNC_AR_FUSED_NORM_MAX_BATCH
+        and (
+            tile_sizes is None
+            or tile_sizes.batch_block_size <= _ASYNC_AR_FUSED_NORM_MAX_BATCH
+        )
+    )
     if backend == "xla":
         should_fallback = True
     elif backend == "auto":
@@ -919,8 +936,7 @@ def sharded_fp8_row_matmul_async_ar(
                     w_dtype=w.dtype,
                     out_dtype=out_dtype,
                     reduce_dtype=reduce_dtype,
-                    fuse_norm_quant=fuse_norm_quant
-                    and orig_batch <= _ASYNC_AR_FUSED_NORM_MAX_BATCH,
+                    fuse_norm_quant=use_fused_epilogue,
                     q_out_dtype=quantize_output_dtype,
                 )
             )
@@ -1011,7 +1027,7 @@ def sharded_fp8_row_matmul_async_ar(
         if fuse_norm_quant:
             res_rep, nw_rep = fused_tail
             assert quantize_output_dtype is not None
-            if tile_sizes is None and orig_batch > _ASYNC_AR_FUSED_NORM_MAX_BATCH:
+            if not use_fused_epilogue:
                 delta_rep = pallas_fp8_row_matmul_async_ar(
                     xq_shard,
                     xs_shard,
@@ -1020,6 +1036,7 @@ def sharded_fp8_row_matmul_async_ar(
                     tp_axis=tp_axis,
                     out_dtype=out_dtype,
                     reduce_dtype=reduce_dtype,
+                    tile_sizes=tile_sizes,
                     collective_id=collective_id,
                     interpret=interpret,
                 )
