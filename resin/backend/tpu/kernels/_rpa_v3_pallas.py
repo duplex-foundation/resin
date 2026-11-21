@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -1046,26 +1046,50 @@ class BatchedDecodeSchedule(_ScheduleSpecMixin):
 
     @classmethod
     def create_shape_dtype(
-        cls, cfgs: BatchedDecodeConfig, *, steps: int
+        cls,
+        cfgs: BatchedDecodeConfig,
+        *,
+        steps: int,
+        leaf_sizes: tuple[int, ...] | None = None,
     ) -> BatchedDecodeSchedule:
-        idx_arr = _SmemArray.create_shape_dtype((steps, cfgs.batch_size))
-        step_arr = _SmemArray.create_shape_dtype((steps,))
+        def _smem_arr(shape: tuple[int, ...], leaf_idx: int) -> _SmemArray:
+            alloc_sz = math.prod(shape) if leaf_sizes is None else leaf_sizes[leaf_idx]
+            return _SmemArray(
+                data=jax.ShapeDtypeStruct((alloc_sz,), jnp.int32), shape=shape
+            )
+
+        b = cfgs.batch_size
         return cls(
-            s_idx=idx_arr,
-            k_idx=idx_arr,
-            is_last_k=idx_arr,
-            do_writeback=idx_arr,
-            dma_q=_SmemArray.create_shape_dtype((steps, cfgs.batch_size, 2)),
-            dma_kv_cache=_SmemArray.create_shape_dtype(
-                (steps, cfgs.batch_size, cfgs.bkv_p, 3)
-            ),
-            dma_kv_new=_SmemArray.create_shape_dtype((steps, cfgs.batch_size, 5)),
-            total_wait_kv_in=step_arr,
-            total_wait_kv_out=step_arr,
-            total_wait_q_in=step_arr,
-            total_wait_o_out=step_arr,
+            s_idx=_smem_arr((steps, b), 0),
+            k_idx=_smem_arr((steps, b), 1),
+            is_last_k=_smem_arr((steps, b), 2),
+            do_writeback=_smem_arr((steps, b), 3),
+            dma_q=_smem_arr((steps, b, 2), 4),
+            dma_kv_cache=_smem_arr((steps, b, cfgs.bkv_p, 3), 5),
+            dma_kv_new=_smem_arr((steps, b, 5), 6),
+            total_wait_kv_in=_smem_arr((steps,), 7),
+            total_wait_kv_out=_smem_arr((steps,), 8),
+            total_wait_q_in=_smem_arr((steps,), 9),
+            total_wait_o_out=_smem_arr((steps,), 10),
             actual_steps=jax.ShapeDtypeStruct((1,), jnp.int32),
         )
+
+    def to_flat_leaves(self) -> tuple[Any, ...]:
+        return tuple(jax.tree_util.tree_leaves(self))
+
+    @classmethod
+    def from_flat_leaves(
+        cls,
+        cfgs: BatchedDecodeConfig,
+        leaves: Sequence[Any],
+        *,
+        steps: int | None = None,
+    ) -> BatchedDecodeSchedule:
+        eff_steps = cfgs.schedule_hbm_steps if steps is None else steps
+        _, treedef = jax.tree_util.tree_flatten(
+            cls.create_shape_dtype(cfgs, steps=eff_steps)
+        )
+        return jax.tree_util.tree_unflatten(treedef, tuple(leaves))
 
 
 @jax.tree_util.register_dataclass
@@ -1150,10 +1174,11 @@ def _batched_decode_schedule_kernel(
         hbm_offset_aligned = pl.multiple_of(hbm_offset, _TPU_NUM_LANES)
         flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
         flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+        b = cfgs.batch_size
+        elem_sizes = (b, b, b, b, 2 * b, 3 * cfgs.bkv_p * b, 5 * b, 1, 1, 1, 1, 0)
         copies = []
-        for h, s in zip(flat_hbm, flat_smem, strict=True):
-            if h.shape[0] > 1:
-                elem_sz = s.shape[0] // cfgs.max_steps_ub
+        for h, s, elem_sz in zip(flat_hbm, flat_smem, elem_sizes, strict=True):
+            if elem_sz > 0:
                 write_sz = cfgs.max_steps_ub * elem_sz
                 out_off = hbm_offset_aligned * elem_sz
                 copies.append(
@@ -1296,6 +1321,138 @@ def generate_batched_decode_schedule(
         interpret=interpret_params,
         name="rpa_metadata_schedule",
     )(kv_lens, cu_q_lens, distribution)
+
+
+def _switched_batched_decode_schedule_kernel(
+    branch_idx_ref: Any,
+    kv_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    distribution_ref: Any,
+    schedule_hbm_ref: BatchedDecodeSchedule,
+    schedule_smem_ref: BatchedDecodeSchedule,
+    dma_sem: Any,
+    *,
+    cfg_long: BatchedDecodeConfig,
+    cfg_short: BatchedDecodeConfig,
+) -> None:
+    b_idx = branch_idx_ref[0]
+
+    @pl.when(b_idx == 0)
+    def _emit_noop() -> None:
+        schedule_smem_ref.actual_steps[0] = 0
+        steps_cp = pltpu.make_async_copy(
+            schedule_smem_ref.actual_steps.at[pl.ds(0, 1)],
+            schedule_hbm_ref.actual_steps.at[pl.ds(0, 1)],
+            dma_sem.at[0],
+        )
+        steps_cp.start()
+        steps_cp.wait()
+
+    @pl.when(b_idx == 1)
+    def _emit_long() -> None:
+        _batched_decode_schedule_kernel(
+            kv_lens_ref,
+            cu_q_lens_ref,
+            distribution_ref,
+            schedule_hbm_ref,
+            schedule_smem_ref,
+            dma_sem,
+            cfgs=cfg_long,
+        )
+
+    @pl.when(b_idx == 2)
+    def _emit_short() -> None:
+        _batched_decode_schedule_kernel(
+            kv_lens_ref,
+            cu_q_lens_ref,
+            distribution_ref,
+            BatchedDecodeSchedule.from_flat_leaves(
+                cfg_short, schedule_hbm_ref.to_flat_leaves()
+            ),
+            BatchedDecodeSchedule.from_flat_leaves(
+                cfg_short,
+                schedule_smem_ref.to_flat_leaves(),
+                steps=cfg_short.max_steps_ub,
+            ),
+            dma_sem,
+            cfgs=cfg_short,
+        )
+
+
+def generate_switched_batched_decode_schedule(
+    branch_idx: jax.Array,
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    cfg_long: BatchedDecodeConfig,
+    cfg_short: BatchedDecodeConfig,
+) -> tuple[BatchedDecodeSchedule, BatchedDecodeSchedule]:
+    """Build unified HBM schedules for cfg_long (branch 1) and cfg_short (branch 2)."""
+    assert (
+        cfg_long.interpret_mode,
+        cfg_long.disable_bounds_checks,
+        cfg_long.disable_semaphore_checks,
+    ) == (
+        cfg_short.interpret_mode,
+        cfg_short.disable_bounds_checks,
+        cfg_short.disable_semaphore_checks,
+    )
+    smem_long = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_long, steps=cfg_long.max_steps_ub
+    ).to_flat_leaves()
+    smem_short = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_short, steps=cfg_short.max_steps_ub
+    ).to_flat_leaves()
+    hbm_long = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_long, steps=cfg_long.schedule_hbm_steps
+    ).to_flat_leaves()
+    hbm_short = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_short, steps=cfg_short.schedule_hbm_steps
+    ).to_flat_leaves()
+
+    unified_smem_sizes = tuple(
+        max(a.size, b.size) for a, b in zip(smem_long, smem_short, strict=True)
+    )
+    unified_hbm_sizes = tuple(
+        max(a.size, b.size) for a, b in zip(hbm_long, hbm_short, strict=True)
+    )
+    sched_smem_struct = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_long, steps=cfg_long.max_steps_ub, leaf_sizes=unified_smem_sizes
+    )
+    sched_hbm_struct = BatchedDecodeSchedule.create_shape_dtype(
+        cfg_long, steps=cfg_long.schedule_hbm_steps, leaf_sizes=unified_hbm_sizes
+    )
+    interpret_params = pltpu.InterpretParams() if cfg_long.interpret_mode else False
+    sched_long = pl.pallas_call(
+        functools.partial(
+            _switched_batched_decode_schedule_kernel,
+            cfg_long=cfg_long,
+            cfg_short=cfg_short,
+        ),
+        out_shape=sched_hbm_struct,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            in_specs=[],
+            out_specs=sched_hbm_struct.out_specs(),
+            scratch_shapes=[
+                sched_smem_struct.scratch_shapes(),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+            grid=(1,),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=cfg_long.disable_bounds_checks,
+            disable_semaphore_checks=cfg_long.disable_semaphore_checks,
+        ),
+        interpret=interpret_params,
+        name="rpa_metadata_schedule",
+    )(jnp.reshape(branch_idx, (1,)), kv_lens, cu_q_lens, distribution)
+    sched_short = BatchedDecodeSchedule.from_flat_leaves(
+        cfg_short, sched_long.to_flat_leaves()
+    )
+    return sched_long, sched_short
 
 
 def _step_guard(
