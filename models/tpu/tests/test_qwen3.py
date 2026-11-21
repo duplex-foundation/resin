@@ -750,9 +750,34 @@ class TestFp8Weights:
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode in ("auto", "pallas") and tokens <= 320:
                         o_blk = 640 if tokens <= 192 else 1280
-                        assert f"fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3" in mlir_txt
+                        if tokens <= 96:
+                            assert (
+                                f"fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3_add_norm_q"
+                                in mlir_txt
+                            )
+                            assert (
+                                f"fp8_w8a8_async_ar_{tokens}_512_12800_b3_add_norm_q"
+                                in mlir_txt
+                            )
+                            assert (
+                                'kernel_name = "fused_add_rms_norm_fp8_quant_'
+                                not in mlir_txt
+                            )
+                        else:
+                            assert (
+                                f'kernel_name = "fp8_w8a8_async_ar_{tokens}_{o_blk}_4096_b3"'
+                                in mlir_txt
+                            )
+                            assert (
+                                f'kernel_name = "fused_add_rms_norm_fp8_quant_{tokens}_5120"'
+                                in mlir_txt
+                            )
                         assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
-                        assert f"fp8_w8a8_async_ar_{tokens}_512_12800_b3" in mlir_txt
+                        assert (
+                            f'kernel_name = "fp8_w8a8_async_ar_{tokens}_512_12800_b3"'
+                            in mlir_txt
+                        )
+                        assert mlir_txt.count('kernel_name = "rms_norm_fp8_quant_') <= 1
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
                         gu_blk = 1280 if tokens >= 288 else 640
                         gu_suffix = "" if tokens >= 288 else "_b3"

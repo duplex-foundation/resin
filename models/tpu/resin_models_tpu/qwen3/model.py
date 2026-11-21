@@ -659,6 +659,49 @@ class Qwen3Model:
             and (q_width // tp) % 128 == 0
         )
 
+        def _row_proj_add_norm_quant(
+            row_in: jax.Array,
+            row_w: Fp8Weight,
+            res: jax.Array,
+            norm_w: jax.Array,
+            q_out_dtype: Any,
+            *,
+            x_scale: jax.Array | None = None,
+            x_abs_max: jax.Array | None = None,
+            sync_scale: bool,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            if use_async_row_ar:
+                return sharded_fp8_row_matmul_async_ar(
+                    row_in,
+                    row_w.qvalue,
+                    row_w.scale,
+                    mesh=self.mesh,
+                    x_scale=x_scale,
+                    x_abs_max=x_abs_max,
+                    sync_tp_scale=sync_scale,
+                    out_dtype=act_dtype,
+                    residual=res,
+                    norm_weight=norm_w,
+                    eps=eps,
+                    quantize_output_dtype=q_out_dtype,
+                    transposed_scale=True,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                )
+            row_out = self._linear(
+                row_in,
+                row_w,
+                ROW,
+                x_scale=x_scale,
+                x_abs_max=x_abs_max,
+                sync_tp_scale=sync_scale,
+                async_all_reduce=False,
+                out_dtype=act_dtype,
+                backend=proj_backend,
+                interpret=dec_interp,
+            )
+            return _rep_add_norm_quant(row_out, res, norm_w)
+
         h_q, h_scale = _rep_norm_quant(x, layers[0].input_norm)
         layer_caches = []
         num_layers = len(layers)
@@ -702,34 +745,28 @@ class Qwen3Model:
                     out_specs=(ROW, P(TP_AXIS, None)),
                     check_vma=False,
                 )(att_packed)
-                o_out = self._linear(
+                mlp_q, mlp_scale, x = _row_proj_add_norm_quant(
                     att_q,
                     weights.o,
-                    ROW,
+                    x,
+                    weights.post_norm,
+                    weights.gate_up.qvalue.dtype,
                     x_scale=att_scale,
-                    sync_tp_scale=False,
-                    async_all_reduce=use_async_row_ar,
-                    out_dtype=act_dtype,
-                    backend=proj_backend,
-                    interpret=dec_interp,
+                    sync_scale=False,
                 )
             else:
                 attended, kv_cache = self._attend_qkv(
                     qkv_out, weights, kv_cache, inputs, params.rope_cache
                 )
                 layer_caches.append(kv_cache)
-                o_out = self._linear(
+                mlp_q, mlp_scale, x = _row_proj_add_norm_quant(
                     attended.reshape(tokens, q_width),
                     weights.o,
-                    ROW,
-                    sync_tp_scale=row_sync_tp_scale,
-                    async_all_reduce=use_async_row_ar,
-                    out_dtype=act_dtype,
-                    backend=proj_backend,
-                    interpret=dec_interp,
+                    x,
+                    weights.post_norm,
+                    weights.gate_up.qvalue.dtype,
+                    sync_scale=row_sync_tp_scale,
                 )
-
-            mlp_q, mlp_scale, x = _rep_add_norm_quant(o_out, x, weights.post_norm)
 
             gated_in, gated_aux = sharded_fp8_gate_up_swiglu(
                 mlp_q,
@@ -745,23 +782,32 @@ class Qwen3Model:
                 backend=gu_backend,
                 interpret=dec_interp,
             )
-            down_out = self._linear(
-                gated_in,
-                weights.down,
-                ROW,
-                x_scale=gated_aux if prequantize_gated else None,
-                x_abs_max=None if prequantize_gated else gated_aux,
-                sync_tp_scale=row_sync_tp_scale,
-                async_all_reduce=use_async_row_ar,
-                out_dtype=act_dtype,
-                backend=proj_backend,
-                interpret=dec_interp,
-            )
             if idx + 1 < num_layers:
-                h_q, h_scale, x = _rep_add_norm_quant(
-                    down_out, x, layers[idx + 1].input_norm
+                next_layer = layers[idx + 1]
+                assert isinstance(next_layer.qkv, Fp8Weight)
+                h_q, h_scale, x = _row_proj_add_norm_quant(
+                    gated_in,
+                    weights.down,
+                    x,
+                    next_layer.input_norm,
+                    next_layer.qkv.qvalue.dtype,
+                    x_scale=gated_aux if prequantize_gated else None,
+                    x_abs_max=None if prequantize_gated else gated_aux,
+                    sync_scale=row_sync_tp_scale,
                 )
             else:
+                down_out = self._linear(
+                    gated_in,
+                    weights.down,
+                    ROW,
+                    x_scale=gated_aux if prequantize_gated else None,
+                    x_abs_max=None if prequantize_gated else gated_aux,
+                    sync_tp_scale=row_sync_tp_scale,
+                    async_all_reduce=use_async_row_ar,
+                    out_dtype=act_dtype,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                )
                 normed, _ = fused_add_rms_norm(down_out, x, params.norm, eps)
 
         return normed, (tuple(layer_caches),)

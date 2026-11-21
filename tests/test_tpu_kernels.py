@@ -3767,6 +3767,181 @@ class TestDecodeMatmulPath:
         )
         np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
 
+    @pytest.mark.parametrize("batch", [1, 8, 16, 64, 192, 224, 313, 320])
+    @pytest.mark.parametrize("n_dim,k_global", [(256, 256), (512, 256), (384, 256)])
+    def test_async_ar_fused_add_rms_norm_fp8_quant_interpret(
+        self, batch: int, n_dim: int, k_global: int
+    ) -> None:
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            estimate_async_ar_vmem_bytes,
+            fp8_matmul_prequantized,
+            fused_add_rms_norm_fp8_quant,
+            get_async_ar_tile_sizes,
+            quantize_fp8_act,
+            quantize_fp8_weight,
+            sharded_fp8_row_matmul_async_ar,
+        )
+        from resin.backend.tpu.kernels._rpa_v3_pallas import align_to
+
+        if batch in (64, 192, 224, 320) and (n_dim, k_global) != (512, 256):
+            return
+
+        if batch == 320 and (n_dim, k_global) == (512, 256):
+            for out_dim, k_loc in ((5120, 4096), (5120, 12800)):
+                t_qwen = get_async_ar_tile_sizes(320, out_dim, k_loc)
+                n_out_q = out_dim // t_qwen.out_block_size
+                v_bytes = estimate_async_ar_vmem_bytes(
+                    t_qwen.batch_block_size,
+                    t_qwen.out_block_size,
+                    t_qwen.in_block_size,
+                    n_out_q,
+                    min(t_qwen.w_buffer_count, n_out_q),
+                    fuse_norm_quant=True,
+                )
+                assert v_bytes <= 40 * 1024 * 1024
+
+        devices = jax.devices()
+        if len(devices) < 2:
+            pytest.skip("requires at least 2 devices for tp=2 async all-reduce")
+
+        mesh = make_mesh(2, devices[:2])
+        row_sharding = NamedSharding(mesh, P(None, "tp"))
+        rep_sharding = NamedSharding(mesh, P())
+        rng = np.random.default_rng(7100 + batch * 13 + n_dim)
+
+        x_bf16 = jax.device_put(
+            jnp.asarray(rng.standard_normal((batch, k_global)) * 0.4, jnp.bfloat16),
+            row_sharding,
+        )
+        res_bf16 = jax.device_put(
+            jnp.asarray(rng.standard_normal((batch, n_dim)) * 0.4, jnp.bfloat16),
+            rep_sharding,
+        )
+        norm_w = jax.device_put(
+            jnp.asarray(rng.uniform(0.5, 1.5, size=(n_dim,)), jnp.bfloat16),
+            rep_sharding,
+        )
+        w = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((n_dim, k_global)) * 0.03, jnp.bfloat16)
+        )
+        wq = jax.device_put(w.qvalue, row_sharding)
+        ws = jax.device_put(w.scale, rep_sharding)
+
+        def _quant_per_die(x_sh: jax.Array) -> tuple[jax.Array, jax.Array]:
+            def _lq(xl: jax.Array) -> tuple[jax.Array, jax.Array]:
+                ql, sl = quantize_fp8_act(xl, tp_axis="tp", sync_tp_scale=False)
+                return ql, jnp.transpose(sl.reshape(batch, 1))
+
+            return jax.shard_map(
+                _lq,
+                mesh=mesh,
+                in_specs=P(None, "tp"),
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )(x_sh)
+
+        xq, xs = _quant_per_die(x_bf16)
+        tiles = Fp8MatmulTileSizes(align_to(max(8, batch), 8), 128, 128, 2)
+        interp_params = pltpu.InterpretParams(detect_races=True)
+
+        xq_got, xs_got, res_got = sharded_fp8_row_matmul_async_ar(
+            xq,
+            wq,
+            ws,
+            mesh=mesh,
+            x_scale=xs,
+            sync_tp_scale=False,
+            residual=res_bf16,
+            norm_weight=norm_w,
+            eps=1e-6,
+            quantize_output_dtype=jnp.float8_e4m3fn,
+            transposed_scale=True,
+            tile_sizes=tiles,
+            backend="pallas",
+            interpret=interp_params,
+        )
+        assert interpret_pallas_call.races is not None
+        assert not interpret_pallas_call.races.races_found
+
+        delta_ref = sharded_fp8_row_matmul_async_ar(
+            xq,
+            wq,
+            ws,
+            mesh=mesh,
+            x_scale=xs,
+            sync_tp_scale=False,
+            tile_sizes=tiles,
+            backend="pallas",
+            interpret=True,
+        )
+        xq_ref, xs_ref, res_ref = jax.shard_map(
+            lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(
+                dl, rl, nw, 1e-6, transposed_scale=True, interpret=True
+            ),
+            mesh=mesh,
+            in_specs=(P(None, None), P(None, None), P()),
+            out_specs=(P(None, None), P(None, None), P(None, None)),
+            check_vma=False,
+        )(delta_ref, res_bf16, norm_w)
+
+        np.testing.assert_array_equal(
+            np.asarray(res_got.addressable_shards[0].data),
+            np.asarray(res_got.addressable_shards[1].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(xq_got.addressable_shards[0].data),
+            np.asarray(xq_got.addressable_shards[1].data),
+        )
+
+        k_half = k_global // 2
+        d0 = fp8_matmul_prequantized(
+            xq[:, :k_half], xs[0].reshape(batch, 1), w.qvalue[:, :k_half], w.scale
+        )
+        d1 = fp8_matmul_prequantized(
+            xq[:, k_half:], xs[1].reshape(batch, 1), w.qvalue[:, k_half:], w.scale
+        )
+        exact_next_res = (
+            d0.astype(jnp.float32)
+            + d1.astype(jnp.float32)
+            + res_bf16.astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        np.testing.assert_allclose(
+            np.asarray(res_got, np.float32),
+            np.asarray(exact_next_res, np.float32),
+            rtol=1e-2,
+            atol=2e-3,
+        )
+        np.testing.assert_array_equal(np.asarray(res_got), np.asarray(res_ref))
+        np.testing.assert_array_equal(np.asarray(xs_got), np.asarray(xs_ref))
+        np.testing.assert_array_equal(np.asarray(xq_got), np.asarray(xq_ref))
+
+        if batch == 8 and (n_dim, k_global) == (256, 256):
+            fb_q, fb_s, fb_r = sharded_fp8_row_matmul_async_ar(
+                xq,
+                wq,
+                ws,
+                mesh=mesh,
+                x_scale=xs,
+                sync_tp_scale=False,
+                residual=res_bf16,
+                norm_weight=norm_w,
+                eps=1e-6,
+                quantize_output_dtype=jnp.float8_e4m3fn,
+                transposed_scale=True,
+                backend="xla",
+            )
+            np.testing.assert_allclose(
+                np.asarray(fb_r, np.float32),
+                np.asarray(res_got, np.float32),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            assert fb_q.shape == (batch, n_dim)
+            assert fb_s.shape == (1, batch)
+
     def test_async_row_all_reduce_vmem_limit_tile_validation_and_fallbacks(
         self,
     ) -> None:
