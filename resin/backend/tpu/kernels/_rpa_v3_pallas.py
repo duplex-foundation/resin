@@ -1633,7 +1633,7 @@ def _batched_decode_rpa_body(
         mask_fill: Any = jnp.asarray(mask_val, dtype=jnp.bfloat16)
         exp_fn = lax.exp2
     else:
-        mask_fill = cfgs.mask_value
+        mask_fill = jnp.asarray(cfgs.mask_value, dtype=qk.dtype)
         exp_fn = jnp.exp
 
     # Finite mask_fill guarantees finite m_next even on all-masked tiles; on the
@@ -1641,13 +1641,7 @@ def _batched_decode_rpa_body(
     # zeros carried-over finite l_prev / o_prev without extra vselect ops.
     skip_lo_reset = use_bf16_qkp
 
-    qk = jnp.stack(
-        [
-            jnp.where(masks[b_idx], qk[b_idx], mask_fill)
-            for b_idx in range(cfgs.batch_size)
-        ],
-        axis=0,
-    )
+    qk = jnp.where(jnp.stack(masks, axis=0), qk, mask_fill)
 
     m_reset = jnp.asarray(-jnp.inf, dtype=acc_dt)
     zero_acc = jnp.asarray(0.0, dtype=acc_dt)
