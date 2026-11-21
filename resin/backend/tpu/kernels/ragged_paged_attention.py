@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import Any, NamedTuple
 
 import jax
@@ -63,6 +64,10 @@ _DECODE_VMEM_SCRATCH_FRACTION = 0.375
 _MIXED_VMEM_SCRATCH_FRACTION = 0.45
 _TUNED_VMEM_CAP_FRACTION = 0.75
 _BATCHED_DECODE_VMEM_FRACTION = 0.90
+_BATCHED_DECODE_SELECT_VMEM_FRACTION = 50.0 / 64.0
+_BATCHED_DECODE_MIN_SCOPED_VMEM_BYTES = 20 * 1024 * 1024
+_BATCHED_DECODE_SCOPED_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
+_BATCHED_DECODE_MIN_HIGH_BATCH_STEPS_UB = 256
 _BATCHED_DECODE_DEFAULT_BATCH_SIZE = 8
 _BATCHED_DECODE_MIN_SEQS = 16
 _BATCHED_MIXED_VMEM_FRACTION = 0.80
@@ -948,7 +953,23 @@ def _batched_decode_vmem_estimate_bytes(
     )
 
 
-def _get_batched_decode_block_sizes(
+def _batched_decode_candidates(
+    max_num_seqs: int, horizon_kv: int
+) -> tuple[tuple[int, int], ...]:
+    small_batch = ((8, 512), (8, 256), (4, 512), (4, 256))
+    if max_num_seqs <= 8 or (max_num_seqs <= 16 and horizon_kv <= 4096):
+        return small_batch
+    if max_num_seqs <= 16:
+        return ((16, 512), *small_batch)
+    long_kv = ((8, 1280),) if horizon_kv > 4096 and max_num_seqs >= 32 else ()
+    return (
+        *long_kv,
+        (16, 512),
+        *small_batch,
+    )
+
+
+def _select_batched_decode_config(
     q_dtype: Any,
     kv_dtype: Any,
     actual_num_q_heads: int,
@@ -956,55 +977,135 @@ def _get_batched_decode_block_sizes(
     head_dim: int,
     page_size: int,
     pages_per_seq: int,
+    max_num_seqs: int,
     *,
-    tpu_version: int | None = None,
+    sm_scale: float = 1.0,
+    mask_value: float = _DEFAULT_MASK_VALUE,
     sliding_window: int | None = None,
-    vmem_limit_bytes: int | None = None,
+    soft_cap: float | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    update_kv_cache: bool = True,
     bf16_qk_softmax: bool = True,
     bf16_online_scratch: bool = False,
-) -> tuple[int, int]:
+    tpu_version: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    smem_capacity_bytes: int = _DEFAULT_SMEM_BYTES,
+    disable_bounds_checks: bool = True,
+    disable_semaphore_checks: bool = True,
+    interpret_mode: bool = False,
+) -> BatchedDecodeConfig | None:
+    if page_size <= 0 or pages_per_seq <= 0 or max_num_seqs <= 0:
+        return None
     version = get_tpu_version() if tpu_version is None else tpu_version
     eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
-    capped_vmem = int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
 
-    mxu_col = 256 if (version >= 6 or version < 0) else 128
-    table_kv = pages_per_seq * page_size
     horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
-    max_bkv = min(4096, horizon_kv, table_kv)
-    bkv_step = align_to(mxu_col, page_size)
-    if bkv_step > max_bkv:
-        bkv_step = page_size
-
+    min_unit = math.lcm(page_size, 128)
+    max_useful_bkv = max(256, min_unit, align_to(horizon_kv, min_unit))
     q_per_kv = actual_num_q_heads // actual_num_kv_heads
+    q_dt_name = jnp.dtype(q_dtype).name
+    kv_dt_name = jnp.dtype(kv_dtype).name
+    kv_itemsize = jnp.dtype(kv_dtype).itemsize
+    aligned_hd = align_to(head_dim, 128)
 
-    def _est(bsz: int, bkv: int) -> int:
-        return _batched_decode_vmem_estimate_bytes(
+    env_bsz = os.environ.get("RESIN_TPU_BATCHED_DECODE_BATCH_SIZE")
+    env_bkv = os.environ.get("RESIN_TPU_BATCHED_DECODE_BKV_SZ")
+    if bool(env_bsz) != bool(env_bkv):
+        raise ValueError(
+            "set both RESIN_TPU_BATCHED_DECODE_BATCH_SIZE and RESIN_TPU_BATCHED_DECODE_BKV_SZ"
+        )
+    has_env_override = bool(env_bsz and env_bkv)
+    bsz_ov = bkv_ov = 0
+    if has_env_override:
+        assert env_bsz is not None and env_bkv is not None
+        bsz_ov, bkv_ov = int(env_bsz), int(env_bkv)
+        if bsz_ov <= 0 or bkv_ov <= 0:
+            raise ValueError(f"invalid batched decode override: ({bsz_ov}, {bkv_ov})")
+        candidates: tuple[tuple[int, int], ...] = ((bsz_ov, bkv_ov),)
+        vmem_budget = int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
+    else:
+        candidates = _batched_decode_candidates(max_num_seqs, horizon_kv)
+        vmem_budget = int(eff_vmem * _BATCHED_DECODE_SELECT_VMEM_FRACTION)
+
+    for batch_size, bkv_sz in candidates:
+        if bkv_sz < min_unit or bkv_sz % min_unit != 0:
+            continue
+        if not has_env_override and bkv_sz > max_useful_bkv:
+            continue
+        est_bytes = _batched_decode_vmem_estimate_bytes(
             actual_num_kv_heads,
             q_per_kv,
             head_dim,
-            bsz,
-            bkv,
+            batch_size,
+            bkv_sz,
             q_dtype,
             kv_dtype,
             bf16_qk_softmax=bf16_qk_softmax,
             bf16_online_scratch=bf16_online_scratch,
         )
-
-    batch_size = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
-    while batch_size > 1 and _est(batch_size, bkv_step) > capped_vmem:
-        batch_size -= 1
-
-    bkv_sz = bkv_step
-    while bkv_sz > page_size and _est(batch_size, bkv_sz) > capped_vmem:
-        bkv_sz = max(page_size, (bkv_sz // 2 // page_size) * page_size)
-
-    while (
-        bkv_sz + bkv_step <= max_bkv
-        and _est(batch_size, bkv_sz + bkv_step) < capped_vmem
-    ):
-        bkv_sz += bkv_step
-
-    return bkv_sz, batch_size
+        cand_budget = (
+            int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
+            if not has_env_override
+            and (batch_size, bkv_sz) == (8, 1280)
+            and horizon_kv > 4096
+            and max_num_seqs >= 32
+            and kv_itemsize == 1
+            and actual_num_kv_heads * aligned_hd <= 512
+            else vmem_budget
+        )
+        if est_bytes > cand_budget:
+            continue
+        scoped_vmem = min(
+            eff_vmem,
+            max(
+                _BATCHED_DECODE_MIN_SCOPED_VMEM_BYTES,
+                align_to(
+                    est_bytes + _BATCHED_DECODE_SCOPED_VMEM_HEADROOM_BYTES,
+                    1024 * 1024,
+                ),
+            ),
+        )
+        cfg = BatchedDecodeConfig(
+            batch_size=batch_size,
+            bkv_sz=bkv_sz,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            max_num_seqs=max_num_seqs,
+            num_q_heads=actual_num_q_heads,
+            num_kv_heads=actual_num_kv_heads,
+            head_dim=head_dim,
+            q_dtype_name=q_dt_name,
+            kv_dtype_name=kv_dt_name,
+            sm_scale=sm_scale,
+            mask_value=mask_value,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=update_kv_cache,
+            bf16_qk_softmax=bf16_qk_softmax,
+            bf16_online_scratch=bf16_online_scratch,
+            vmem_limit_bytes=scoped_vmem,
+            smem_capacity_bytes=smem_capacity_bytes,
+            disable_bounds_checks=disable_bounds_checks,
+            disable_semaphore_checks=disable_semaphore_checks,
+            interpret_mode=interpret_mode,
+        )
+        if (
+            max_num_seqs >= 32
+            and cfg.max_steps_ub < _BATCHED_DECODE_MIN_HIGH_BATCH_STEPS_UB
+        ):
+            continue
+        return cfg
+    if has_env_override:
+        raise ValueError(
+            f"batched decode override ({bsz_ov}, {bkv_ov}) rejected for "
+            f"max_num_seqs={max_num_seqs}, min_unit={min_unit}, vmem_budget={vmem_budget}"
+        )
+    return None
 
 
 def _batched_mixed_vmem_estimate_bytes(
@@ -1505,7 +1606,7 @@ def ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
         ).as_dict()
 
-    dispatch_batched_decode = (
+    try_batched_decode = (
         (
             tpu_version >= 7
             and d_block_sizes is None
@@ -1514,47 +1615,15 @@ def ragged_paged_attention(
         if use_batched_decode is None
         else use_batched_decode
     )
-
-    if dispatch_batched_decode:
+    batched_cfgs: BatchedDecodeConfig | None = None
+    if try_batched_decode:
         assert vmem_limit_bytes is not None
-        if d_block_sizes is not None:
-            if d_block_sizes[0] != 1 or d_block_sizes[2] != 1:
-                raise ValueError(
-                    f"batched decode requires bq_sz == bq_csz == 1, got {d_block_sizes=}"
-                )
-            batched_bkv_sz = d_block_sizes[1]
-            batched_bsz = _BATCHED_DECODE_DEFAULT_BATCH_SIZE
-        else:
-            batched_bkv_sz, batched_bsz = _get_batched_decode_block_sizes(
-                q.dtype,
-                kv_cache.dtype,
-                eff_q_heads,
-                actual_num_kv_heads,
-                eff_head_dim,
-                page_size,
-                pages_per_seq,
-                tpu_version=tpu_version,
-                sliding_window=sliding_window,
-                vmem_limit_bytes=vmem_limit_bytes,
-                bf16_qk_softmax=bf16_qk_softmax,
-                bf16_online_scratch=bf16_online_scratch,
-            )
         smem_bytes = (
             pltpu.get_tpu_info().smem_capacity_bytes
             if tpu_version >= 4
             else _DEFAULT_SMEM_BYTES
         )
-        batched_cfgs = BatchedDecodeConfig(
-            batch_size=batched_bsz,
-            bkv_sz=batched_bkv_sz,
-            page_size=page_size,
-            pages_per_seq=pages_per_seq,
-            max_num_seqs=max_num_seqs,
-            num_q_heads=eff_q_heads,
-            num_kv_heads=actual_num_kv_heads,
-            head_dim=eff_head_dim,
-            q_dtype_name=jnp.dtype(q.dtype).name,
-            kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
+        decode_common: dict[str, Any] = dict(
             sm_scale=sm_scale,
             mask_value=mask_value,
             sliding_window=sliding_window,
@@ -1565,12 +1634,50 @@ def ragged_paged_attention(
             update_kv_cache=update_kv_cache,
             bf16_qk_softmax=bf16_qk_softmax,
             bf16_online_scratch=bf16_online_scratch,
-            vmem_limit_bytes=vmem_limit_bytes,
             smem_capacity_bytes=smem_bytes,
             disable_bounds_checks=disable_bounds_checks,
             disable_semaphore_checks=disable_semaphore_checks,
             interpret_mode=interpret,
         )
+        if d_block_sizes is not None:
+            if d_block_sizes[0] != 1 or d_block_sizes[2] != 1:
+                raise ValueError(
+                    f"batched decode requires bq_sz == bq_csz == 1, got {d_block_sizes=}"
+                )
+            batched_cfgs = BatchedDecodeConfig(
+                batch_size=_BATCHED_DECODE_DEFAULT_BATCH_SIZE,
+                bkv_sz=d_block_sizes[1],
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                max_num_seqs=max_num_seqs,
+                num_q_heads=eff_q_heads,
+                num_kv_heads=actual_num_kv_heads,
+                head_dim=eff_head_dim,
+                q_dtype_name=jnp.dtype(q.dtype).name,
+                kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
+                vmem_limit_bytes=vmem_limit_bytes,
+                **decode_common,
+            )
+        else:
+            batched_cfgs = _select_batched_decode_config(
+                q.dtype,
+                kv_cache.dtype,
+                eff_q_heads,
+                actual_num_kv_heads,
+                eff_head_dim,
+                page_size,
+                pages_per_seq,
+                max_num_seqs,
+                tpu_version=tpu_version,
+                vmem_limit_bytes=vmem_limit_bytes,
+                **decode_common,
+            )
+            if batched_cfgs is None and use_batched_decode is True:
+                raise ValueError(
+                    "no batched decode config fits VMEM and alignment constraints"
+                )
+
+    if batched_cfgs is not None:
         # Emit schedule generation outside lax.cond so XLA CSE shares one
         # schedule call across all layers of the forward step.
         decode_schedule = generate_batched_decode_schedule(
