@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pytest
@@ -1097,6 +1097,65 @@ class TestRpaDecodeBlockSizes:
                 atol=3e-2,
             )
 
+    def test_rpa_v3_case_vmem_limit_capped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        from jax._src import tpu_info
+        from jax.experimental import pallas as pl
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        assert v7x_info.vmem_capacity_bytes == 64 * 1024 * 1024
+
+        captured_calls: list[tuple[str, int | None]] = []
+        orig_pallas_call = pl.pallas_call
+
+        def _spy_pallas_call(*args: Any, **kwargs: Any) -> Any:
+            cp = kwargs.get("compiler_params")
+            captured_calls.append(
+                (kwargs.get("name", ""), getattr(cp, "vmem_limit_bytes", None))
+            )
+            return orig_pallas_call(*args, **kwargs)
+
+        monkeypatch.setattr(rpa_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(rpa_mod.pltpu, "get_tpu_info", lambda: v7x_info)
+        monkeypatch.setattr(pl, "pallas_call", _spy_pallas_call)
+
+        cache = jax.ShapeDtypeStruct(
+            get_kv_cache_shape(64, 256, 2, 128, jnp.float8_e4m3fn), jnp.float8_e4m3fn
+        )
+        q = jax.ShapeDtypeStruct((8, 16, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((8, 2, 128), jnp.float8_e4m3fn)
+        v = jax.ShapeDtypeStruct((8, 2, 128), jnp.float8_e4m3fn)
+        kv_lens = jax.ShapeDtypeStruct((8,), jnp.int32)
+        page_indices = jax.ShapeDtypeStruct((8 * 36,), jnp.int32)
+        cu_q_lens = jax.ShapeDtypeStruct((9,), jnp.int32)
+        dist = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+        _ = jax.make_jaxpr(
+            lambda q_i, k_i, v_i, c_i, kl_i, pi_i, cq_i, d_i: (
+                rpa_mod.ragged_paged_attention(
+                    q_i, k_i, v_i, c_i, kl_i, pi_i, cq_i, d_i, sm_scale=128**-0.5
+                )
+            )
+        )(q, k, v, cache, kv_lens, page_indices, cu_q_lens, dist)
+
+        rpad_calls = [
+            (name, vmem) for name, vmem in captured_calls if name.startswith("RPAd-")
+        ]
+        rpam_calls = [
+            (name, vmem) for name, vmem in captured_calls if name.startswith("RPAm-")
+        ]
+        assert rpad_calls and rpam_calls
+        assert rpad_calls[0][0] == "RPAd-p_256-bq_1_1-bkv_4096_4096"
+        for _name, vmem in rpad_calls + rpam_calls:
+            assert vmem is not None
+            assert 16 * 1024 * 1024 <= vmem <= 24 * 1024 * 1024
+
 
 def _qwix_reference_fp8_w8a8(x: np.ndarray, w: np.ndarray) -> np.ndarray:
     """Independent Qwix symmetric absmax FP8 W8A8 reference (x: [T, K], w: [N, K])."""
@@ -1182,7 +1241,14 @@ class TestFp8Matmul:
 
     def test_qwen3_32b_tp2_buckets_all_hit_zero_pad_tpu7x_tiles(self) -> None:
         from deploy.models import TPU_WORKLOADS, _tpu_buckets
-        from resin.backend.tpu.kernels.fp8_matmul import _raw_vmem_estimate_bytes
+        from resin.backend.tpu.kernels.fp8_matmul import (
+            _LARGE_PREFILL_SLACK_BYTES,
+            _TPU7X_GATE_UP_TUNED_BLOCKS,
+            _estimate_vmem_limit_bytes,
+            _get_tuned_gate_up_block_sizes,
+            _raw_vmem_estimate_bytes,
+            _should_save_x_q,
+        )
 
         tp2_shapes = (
             (4096, 5120),
@@ -1193,7 +1259,7 @@ class TestFp8Matmul:
             (12800, 5120),
             (25600, 5120),
         )
-        tp2_decode_shapes = set(tp2_shapes)
+        tp2_shape_set = set(tp2_shapes)
 
         vmem_cap = 48 * 1024 * 1024
         for (batch, n_out, n_in), tile in _TPU7X_FP8_TUNED_BLOCKS.items():
@@ -1219,15 +1285,26 @@ class TestFp8Matmul:
                 no = n_out // sel.out_block_size
                 ni = n_in // sel.in_block_size
                 save_acc = ni > 1
-                save_xq = (
-                    quant
-                    and no > 1
-                    and (
-                        ni * sel.batch_block_size * sel.in_block_size <= 4 * 1024 * 1024
-                    )
+
+                save_xq = _should_save_x_q(
+                    quantize_activation=quant,
+                    n_batch=nb,
+                    n_out=no,
+                    n_in=ni,
+                    batch_block_size=sel.batch_block_size,
+                    out_block_size=sel.out_block_size,
+                    in_block_size=sel.in_block_size,
+                    x_dtype=x_dtype,
+                    x_q_dtype=jnp.float8_e4m3fn,
+                    w_q_dtype=jnp.float8_e4m3fn,
+                    out_dtype=jnp.bfloat16,
+                    save_acc=save_acc,
+                    tpu_version=7,
+                    w_buffer_count=sel.w_buffer_count,
                 )
-                if batch <= 320 and (n_out, n_in) in tp2_decode_shapes:
-                    raw = _raw_vmem_estimate_bytes(
+
+                def _vmem(*, headroom: bool) -> int:
+                    return _raw_vmem_estimate_bytes(
                         n_batch=nb,
                         n_out=no,
                         n_in=ni,
@@ -1241,11 +1318,91 @@ class TestFp8Matmul:
                         save_acc=save_acc,
                         save_x_q=save_xq,
                         w_buffer_count=sel.w_buffer_count,
+                        include_headroom=headroom,
                     )
-                    assert raw <= vmem_cap
-                    assert sel.batch_block_size == batch
-                    assert sel.out_block_size >= 512
-                    assert sel.in_block_size == n_in
+
+                raw_no_headroom = _vmem(headroom=False)
+                assert raw_no_headroom + _LARGE_PREFILL_SLACK_BYTES <= vmem_cap
+                if batch >= 2048:
+                    vmem_limit = _estimate_vmem_limit_bytes(
+                        n_batch=nb,
+                        n_out=no,
+                        n_in=ni,
+                        batch_block_size=sel.batch_block_size,
+                        out_block_size=sel.out_block_size,
+                        in_block_size=sel.in_block_size,
+                        x_dtype=x_dtype,
+                        x_q_dtype=jnp.float8_e4m3fn,
+                        w_q_dtype=jnp.float8_e4m3fn,
+                        out_dtype=jnp.bfloat16,
+                        save_acc=save_acc,
+                        save_x_q=save_xq,
+                        tpu_version=7,
+                        w_buffer_count=sel.w_buffer_count,
+                    )
+                    assert vmem_limit - raw_no_headroom >= _LARGE_PREFILL_SLACK_BYTES
+                    if quant and (n_out, n_in) == (5120, 8192):
+                        assert not save_xq
+
+                if (n_out, n_in) in tp2_shape_set:
+                    if batch <= 320:
+                        assert _vmem(headroom=True) <= vmem_cap
+                        assert sel.batch_block_size == batch
+                        assert sel.out_block_size >= 512
+                        assert sel.in_block_size == n_in
+                    elif batch >= 2048:
+                        if quant and (n_out, n_in) == (5120, 12800):
+                            assert sel == Fp8MatmulTileSizes(1024, 2560, 2560)
+                            # At out_block=2560 (n_out=2), 2-buffered VMEM + 12.5 MiB
+                            # x_q_scratch is 55 MiB > 48 MiB, so save_x_q stays False;
+                            # at out_block=1280 (n_out=4, 38.8 MiB + 4 MiB <= 48 MiB), save_x_q is True.
+                            assert not save_xq
+                            assert _should_save_x_q(
+                                quantize_activation=True,
+                                n_batch=batch // 1024,
+                                n_out=4,
+                                n_in=5,
+                                batch_block_size=1024,
+                                out_block_size=1280,
+                                in_block_size=2560,
+                                x_dtype=jnp.bfloat16,
+                                x_q_dtype=jnp.float8_e4m3fn,
+                                w_q_dtype=jnp.float8_e4m3fn,
+                                out_dtype=jnp.bfloat16,
+                                save_acc=True,
+                                tpu_version=7,
+                            )
+
+        for (batch, n_ffn, n_in), tile in _TPU7X_GATE_UP_TUNED_BLOCKS.items():
+            assert (
+                _get_tuned_gate_up_block_sizes(batch, n_ffn, n_in, tpu_version=7)
+                == tile
+            )
+            assert batch % tile.batch_block_size == 0
+            assert n_ffn % tile.out_block_size == 0
+            assert n_in % tile.in_block_size == 0
+            assert tile.batch_block_size % 128 == 0
+            assert tile.out_block_size % 128 == 0
+            assert tile.in_block_size % 128 == 0
+            n_in_tiles = n_in // tile.in_block_size
+            x_q_bytes = tile.batch_block_size * tile.in_block_size
+            gate_up_w_bytes = 2 * tile.out_block_size * tile.in_block_size
+            gated_out_bytes = tile.batch_block_size * tile.out_block_size * 2
+            acc_scratch_bytes = (
+                2 * tile.batch_block_size * tile.out_block_size * 4
+                if n_in_tiles > 1
+                else 0
+            )
+            gate_up_vmem_bytes = (
+                2 * (x_q_bytes + gate_up_w_bytes + gated_out_bytes) + acc_scratch_bytes
+            )
+            assert gate_up_vmem_bytes <= vmem_cap
+        assert _get_tuned_gate_up_block_sizes(
+            320, 12800, 5120, tpu_version=7
+        ) == Fp8MatmulTileSizes(320, 1280, 5120)
+        assert _get_tuned_gate_up_block_sizes(
+            4096, 25600, 5120, tpu_version=7
+        ) == Fp8MatmulTileSizes(512, 1280, 5120)
 
         buckets = {
             bucket.tokens
@@ -1256,13 +1413,18 @@ class TestFp8Matmul:
             for n_out, n_in in tp2_shapes:
                 assert (batch, n_out, n_in) in _TPU7X_FP8_TUNED_BLOCKS
 
+        for bs in (8, 16, 32, 64, 96, 128, 160, 192):
+            assert get_tuned_block_sizes(
+                bs, 5120, 4096, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 640, 4096, 3)
+        for bs in (224, 256, 288, 320):
+            assert get_tuned_block_sizes(
+                bs, 5120, 4096, tpu_version=7, quantize_activation=False
+            ) == Fp8MatmulTileSizes(bs, 1280, 4096, 3)
         for bs in (288, 320):
             assert get_tuned_block_sizes(
                 bs, 5120, 5120, tpu_version=7, quantize_activation=False
             ) == Fp8MatmulTileSizes(bs, 1280, 5120)
-            assert get_tuned_block_sizes(
-                bs, 5120, 4096, tpu_version=7, quantize_activation=False
-            ) == Fp8MatmulTileSizes(bs, 1280, 4096)
             assert get_tuned_block_sizes(
                 bs, 5120, 12800, tpu_version=7, quantize_activation=False
             ) == Fp8MatmulTileSizes(bs, 512, 12800, 3)
@@ -1289,6 +1451,179 @@ class TestFp8Matmul:
         assert get_tuned_block_sizes(
             320, 51200, 5120, tpu_version=7
         ) == Fp8MatmulTileSizes(320, 2560, 2560)
+
+    def test_raw_vmem_estimate_counts_scratch_buffers_once(self) -> None:
+        from resin.backend.tpu.kernels.fp8_matmul import _raw_vmem_estimate_bytes
+
+        n_in = 5
+        batch_block, out_block, in_block = 1024, 1280, 2560
+
+        def _estimate(*, save_acc: bool, save_x_q: bool) -> int:
+            return _raw_vmem_estimate_bytes(
+                n_batch=4,
+                n_out=4,
+                n_in=n_in,
+                batch_block_size=batch_block,
+                out_block_size=out_block,
+                in_block_size=in_block,
+                x_dtype=jnp.bfloat16,
+                x_q_dtype=jnp.float8_e4m3fn,
+                w_q_dtype=jnp.float8_e4m3fn,
+                out_dtype=jnp.bfloat16,
+                save_acc=save_acc,
+                save_x_q=save_x_q,
+                include_headroom=False,
+            )
+
+        base = _estimate(save_acc=False, save_x_q=False)
+        with_scratch = _estimate(save_acc=True, save_x_q=True)
+        acc_scratch_bytes = batch_block * out_block * 4
+        x_q_scratch_bytes = n_in * batch_block * in_block
+        assert with_scratch - base == acc_scratch_bytes + x_q_scratch_bytes
+
+    def test_large_prefill_vmem_limit_stays_under_32mib(self) -> None:
+        from resin.backend.tpu.kernels.fp8_matmul import _estimate_vmem_limit_bytes
+
+        for in_block in (4096, 5120):
+            vmem = _estimate_vmem_limit_bytes(
+                n_batch=4,
+                n_out=4,
+                n_in=1,
+                batch_block_size=1024,
+                out_block_size=1280,
+                in_block_size=in_block,
+                x_dtype=jnp.float8_e4m3fn,
+                x_q_dtype=jnp.float8_e4m3fn,
+                w_q_dtype=jnp.float8_e4m3fn,
+                out_dtype=jnp.bfloat16,
+                save_acc=False,
+                save_x_q=False,
+                tpu_version=7,
+            )
+            assert vmem < 32 * 1024 * 1024
+
+    def test_pallas_save_x_q_16mib_cap_and_vmem_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        import jax.experimental.pallas as pl
+
+        fp8_mod = importlib.import_module("resin.backend.tpu.kernels.fp8_matmul")
+        captured_scratch: list[tuple[object, ...]] = []
+        orig_pallas_call = pl.pallas_call
+
+        def _spy_pallas_call(*args: Any, **kwargs: Any) -> Any:
+            grid_spec = kwargs.get("grid_spec")
+            if grid_spec is not None and hasattr(grid_spec, "scratch_shapes"):
+                captured_scratch.append(tuple(grid_spec.scratch_shapes))
+            return orig_pallas_call(*args, **kwargs)
+
+        monkeypatch.setattr(fp8_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(pl, "pallas_call", _spy_pallas_call)
+
+        rng = np.random.default_rng(4096)
+        x = jnp.asarray(rng.standard_normal((2048, 10240)) * 0.2, jnp.bfloat16)
+        weight = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((256, 10240)) * 0.05, jnp.bfloat16)
+        )
+        tile_sizes = Fp8MatmulTileSizes(1024, 128, 2560)
+
+        # Below 2048 padded tokens the 4 MiB cap still applies: 5 MiB stays uncached.
+        fp8_mod.pallas_fp8_matmul(
+            x[:512],
+            weight.qvalue,
+            weight.scale,
+            tile_sizes=Fp8MatmulTileSizes(512, 128, 2560),
+            interpret=True,
+        )
+        assert len(captured_scratch) == 1
+        assert captured_scratch[0][1] is None
+        captured_scratch.clear()
+
+        # 10 MiB x_q_scratch at 2048 padded tokens (> 4 MiB old cap, <= 16 MiB cap): allocates scratch and matches XLA.
+        y_cached = fp8_mod.pallas_fp8_matmul(
+            x,
+            weight.qvalue,
+            weight.scale,
+            tile_sizes=tile_sizes,
+            interpret=True,
+        )
+        y_xla = xla_fp8_matmul(x, weight.qvalue, weight.scale)
+        assert len(captured_scratch) == 1
+        assert captured_scratch[0][1] is not None
+        np.testing.assert_allclose(
+            np.asarray(y_cached, np.float32),
+            np.asarray(y_xla, np.float32),
+            rtol=1e-2,
+            atol=3e-2,
+        )
+
+        # Lowering VMEM cap below 2-buffered VMEM + x_q_scratch disables save_x_q cleanly.
+        monkeypatch.setattr(
+            fp8_mod, "_DEVICE_VMEM_LIMIT", {6: 96 * 1024 * 1024, 7: 8 * 1024 * 1024}
+        )
+        captured_scratch.clear()
+        y_uncached = fp8_mod.pallas_fp8_matmul(
+            x,
+            weight.qvalue,
+            weight.scale,
+            tile_sizes=tile_sizes,
+            interpret=True,
+        )
+        assert len(captured_scratch) == 1
+        assert captured_scratch[0][1] is None
+        np.testing.assert_allclose(
+            np.asarray(y_uncached, np.float32),
+            np.asarray(y_cached, np.float32),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    @pytest.mark.parametrize("tokens", [2048, 4096])
+    def test_prefill_down_and_gate_up_tpu7x_mlir_export(
+        self, monkeypatch: pytest.MonkeyPatch, tokens: int
+    ) -> None:
+        import importlib
+
+        from jax import export
+        from jax._src import tpu_info
+        from jax._src.pallas.mosaic import lowering as mosaic_lowering
+        from jax._src.pallas.mosaic import pallas_call_registration
+
+        fp8_mod = importlib.import_module("resin.backend.tpu.kernels.fp8_matmul")
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        monkeypatch.setattr(fp8_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(tpu_info, "get_tpu_info", lambda: v7x_info)
+        monkeypatch.setattr(mosaic_lowering.tpu_info, "get_tpu_info", lambda: v7x_info)
+        monkeypatch.setattr(
+            pallas_call_registration.tpu_info, "get_tpu_info", lambda: v7x_info
+        )
+
+        down_exported = export.export(
+            jax.jit(fp8_mod.pallas_fp8_matmul),
+            platforms=["tpu"],
+        )(
+            jax.ShapeDtypeStruct((tokens, 12800), jnp.bfloat16),
+            jax.ShapeDtypeStruct((5120, 12800), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((5120,), jnp.float32),
+        )
+        down_mlir = down_exported.mlir_module()
+        assert "tpu_custom_call" in down_mlir
+        assert "fp8_w8a8_matmul_1024_2560_2560" in down_mlir
+
+        gate_up_exported = export.export(
+            jax.jit(fp8_mod.pallas_fp8_gate_up_swiglu),
+            platforms=["tpu"],
+        )(
+            jax.ShapeDtypeStruct((tokens, 5120), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, tokens), jnp.float32),
+            jax.ShapeDtypeStruct((25600, 5120), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((25600,), jnp.float32),
+        )
+        gate_up_mlir = gate_up_exported.mlir_module()
+        assert "tpu_custom_call" in gate_up_mlir
+        assert "fp8_gate_up_swiglu_1024_1280_5120" in gate_up_mlir
 
     @pytest.mark.parametrize(("batch", "live_rows"), [(8, 1), (8, 4), (16, 9)], ids=str)
     @pytest.mark.parametrize(
@@ -1500,6 +1835,86 @@ class TestNormAndRope:
         finally:
             counter.close()
 
+    @pytest.mark.parametrize("batch", [1, 7, 8, 33, 320])
+    @pytest.mark.parametrize("k_dim", [256, 5120])
+    def test_pallas_rms_norm_fp8_quant_1d_weight(self, batch: int, k_dim: int) -> None:
+        from resin.backend.tpu.kernels.norm_rope import (
+            pallas_qkv_norm_rope_pack,
+            pallas_rms_norm_fp8_quant,
+        )
+
+        rng = np.random.default_rng(1100 + batch * 17 + k_dim)
+        x = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        res = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        w_1d = jnp.asarray(rng.uniform(0.5, 1.5, size=(k_dim,)), jnp.bfloat16)
+
+        jaxpr_plain = jax.make_jaxpr(
+            lambda xi, wi: pallas_rms_norm_fp8_quant(
+                xi, wi, eps=1e-6, transposed_scale=True, interpret=True
+            )
+        )(x, w_1d)
+        assert not any(
+            e.primitive.name == "reshape" and e.invars[0].aval.shape == (k_dim,)
+            for e in jaxpr_plain.jaxpr.eqns
+        )
+
+        jaxpr_fused = jax.make_jaxpr(
+            lambda xi, ri, wi: pallas_rms_norm_fp8_quant(
+                xi, wi, eps=1e-6, residual=ri, transposed_scale=True, interpret=True
+            )
+        )(x, res, w_1d)
+        assert not any(
+            e.primitive.name == "reshape" and e.invars[0].aval.shape == (k_dim,)
+            for e in jaxpr_fused.jaxpr.eqns
+        )
+
+        xq, xs = pallas_rms_norm_fp8_quant(
+            x, w_1d, eps=1e-6, transposed_scale=True, interpret=True
+        )
+        xq_2d, xs_2d = pallas_rms_norm_fp8_quant(
+            x, w_1d.reshape(1, k_dim), eps=1e-6, transposed_scale=True, interpret=True
+        )
+        np.testing.assert_array_equal(np.asarray(xq), np.asarray(xq_2d))
+        np.testing.assert_array_equal(np.asarray(xs), np.asarray(xs_2d))
+
+        fxq, fxs, fnr = pallas_rms_norm_fp8_quant(
+            x, w_1d, eps=1e-6, residual=res, transposed_scale=True, interpret=True
+        )
+        fxq_2d, fxs_2d, fnr_2d = pallas_rms_norm_fp8_quant(
+            x,
+            w_1d.reshape(1, k_dim),
+            eps=1e-6,
+            residual=res,
+            transposed_scale=True,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(fnr), np.asarray(fnr_2d))
+        np.testing.assert_array_equal(np.asarray(fxq), np.asarray(fxq_2d))
+        np.testing.assert_array_equal(np.asarray(fxs), np.asarray(fxs_2d))
+
+        if k_dim == 5120 and batch in (1, 8):
+            cos_sin = build_rope_cache(64, 128)
+            pos = jnp.arange(batch, dtype=jnp.int32)
+            qw = jnp.ones((128,), dtype=jnp.bfloat16)
+            kw = jnp.ones((128,), dtype=jnp.bfloat16)
+            jaxpr_qkv = jax.make_jaxpr(
+                lambda qkv_i, qwi, kwi: pallas_qkv_norm_rope_pack(
+                    qkv_i,
+                    pos,
+                    cos_sin,
+                    qwi,
+                    kwi,
+                    jnp.float8_e4m3fn,
+                    num_q_heads=32,
+                    num_kv_heads=4,
+                    interpret=True,
+                )
+            )(x, qw, kw)
+            assert not any(
+                e.primitive.name == "reshape" and e.invars[0].aval.shape == (128,)
+                for e in jaxpr_qkv.jaxpr.eqns
+            )
+
 
 class TestPrefillKernels:
     def test_fused_add_rms_norm_fp8_quant_matches_unfused_bit_for_bit(self) -> None:
@@ -1637,6 +2052,94 @@ class TestPrefillKernels:
             np.asarray(exp_kvm, np.float32),
             rtol=1e-2,
             atol=2e-2,
+        )
+
+        # Qwen3-32B tp=2 head geometry (32 Q, 4 KV) at tb=512 with non-512-multiple tail.
+        t_big, q_big, kv_big = 525, 32, 4
+        q_big_np = rng.standard_normal((t_big, q_big, head_dim)).astype(np.float32)
+        k_big_np = rng.standard_normal((t_big, kv_big, head_dim)).astype(np.float32)
+        v_big_np = rng.standard_normal((t_big, kv_big, head_dim)).astype(np.float32)
+        q_big_np[516:] = 0.0
+        k_big_np[516:] = 0.0
+        v_big_np[516:] = 0.0
+        q_b = jnp.asarray(q_big_np, jnp.bfloat16)
+        k_b = jnp.asarray(k_big_np, jnp.bfloat16)
+        v_b = jnp.asarray(v_big_np, jnp.bfloat16)
+        pos_b = jnp.arange(t_big, dtype=jnp.int32)
+        qkv_b = jnp.concatenate(
+            [q_b.reshape(t_big, -1), k_b.reshape(t_big, -1), v_b.reshape(t_big, -1)],
+            axis=-1,
+        )
+        qp_512, kvm_512 = pallas_qkv_norm_rope_pack(
+            qkv_b,
+            pos_b,
+            rope_cache,
+            q_norm_w,
+            k_norm_w,
+            kv_dtype,
+            num_q_heads=q_big,
+            num_kv_heads=kv_big,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=1e-6,
+            pack_mode=pack_mode,
+            interpret=True,
+        )
+        qp_512_qk, kvm_512_qk = pallas_qk_norm_rope_pack(
+            q_b,
+            k_b,
+            v_b,
+            pos_b,
+            rope_cache,
+            q_norm_w,
+            k_norm_w,
+            kv_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            eps=1e-6,
+            pack_mode=pack_mode,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(qp_512), np.asarray(qp_512_qk))
+        np.testing.assert_array_equal(np.asarray(kvm_512), np.asarray(kvm_512_qk))
+        q_ref_b = apply_rope(
+            rms_norm(q_b, q_norm_w, 1e-6), pos_b, head_dim, cos_sin_cache=rope_cache
+        )
+        k_ref_b = quantize_kv(
+            apply_rope(
+                rms_norm(k_b, k_norm_w, 1e-6),
+                pos_b,
+                head_dim,
+                cos_sin_cache=rope_cache,
+            ),
+            kv_dtype,
+            k_scale,
+        )
+        v_ref_b = quantize_kv(v_b, kv_dtype, v_scale)
+        exp_qp_b, exp_kvm_b = prepare_inputs(q_ref_b, k_ref_b, v_ref_b)
+        np.testing.assert_allclose(
+            np.asarray(qp_512, np.float32),
+            np.asarray(exp_qp_b, np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
+        kv_rtol = 0.125 if kv_dtype == jnp.float8_e4m3fn else 1e-2
+        np.testing.assert_allclose(
+            np.asarray(kvm_512, np.float32),
+            np.asarray(exp_kvm_b, np.float32),
+            rtol=kv_rtol,
+            atol=2e-2,
+        )
+        assert (
+            float(
+                np.mean(
+                    np.abs(
+                        np.asarray(kvm_512, np.float32)
+                        - np.asarray(exp_kvm_b, np.float32)
+                    )
+                )
+            )
+            < 1e-3
         )
 
     def test_prequantized_pallas_fp8_matmul_gate_up_swiglu_and_sequence_parallel(
@@ -2163,6 +2666,160 @@ class TestPrefillKernels:
             np.asarray(idle_cache[1], np.float32), before_page
         )
 
+    def test_prefill_tb512_unpack_norm_and_vmem_guards(self) -> None:
+        import unittest.mock as mock
+
+        from resin.backend.tpu.kernels import (
+            fused_add_rms_norm_fp8_quant,
+            pallas_qkv_norm_rope_pack,
+            pallas_unpack_attn_fp8_quant,
+            prepare_inputs,
+            quantize_fp8_act,
+        )
+        from resin.backend.tpu.kernels.norm_rope import _select_qk_token_block
+
+        rng = np.random.default_rng(4512)
+        iter_eqns = TestDecodeMatmulPath._iter_jaxpr_eqns
+        assert_no_pad = TestDecodeMatmulPath._assert_no_pad_eqns
+
+        def _pallas_call_info(fn, *sds):
+            call = next(
+                e
+                for e in iter_eqns(jax.make_jaxpr(fn)(*sds), enter_pallas=False)
+                if e.primitive.name == "pallas_call"
+            )
+            return call.params["name"], call.params["compiler_params"].vmem_limit_bytes
+
+        # Qwen3-32B tp=2 geometry: 32 Q heads, 4 KV heads, out_width=4096 at T=512/768 (zero pad) and T=525 (tail).
+        q_heads, kv_heads, head_dim = 32, 4, 128
+        for t_len, zero_pad_expected in ((512, True), (768, True), (525, False)):
+            q_np = rng.standard_normal((t_len, q_heads, head_dim)).astype(np.float32)
+            q_np[-9:] = 0.0
+            q_t = jnp.asarray(q_np, jnp.bfloat16)
+            dummy_kv = jnp.zeros((t_len, kv_heads, head_dim), jnp.bfloat16)
+            out_packed, _ = prepare_inputs(q_t, dummy_kv, dummy_kv)
+            ref_bf16 = q_t.reshape(t_len, q_heads * head_dim)
+            ref_abs = jnp.max(jnp.abs(ref_bf16.astype(jnp.float32)), axis=-1)
+            ref_q, ref_s = quantize_fp8_act(ref_bf16)
+
+            unpack_modes: tuple[Literal["reshape", "bitcast_u32"], ...] = (
+                "reshape",
+                "bitcast_u32",
+            )
+            for mode in unpack_modes:
+                if zero_pad_expected:
+                    u_jaxpr = jax.make_jaxpr(
+                        lambda op, _m=mode: pallas_unpack_attn_fp8_quant(
+                            op, 8, head_dim, unpack_mode=_m, interpret=True
+                        )
+                    )(out_packed)
+                    assert_no_pad(u_jaxpr)
+                att_q, att_s = pallas_unpack_attn_fp8_quant(
+                    out_packed, 8, head_dim, unpack_mode=mode, interpret=True
+                )
+                assert att_s.shape == (1, t_len)
+                np.testing.assert_array_equal(np.asarray(att_q), np.asarray(ref_q))
+                np.testing.assert_array_equal(np.asarray(att_s.T), np.asarray(ref_s))
+
+                bf16_out, abs_out = pallas_unpack_attn_fp8_quant(
+                    out_packed,
+                    8,
+                    head_dim,
+                    return_bf16_and_absmax=True,
+                    unpack_mode=mode,
+                    interpret=True,
+                )
+                assert abs_out.shape == (1, t_len)
+                np.testing.assert_array_equal(
+                    np.asarray(bf16_out), np.asarray(ref_bf16)
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(abs_out[0]), np.asarray(ref_abs)
+                )
+
+        m32 = 32 * 1024 * 1024
+        m48 = 48 * 1024 * 1024
+        with mock.patch(
+            "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=7
+        ):
+            assert _select_qk_token_block(4096, total_heads=40) == 512
+            assert _select_qk_token_block(4096, total_heads=80) == 128
+
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((320, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((320, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8192,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_8192", m32)
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((512, 10240), jnp.bfloat16),
+                jax.ShapeDtypeStruct((512, 10240), jnp.bfloat16),
+                jax.ShapeDtypeStruct((10240,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_128_10240", m32)
+
+            sp_jaxpr = jax.make_jaxpr(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6)
+            )(
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            )
+            assert_no_pad(sp_jaxpr)
+            assert all(
+                e.primitive.name != "transpose"
+                for e in iter_eqns(sp_jaxpr, enter_pallas=False)
+            )
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_5120", m32)
+            assert _pallas_call_info(
+                lambda ql, p, c, s, qw, kw: pallas_qkv_norm_rope_pack(
+                    ql,
+                    p,
+                    (c, s),
+                    qw,
+                    kw,
+                    jnp.float8_e4m3fn,
+                    num_q_heads=32,
+                    num_kv_heads=4,
+                ),
+                jax.ShapeDtypeStruct((4096, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((4096,), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32),
+                jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((128,), jnp.bfloat16),
+            ) == ("qkv_norm_rope_pack_512_32_4", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(op, 8, 128),
+                jax.ShapeDtypeStruct((8, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_fp8_quant_256_8192", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(
+                    op, 8, 128, return_bf16_and_absmax=True
+                ),
+                jax.ShapeDtypeStruct((4, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_absmax_512_4096", m48)
+
+        with mock.patch(
+            "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=6
+        ):
+            assert _select_qk_token_block(4096, total_heads=40) == 128
+            assert _pallas_call_info(
+                lambda xi, ri, wi: fused_add_rms_norm_fp8_quant(xi, ri, wi, 1e-6),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2048, 5120), jnp.bfloat16),
+                jax.ShapeDtypeStruct((5120,), jnp.bfloat16),
+            ) == ("fused_add_rms_norm_fp8_quant_256_5120", m32)
+            assert _pallas_call_info(
+                lambda op: pallas_unpack_attn_fp8_quant(op, 8, 128),
+                jax.ShapeDtypeStruct((4, 1024, 4, 2, 128), jnp.bfloat16),
+            ) == ("unpack_attn_fp8_quant_256_4096", m32)
+
 
 class TestDecodeMatmulPath:
     @staticmethod
@@ -2287,35 +2944,213 @@ class TestDecodeMatmulPath:
         np.testing.assert_array_equal(np.asarray(exact_gq), np.asarray(ref_gq))
         np.testing.assert_array_equal(np.asarray(exact_gs.T), np.asarray(ref_gs))
 
-        if batch == 320:
-            # Wide K=65536 exceeds 48 MiB single-pass VMEM and falls back cleanly to XLA.
-            wide_x = jnp.asarray(
-                rng.standard_normal((batch, 65536)).astype(np.float32) * 0.25,
+    @pytest.mark.parametrize("batch", [1, 5, 8, 16, 96, 192, 313, 320])
+    def test_pallas_fp8_gate_up_swiglu_quant_interpret(self, batch: int) -> None:
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            fp8_matmul_prequantized,
+            pallas_fp8_gate_up_swiglu,
+            pallas_fp8_gate_up_swiglu_quant,
+            quantize_fp8_act,
+            quantize_fp8_weight,
+            sharded_fp8_gate_up_swiglu,
+        )
+        from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax
+
+        rng = np.random.default_rng(4200 + batch)
+        ffn, k_dim = (300, 192) if batch in (5, 313) else (1280, 256)
+        x = jnp.asarray(rng.standard_normal((batch, k_dim)) * 0.4, jnp.bfloat16)
+        xq, xs = quantize_fp8_act(x)
+        xs_row = jnp.transpose(xs)
+        w_gate = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((ffn, k_dim)) * 0.04, jnp.bfloat16)
+        )
+        w_up = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((ffn, k_dim)) * 0.04, jnp.bfloat16)
+        )
+        w_gu_q = jnp.concatenate([w_gate.qvalue, w_up.qvalue], axis=0)
+        w_gu_s = jnp.concatenate([w_gate.scale, w_up.scale], axis=0)
+
+        gq, gs = pallas_fp8_gate_up_swiglu_quant(
+            xq,
+            xs_row,
+            w_gu_q,
+            w_gu_s,
+            transposed_scale=True,
+            interpret=pltpu.InterpretParams(detect_races=True),
+        )
+        assert interpret_pallas_call.races is not None
+        assert not interpret_pallas_call.races.races_found
+
+        assert gq.shape == (batch, ffn)
+        assert gq.dtype == jnp.float8_e4m3fn
+        assert gs.shape == (1, batch)
+        deq_got = np.asarray(
+            gq.astype(jnp.float32) * jnp.transpose(gs), dtype=np.float32
+        )
+
+        unfused_gated, unfused_abs = pallas_fp8_gate_up_swiglu(
+            xq, xs_row, w_gu_q, w_gu_s, interpret=True
+        )
+        unfused_q, unfused_s = quantize_fp8_with_absmax(
+            unfused_gated,
+            jnp.max(unfused_abs, axis=0, keepdims=True),
+            dtype=w_gu_q.dtype,
+            transposed_scale=True,
+            interpret=True,
+        )
+        np.testing.assert_array_equal(np.asarray(gq), np.asarray(unfused_q))
+        np.testing.assert_allclose(
+            np.asarray(gs), np.asarray(unfused_s), rtol=1e-6, atol=0.0
+        )
+
+        gate_f32 = fp8_matmul_prequantized(
+            xq, xs, w_gate.qvalue, w_gate.scale, out_dtype=jnp.float32
+        )
+        up_f32 = fp8_matmul_prequantized(
+            xq, xs, w_up.qvalue, w_up.scale, out_dtype=jnp.float32
+        )
+        ref_swiglu = (jax.nn.silu(gate_f32) * up_f32).astype(jnp.bfloat16)
+        ref_q, ref_s = quantize_fp8_act(ref_swiglu)
+        deq_ref = np.asarray(ref_q.astype(jnp.float32) * ref_s, dtype=np.float32)
+
+        np.testing.assert_allclose(deq_got, deq_ref, rtol=2e-2, atol=4e-2)
+        cos = float(
+            np.dot(deq_got.ravel(), deq_ref.ravel())
+            / (np.linalg.norm(deq_got.ravel()) * np.linalg.norm(deq_ref.ravel()))
+        )
+        assert cos >= 0.9995
+
+        if batch in (1, 8):
+            zero_xq = jnp.zeros_like(xq)
+            zero_xs = jnp.ones((1, batch), dtype=jnp.float32)
+            zq, zs = pallas_fp8_gate_up_swiglu_quant(
+                zero_xq, zero_xs, w_gu_q, w_gu_s, interpret=True
+            )
+            assert not np.any(np.isnan(np.asarray(zq, np.float32)))
+            np.testing.assert_array_equal(
+                np.asarray(zs), np.ones((1, batch), dtype=np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(zq, np.float32), np.zeros((batch, ffn), dtype=np.float32)
+            )
+
+        if len(jax.devices()) >= 2 and ffn % 256 == 0 and k_dim == 256:
+            mesh = Mesh(np.array(jax.devices()[:2]), ("tp",))
+            half = ffn // 2
+            w_sh_q = jax.device_put(
+                jnp.concatenate(
+                    [
+                        w_gate.qvalue[:half],
+                        w_up.qvalue[:half],
+                        w_gate.qvalue[half:],
+                        w_up.qvalue[half:],
+                    ],
+                    axis=0,
+                ),
+                NamedSharding(mesh, P("tp", None)),
+            )
+            w_sh_s = jax.device_put(
+                jnp.concatenate(
+                    [
+                        w_gate.scale[:half],
+                        w_up.scale[:half],
+                        w_gate.scale[half:],
+                        w_up.scale[half:],
+                    ],
+                    axis=0,
+                ),
+                NamedSharding(mesh, P("tp")),
+            )
+            xq_rep = jax.device_put(xq, NamedSharding(mesh, P(None, None)))
+            xs_rep = jax.device_put(xs_row, NamedSharding(mesh, P(None, None)))
+            sh_gq, sh_gs = sharded_fp8_gate_up_swiglu(
+                xq_rep,
+                xs_rep,
+                w_sh_q,
+                w_sh_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                quantize_output=True,
+                backend="pallas",
+                interpret=True,
+            )
+            assert sh_gs is not None and sh_gs.shape == (2, batch)
+            sh_deq = np.concatenate(
+                [
+                    np.asarray(
+                        sh_gq[:, :half].astype(jnp.float32) * sh_gs[0:1].T,
+                        dtype=np.float32,
+                    ),
+                    np.asarray(
+                        sh_gq[:, half:].astype(jnp.float32) * sh_gs[1:2].T,
+                        dtype=np.float32,
+                    ),
+                ],
+                axis=-1,
+            )
+            ref_f32 = np.asarray(jax.nn.silu(gate_f32) * up_f32, dtype=np.float32)
+            sh_cos = float(
+                np.dot(sh_deq.ravel(), ref_f32.ravel())
+                / (np.linalg.norm(sh_deq.ravel()) * np.linalg.norm(ref_f32.ravel()))
+            )
+            assert sh_cos >= 0.999
+
+    def test_quantize_fp8_with_absmax_k_tiling_and_xla_fallback(self) -> None:
+        from resin.backend.tpu.kernels import quantize_fp8_act
+        from resin.backend.tpu.kernels.fp8_matmul import quantize_fp8_with_absmax
+
+        rng = np.random.default_rng(320)
+        wide_x = jnp.asarray(
+            rng.standard_normal((320, 12800)).astype(np.float32) * 0.25,
+            jnp.bfloat16,
+        )
+        wide_abs = jnp.max(
+            jnp.abs(wide_x.astype(jnp.float32)), axis=-1, keepdims=True
+        ).T
+        wq_pallas, ws_pallas = quantize_fp8_with_absmax(
+            wide_x,
+            wide_abs,
+            jnp.float8_e4m3fn,
+            transposed_scale=True,
+            use_pallas=True,
+            interpret=True,
+        )
+        wq_ref, ws_ref = quantize_fp8_act(wide_x)
+        np.testing.assert_array_equal(np.asarray(wq_pallas), np.asarray(wq_ref))
+        np.testing.assert_array_equal(np.asarray(ws_pallas.T), np.asarray(ws_ref))
+
+        for fallback_shape in ((384, 256), (16, 192)):
+            fb_x = jnp.asarray(
+                rng.standard_normal(fallback_shape).astype(np.float32) * 0.25,
                 jnp.bfloat16,
             )
-            wide_abs = jnp.max(
-                jnp.abs(wide_x.astype(jnp.float32)), axis=-1, keepdims=True
+            fb_abs = jnp.max(
+                jnp.abs(fb_x.astype(jnp.float32)), axis=-1, keepdims=True
             ).T
             with pytest.raises(ValueError, match="unsupported"):
                 quantize_fp8_with_absmax(
-                    wide_x, wide_abs, jnp.float8_e4m3fn, use_pallas=True, interpret=True
+                    fb_x, fb_abs, jnp.float8_e4m3fn, use_pallas=True, interpret=True
                 )
-            wq_auto, ws_auto = quantize_fp8_with_absmax(
-                wide_x,
-                wide_abs,
+            fq_auto, fs_auto = quantize_fp8_with_absmax(
+                fb_x,
+                fb_abs,
                 jnp.float8_e4m3fn,
                 transposed_scale=True,
                 interpret=True,
             )
-            wq_x, ws_x = quantize_fp8_with_absmax(
-                wide_x,
-                wide_abs,
+            fq_x, fs_x = quantize_fp8_with_absmax(
+                fb_x,
+                fb_abs,
                 jnp.float8_e4m3fn,
                 transposed_scale=True,
                 use_pallas=False,
             )
-            np.testing.assert_array_equal(np.asarray(wq_auto), np.asarray(wq_x))
-            np.testing.assert_array_equal(np.asarray(ws_auto), np.asarray(ws_x))
+            np.testing.assert_array_equal(np.asarray(fq_auto), np.asarray(fq_x))
+            np.testing.assert_array_equal(np.asarray(fs_auto), np.asarray(fs_x))
 
     @pytest.mark.parametrize("batch", [160, 192, 320])
     def test_zero_pad_norms_qkv_pack_and_unpack_attn_fp8_quant(
@@ -2755,22 +3590,24 @@ class TestDecodeMatmulPath:
             sharded_fp8_row_matmul_async_ar,
         )
 
-        # VMEM audit across all 12 Qwen3-32B tp=2 decode buckets on o_proj and down_proj.
+        # VMEM audit across all Qwen3-32B tp=2 decode buckets (including <8 padded) on o_proj and down_proj.
         vmem_budget_bytes = 40 * 1024 * 1024
-        decode_buckets = (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320)
+        decode_buckets = (1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320)
         for bs in decode_buckets:
             for n_out_dim, k_local in ((5120, 4096), (5120, 12800)):
                 tiles = get_async_ar_tile_sizes(bs, n_out_dim, k_local)
                 n_out = n_out_dim // tiles.out_block_size
                 assert n_out >= 4
-                vmem_bytes = estimate_async_ar_vmem_bytes(
-                    tiles.batch_block_size,
-                    tiles.out_block_size,
-                    tiles.in_block_size,
-                    n_out,
-                    min(tiles.w_buffer_count, n_out),
-                )
-                assert vmem_bytes <= vmem_budget_bytes
+                for fuse_nq in (False, True):
+                    vmem_bytes = estimate_async_ar_vmem_bytes(
+                        tiles.batch_block_size,
+                        tiles.out_block_size,
+                        tiles.in_block_size,
+                        n_out,
+                        min(tiles.w_buffer_count, n_out),
+                        fuse_norm_quant=fuse_nq,
+                    )
+                    assert vmem_bytes <= vmem_budget_bytes
 
         devices = jax.devices()
         if len(devices) < 2:
@@ -2931,6 +3768,256 @@ class TestDecodeMatmulPath:
             interpret=True,
         )
         np.testing.assert_array_equal(np.asarray(y1), np.asarray(y_ref_chain))
+
+    @pytest.mark.parametrize("batch", [1, 8, 16, 64, 89, 96, 128, 192, 224, 313, 320])
+    @pytest.mark.parametrize("n_dim,k_global", [(256, 256), (512, 256), (384, 256)])
+    def test_async_ar_fused_add_rms_norm_fp8_quant_interpret(
+        self, batch: int, n_dim: int, k_global: int
+    ) -> None:
+        from unittest import mock
+
+        from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from resin.backend.tpu.kernels import (
+            estimate_async_ar_vmem_bytes,
+            fp8_matmul_prequantized,
+            fused_add_rms_norm_fp8_quant,
+            get_async_ar_tile_sizes,
+            pallas_fp8_row_matmul_async_ar,
+            quantize_fp8_act,
+            quantize_fp8_weight,
+            sharded_fp8_row_matmul_async_ar,
+        )
+        from resin.backend.tpu.kernels._rpa_v3_pallas import align_to
+
+        if batch in (64, 96, 128, 192, 224, 320) and (n_dim, k_global) != (512, 256):
+            return
+
+        if batch == 320 and (n_dim, k_global) == (512, 256):
+            for out_dim, k_loc in ((5120, 4096), (5120, 12800)):
+                t_qwen = get_async_ar_tile_sizes(320, out_dim, k_loc)
+                n_out_q = out_dim // t_qwen.out_block_size
+                v_bytes = estimate_async_ar_vmem_bytes(
+                    t_qwen.batch_block_size,
+                    t_qwen.out_block_size,
+                    t_qwen.in_block_size,
+                    n_out_q,
+                    min(t_qwen.w_buffer_count, n_out_q),
+                    fuse_norm_quant=True,
+                )
+                assert v_bytes <= 40 * 1024 * 1024
+
+        devices = jax.devices()
+        if len(devices) < 2:
+            pytest.skip("requires at least 2 devices for tp=2 async all-reduce")
+
+        mesh = make_mesh(2, devices[:2])
+        row_sharding = NamedSharding(mesh, P(None, "tp"))
+        rep_sharding = NamedSharding(mesh, P())
+        rng = np.random.default_rng(7100 + batch * 13 + n_dim)
+
+        x_bf16 = jax.device_put(
+            jnp.asarray(rng.standard_normal((batch, k_global)) * 0.4, jnp.bfloat16),
+            row_sharding,
+        )
+        res_bf16 = jax.device_put(
+            jnp.asarray(rng.standard_normal((batch, n_dim)) * 0.4, jnp.bfloat16),
+            rep_sharding,
+        )
+        norm_w = jax.device_put(
+            jnp.asarray(rng.uniform(0.5, 1.5, size=(n_dim,)), jnp.bfloat16),
+            rep_sharding,
+        )
+        w = quantize_fp8_weight(
+            jnp.asarray(rng.standard_normal((n_dim, k_global)) * 0.03, jnp.bfloat16)
+        )
+        wq = jax.device_put(w.qvalue, row_sharding)
+        ws = jax.device_put(w.scale, rep_sharding)
+
+        def _quant_per_die(x_sh: jax.Array) -> tuple[jax.Array, jax.Array]:
+            def _lq(xl: jax.Array) -> tuple[jax.Array, jax.Array]:
+                ql, sl = quantize_fp8_act(xl, tp_axis="tp", sync_tp_scale=False)
+                return ql, jnp.transpose(sl.reshape(batch, 1))
+
+            return jax.shard_map(
+                _lq,
+                mesh=mesh,
+                in_specs=P(None, "tp"),
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )(x_sh)
+
+        xq, xs = _quant_per_die(x_bf16)
+        tiles = Fp8MatmulTileSizes(align_to(max(8, batch), 8), 128, 128, 2)
+        interp_params = pltpu.InterpretParams(detect_races=True)
+
+        with mock.patch(
+            "resin.backend.tpu.kernels.collective_fp8_matmul.pl.pallas_call",
+            wraps=pl.pallas_call,
+        ) as ar_pallas_spy:
+            xq_got, xs_got, res_got = sharded_fp8_row_matmul_async_ar(
+                xq,
+                wq,
+                ws,
+                mesh=mesh,
+                x_scale=xs,
+                sync_tp_scale=False,
+                residual=res_bf16,
+                norm_weight=norm_w,
+                eps=1e-6,
+                quantize_output_dtype=jnp.float8_e4m3fn,
+                transposed_scale=True,
+                tile_sizes=tiles,
+                backend="pallas",
+                interpret=interp_params,
+            )
+        ar_names = [
+            str(call.kwargs.get("name", "")) for call in ar_pallas_spy.call_args_list
+        ]
+        if batch <= 96:
+            assert len(ar_names) == 1
+            assert ar_names[0].endswith("_add_norm_q")
+            assert interpret_pallas_call.races is not None
+            assert not interpret_pallas_call.races.races_found
+        else:
+            assert len(ar_names) == 2
+            assert not ar_names[0].endswith("_add_norm_q")
+            assert ar_names[1].startswith("fused_add_rms_norm_fp8_quant_")
+
+        delta_ref = sharded_fp8_row_matmul_async_ar(
+            xq,
+            wq,
+            ws,
+            mesh=mesh,
+            x_scale=xs,
+            sync_tp_scale=False,
+            tile_sizes=tiles,
+            backend="pallas",
+            interpret=True,
+        )
+        xq_ref, xs_ref, res_ref = jax.shard_map(
+            lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(
+                dl, rl, nw, 1e-6, transposed_scale=True, interpret=True
+            ),
+            mesh=mesh,
+            in_specs=(P(None, None), P(None, None), P()),
+            out_specs=(P(None, None), P(None, None), P(None, None)),
+            check_vma=False,
+        )(delta_ref, res_bf16, norm_w)
+
+        np.testing.assert_array_equal(
+            np.asarray(res_got.addressable_shards[0].data),
+            np.asarray(res_got.addressable_shards[1].data),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(xq_got.addressable_shards[0].data),
+            np.asarray(xq_got.addressable_shards[1].data),
+        )
+
+        k_half = k_global // 2
+        d0 = fp8_matmul_prequantized(
+            xq[:, :k_half], xs[0].reshape(batch, 1), w.qvalue[:, :k_half], w.scale
+        )
+        d1 = fp8_matmul_prequantized(
+            xq[:, k_half:], xs[1].reshape(batch, 1), w.qvalue[:, k_half:], w.scale
+        )
+        exact_next_res = (
+            d0.astype(jnp.float32)
+            + d1.astype(jnp.float32)
+            + res_bf16.astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        np.testing.assert_allclose(
+            np.asarray(res_got, np.float32),
+            np.asarray(exact_next_res, np.float32),
+            rtol=1e-2,
+            atol=2e-3,
+        )
+        np.testing.assert_array_equal(np.asarray(res_got), np.asarray(res_ref))
+        np.testing.assert_array_equal(np.asarray(xs_got), np.asarray(xs_ref))
+        np.testing.assert_array_equal(np.asarray(xq_got), np.asarray(xq_ref))
+
+        if batch == 8 and (n_dim, k_global) == (256, 256):
+            fb_q, fb_s, fb_r = sharded_fp8_row_matmul_async_ar(
+                xq,
+                wq,
+                ws,
+                mesh=mesh,
+                x_scale=xs,
+                sync_tp_scale=False,
+                residual=res_bf16,
+                norm_weight=norm_w,
+                eps=1e-6,
+                quantize_output_dtype=jnp.float8_e4m3fn,
+                transposed_scale=True,
+                backend="xla",
+            )
+            np.testing.assert_allclose(
+                np.asarray(fb_r, np.float32),
+                np.asarray(res_got, np.float32),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            assert fb_q.shape == (batch, n_dim)
+            assert fb_s.shape == (1, batch)
+
+            big_tiles = Fp8MatmulTileSizes(128, 128, 128, 2)
+            with mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.pl.pallas_call",
+                wraps=pl.pallas_call,
+            ) as big_tile_spy:
+                bt_q, bt_s, bt_r = sharded_fp8_row_matmul_async_ar(
+                    xq,
+                    wq,
+                    ws,
+                    mesh=mesh,
+                    x_scale=xs,
+                    sync_tp_scale=False,
+                    residual=res_bf16,
+                    norm_weight=norm_w,
+                    eps=1e-6,
+                    quantize_output_dtype=jnp.float8_e4m3fn,
+                    transposed_scale=True,
+                    tile_sizes=big_tiles,
+                    backend="pallas",
+                    interpret=True,
+                )
+            big_names = [
+                str(call.kwargs.get("name", "")) for call in big_tile_spy.call_args_list
+            ]
+            assert len(big_names) == 2
+            assert not big_names[0].endswith("_add_norm_q")
+            assert big_names[1].startswith("fused_add_rms_norm_fp8_quant_")
+            np.testing.assert_array_equal(np.asarray(bt_r), np.asarray(res_ref))
+            np.testing.assert_array_equal(np.asarray(bt_s), np.asarray(xs_ref))
+            np.testing.assert_array_equal(np.asarray(bt_q), np.asarray(xq_ref))
+
+            with pytest.raises(ValueError, match="<= 96"):
+                jax.shard_map(
+                    lambda xql, xsl, wql, wsl, rl, nwl: pallas_fp8_row_matmul_async_ar(
+                        xql,
+                        xsl,
+                        wql,
+                        wsl,
+                        residual=rl,
+                        norm_weight=nwl,
+                        quantize_output_dtype=jnp.float8_e4m3fn,
+                        tile_sizes=big_tiles,
+                        interpret=True,
+                    ),
+                    mesh=mesh,
+                    in_specs=(
+                        P(None, "tp"),
+                        P("tp", None),
+                        P(None, "tp"),
+                        P(),
+                        P(None, None),
+                        P(),
+                    ),
+                    out_specs=(P(None, None), P(None, None), P(None, None)),
+                    check_vma=False,
+                )(xq, xs, wq, ws, res_bf16, norm_w)
 
     def test_async_row_all_reduce_vmem_limit_tile_validation_and_fallbacks(
         self,
@@ -3674,6 +4761,9 @@ class TestTpuHardwareMosaic:
         from resin.backend.tpu.kernels import (
             fused_add_rms_norm_fp8_quant,
             pallas_qkv_norm_rope_pack,
+            pallas_unpack_attn_fp8_quant,
+            prepare_inputs,
+            quantize_fp8_act,
             sharded_fp8_gate_up_swiglu,
             sharded_fp8_matmul_all_gather,
             sharded_fp8_matmul_reduce_scatter,
@@ -3682,7 +4772,7 @@ class TestTpuHardwareMosaic:
         mesh = make_mesh(min(len(jax.devices()), 2))
         tp = int(mesh.shape["tp"])
         rng = np.random.default_rng(2027)
-        tokens = 512
+        tokens = 1024
 
         # 1. Fused residual + RMSNorm + FP8 quant on [tokens // tp, 5120]
         x = jax.device_put(
@@ -3754,6 +4844,69 @@ class TestTpuHardwareMosaic:
             )
         )(qkv_out, pos, rc_rep[0], rc_rep[1], qnw, knw)
 
+        # Direct element-for-element parity of qp/kvm against prepare_inputs(q_ref, k_ref, v_ref).
+        q_heads_local = 64 // tp
+        kv_heads_local = 8 // tp
+        qkv_host = np.asarray(qkv_out, np.float32)
+        q_chunks, k_chunks, v_chunks = [], [], []
+        local_w = (q_heads_local + 2 * kv_heads_local) * 128
+        for s_idx in range(tp):
+            sl = jnp.asarray(
+                qkv_host[:, s_idx * local_w : (s_idx + 1) * local_w], jnp.bfloat16
+            )
+            qs, ks, vs = jnp.split(
+                sl,
+                [q_heads_local * 128, (q_heads_local + kv_heads_local) * 128],
+                axis=-1,
+            )
+            q_chunks.append(qs.reshape(tokens, q_heads_local, 128))
+            k_chunks.append(ks.reshape(tokens, kv_heads_local, 128))
+            v_chunks.append(vs.reshape(tokens, kv_heads_local, 128))
+        q_full = jnp.concatenate(q_chunks, axis=1)
+        k_full = jnp.concatenate(k_chunks, axis=1)
+        v_full = jnp.concatenate(v_chunks, axis=1)
+        pos_host = jnp.arange(tokens, dtype=jnp.int32)
+        q_ref_full = apply_rope(
+            rms_norm(q_full, jnp.ones((128,), jnp.bfloat16), 1e-6),
+            pos_host,
+            128,
+            cos_sin_cache=rc,
+        )
+        k_ref_full = quantize_kv(
+            apply_rope(
+                rms_norm(k_full, jnp.ones((128,), jnp.bfloat16), 1e-6),
+                pos_host,
+                128,
+                cos_sin_cache=rc,
+            ),
+            jnp.float8_e4m3fn,
+        )
+        v_ref_full = quantize_kv(v_full, jnp.float8_e4m3fn)
+        exp_qp_full, exp_kvm_full = prepare_inputs(q_ref_full, k_ref_full, v_ref_full)
+        np.testing.assert_allclose(
+            np.asarray(qp, np.float32),
+            np.asarray(exp_qp_full, np.float32),
+            rtol=1e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(kvm, np.float32),
+            np.asarray(exp_kvm_full, np.float32),
+            rtol=0.125,
+            atol=2e-2,
+        )
+        assert (
+            float(
+                np.mean(
+                    np.abs(
+                        np.asarray(kvm, np.float32)
+                        - np.asarray(exp_kvm_full, np.float32)
+                    )
+                )
+            )
+            < 1e-3
+        )
+
         spec = KvCacheSpec(
             layers=1, kv_heads=8, head_dim=128, page_tokens=256, dtype=jnp.float8_e4m3fn
         )
@@ -3808,6 +4961,84 @@ class TestTpuHardwareMosaic:
             rtol=3e-2,
             atol=5e-2,
         )
+
+        # 2b. Packed attention output + pallas_unpack_attn_fp8_quant (tb=512).
+        cache_packed = jax.device_put(
+            jnp.zeros((8, *spec.page_shape(tp)), jnp.float8_e4m3fn), cache_sharding
+        )
+        att_packed, _ = jax.jit(
+            lambda q_i, kv_i, c_i, m_i: paged_attention(
+                q_i,
+                kv_i,
+                None,
+                c_i,
+                m_i,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+            )
+        )(qp, kvm, cache_packed, meta)
+        att_q_sh, att_s_sh = jax.jit(
+            jax.shard_map(
+                lambda pk: pallas_unpack_attn_fp8_quant(pk, 8, 128),
+                mesh=mesh,
+                in_specs=Q_PACKED_PARTITION,
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )
+        )(att_packed)
+        att_bf16_sh, att_abs_sh = jax.jit(
+            jax.shard_map(
+                lambda pk: pallas_unpack_attn_fp8_quant(
+                    pk, 8, 128, return_bf16_and_absmax=True
+                ),
+                mesh=mesh,
+                in_specs=Q_PACKED_PARTITION,
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )
+        )(att_packed)
+        att_mosaic_2d = jnp.asarray(att_mosaic).reshape(tokens, 8192)
+        np.testing.assert_array_equal(
+            np.asarray(att_bf16_sh[:420]), np.asarray(att_mosaic_2d[:420])
+        )
+        for s_idx in range(tp):
+            local_2d = att_mosaic_2d[
+                :420, s_idx * (8192 // tp) : (s_idx + 1) * (8192 // tp)
+            ]
+            exp_q_l, exp_s_l = quantize_fp8_act(local_2d)
+            got_q_l = np.asarray(att_q_sh)[
+                :420, s_idx * (8192 // tp) : (s_idx + 1) * (8192 // tp)
+            ]
+            got_s_l = np.asarray(att_s_sh)[s_idx, :420]
+            np.testing.assert_allclose(
+                got_q_l.astype(np.float32),
+                np.asarray(exp_q_l, np.float32),
+                rtol=0.125,
+                atol=5e-2,
+            )
+            assert (
+                float(
+                    np.mean(
+                        np.abs(
+                            got_q_l.astype(np.float32) - np.asarray(exp_q_l, np.float32)
+                        )
+                    )
+                )
+                < 1e-3
+            )
+            np.testing.assert_allclose(
+                got_s_l, np.asarray(exp_s_l[:, 0]), rtol=1e-4, atol=1e-5
+            )
+            np.testing.assert_allclose(
+                np.asarray(att_abs_sh)[s_idx, :420],
+                np.max(np.abs(np.asarray(local_2d, np.float32)), axis=-1),
+                rtol=1e-5,
+                atol=1e-5,
+            )
 
         # 3. Fused gate_up_swiglu + down_proj reduce_scatter
         w_gu = quantize_fp8_weight(
@@ -3877,6 +5108,184 @@ class TestTpuHardwareMosaic:
             np.dot(p_flat, x_flat) / (np.linalg.norm(p_flat) * np.linalg.norm(x_flat))
         )
         assert cosine > 0.999
+
+    def test_qwen3_tp2_mosaic_prefill_4096_w8a8_tiles_parity(self) -> None:
+        from resin.backend.tpu.kernels import (
+            Fp8Weight,
+            fused_add_rms_norm_fp8_quant,
+            quantize_fp8_act,
+            sharded_fp8_gate_up_swiglu,
+            sharded_fp8_matmul_all_gather,
+            sharded_fp8_matmul_reduce_scatter,
+        )
+
+        mesh = make_mesh(min(len(jax.devices()), 2))
+        rng = np.random.default_rng(4096)
+        tokens = 4096
+
+        def _sharded_fp8_weight(
+            shape: tuple[int, int], *, col_parallel: bool
+        ) -> Fp8Weight:
+            weight = quantize_fp8_weight(
+                jnp.asarray(rng.standard_normal(shape) * 0.02, jnp.bfloat16)
+            )
+            q_spec = P("tp", None) if col_parallel else P(None, "tp")
+            s_spec = P("tp") if col_parallel else P()
+            return Fp8Weight(
+                qvalue=jax.device_put(weight.qvalue, NamedSharding(mesh, q_spec)),
+                scale=jax.device_put(weight.scale, NamedSharding(mesh, s_spec)),
+            )
+
+        def _assert_close(actual: jax.Array, expected: jax.Array) -> None:
+            np.testing.assert_allclose(
+                np.asarray(actual, np.float32),
+                np.asarray(expected, np.float32),
+                rtol=2e-2,
+                atol=5e-2,
+            )
+
+        x = jax.device_put(
+            jnp.asarray(rng.standard_normal((tokens, 5120)) * 0.5, jnp.bfloat16),
+            NamedSharding(mesh, P("tp", None)),
+        )
+        residual = jax.device_put(
+            jnp.asarray(rng.standard_normal((tokens, 5120)) * 0.5, jnp.bfloat16),
+            NamedSharding(mesh, P("tp", None)),
+        )
+        norm_weight = jax.device_put(
+            jnp.ones((5120,), jnp.bfloat16), NamedSharding(mesh, P())
+        )
+        x_q, x_scale, _ = jax.jit(
+            jax.shard_map(
+                lambda xl, rl, w: fused_add_rms_norm_fp8_quant(xl, rl, w, 1e-6),
+                mesh=mesh,
+                in_specs=(P("tp", None), P("tp", None), P()),
+                out_specs=(P("tp", None), P("tp", None), P("tp", None)),
+                check_vma=False,
+            )
+        )(x, residual, norm_weight)
+
+        def _jit_pallas_and_xla(call_fn: Any, *args: jax.Array) -> tuple[Any, Any]:
+            return (
+                jax.jit(functools.partial(call_fn, backend="pallas"))(*args),
+                jax.jit(functools.partial(call_fn, backend="xla"))(*args),
+            )
+
+        w_qkv = _sharded_fp8_weight((10240, 5120), col_parallel=True)
+        qkv_pallas, qkv_xla = _jit_pallas_and_xla(
+            lambda xq_i, xs_i, *, backend: sharded_fp8_matmul_all_gather(
+                xq_i, xs_i, w_qkv.qvalue, w_qkv.scale, mesh=mesh, backend=backend
+            ),
+            x_q,
+            x_scale,
+        )
+        _assert_close(qkv_pallas, qkv_xla)
+
+        # o_proj reduce_scatter: test both unquantized bf16 and pre-quantized fp8 activations.
+        att_bf16 = jax.device_put(
+            jnp.asarray(rng.standard_normal((tokens, 8192)) * 0.5, jnp.bfloat16),
+            NamedSharding(mesh, P(None, "tp")),
+        )
+        w_o = _sharded_fp8_weight((5120, 8192), col_parallel=False)
+        o_pallas_bf16, o_xla_bf16 = _jit_pallas_and_xla(
+            lambda a_i, *, backend: sharded_fp8_matmul_reduce_scatter(
+                a_i, w_o.qvalue, w_o.scale, mesh=mesh, backend=backend
+            ),
+            att_bf16,
+        )
+        _assert_close(o_pallas_bf16, o_xla_bf16)
+
+        def _quant_per_die(a_shard: jax.Array) -> tuple[jax.Array, jax.Array]:
+            aq_s, as_s = quantize_fp8_act(a_shard)
+            return aq_s, as_s.reshape(1, tokens)
+
+        att_q, att_scale = jax.jit(
+            jax.shard_map(
+                _quant_per_die,
+                mesh=mesh,
+                in_specs=P(None, "tp"),
+                out_specs=(P(None, "tp"), P("tp", None)),
+            )
+        )(att_bf16)
+        o_pallas_fp8, o_xla_fp8 = _jit_pallas_and_xla(
+            lambda aq, a_s, *, backend: sharded_fp8_matmul_reduce_scatter(
+                aq,
+                w_o.qvalue,
+                w_o.scale,
+                mesh=mesh,
+                x_scale=a_s,
+                sync_tp_scale=False,
+                backend=backend,
+            ),
+            att_q,
+            att_scale,
+        )
+        _assert_close(o_pallas_fp8, o_xla_fp8)
+
+        # gate_up_swiglu + down_proj (both default (1024, 2560, 2560) and save_x_q=True (1024, 1280, 2560)) at T=4096.
+        w_gate_up = _sharded_fp8_weight((51200, 5120), col_parallel=True)
+        w_down = _sharded_fp8_weight((5120, 25600), col_parallel=False)
+
+        (gated_pallas, gated_absmax), (gated_xla, _) = _jit_pallas_and_xla(
+            lambda xq_i, xs_i, *, backend: sharded_fp8_gate_up_swiglu(
+                xq_i,
+                xs_i,
+                w_gate_up.qvalue,
+                w_gate_up.scale,
+                mesh=mesh,
+                sync_tp_scale=False,
+                backend=backend,
+            ),
+            x_q,
+            x_scale,
+        )
+        _assert_close(gated_pallas, gated_xla)
+
+        assert gated_absmax is not None
+        down_pallas = jax.jit(
+            lambda g_i, a_i: sharded_fp8_matmul_reduce_scatter(
+                g_i,
+                w_down.qvalue,
+                w_down.scale,
+                mesh=mesh,
+                x_abs_max=a_i,
+                sync_tp_scale=False,
+                backend="pallas",
+            )
+        )(gated_pallas, gated_absmax)
+        down_xla = jax.jit(
+            lambda g_i: sharded_fp8_matmul_reduce_scatter(
+                g_i,
+                w_down.qvalue,
+                w_down.scale,
+                mesh=mesh,
+                sync_tp_scale=False,
+                backend="xla",
+            )
+        )(gated_pallas)
+        _assert_close(down_pallas, down_xla)
+
+        # Also exercise save_x_q=True + redundant-x-DMA skip on (1024, 1280, 2560) (n_out=4, n_in=5).
+        down_savexq = jax.jit(
+            jax.shard_map(
+                lambda g_s, a_s, wq_s, ws_s: fp8_matmul(
+                    g_s,
+                    wq_s,
+                    ws_s,
+                    x_abs_max=a_s,
+                    tp_axis=None,
+                    scatter_axis="tp",
+                    sync_tp_scale=False,
+                    backend="pallas",
+                    tile_sizes=Fp8MatmulTileSizes(1024, 1280, 2560),
+                ),
+                mesh=mesh,
+                in_specs=(P(None, "tp"), P("tp", None), P(None, "tp"), P()),
+                out_specs=P("tp", None),
+                check_vma=False,
+            )
+        )(gated_pallas, gated_absmax, w_down.qvalue, w_down.scale)
+        _assert_close(down_savexq, down_pallas)
 
     def test_qwen3_tp2_mosaic_decode_fused_kernels_parity(self) -> None:
         from resin.backend.tpu.attention import (
@@ -4414,6 +5823,200 @@ class TestTpuHardwareMosaic:
                 atol=2e-2,
             )
 
+    def test_qwen3_tp2_mosaic_async_ar_fused_norm_quant_bit_exact_buckets(
+        self,
+    ) -> None:
+        from resin.backend.tpu.kernels import (
+            fused_add_rms_norm_fp8_quant,
+            quantize_fp8_act,
+            sharded_fp8_gate_up_swiglu,
+            sharded_fp8_row_matmul_async_ar,
+        )
+
+        if len(jax.devices()) < 2:
+            pytest.skip("requires 2 TPU cores for tp=2 async all-reduce")
+
+        hidden_size = 5120
+        q_width = 8192
+        ffn_width = 25600
+        rms_eps = 1e-6
+
+        mesh = make_mesh(2)
+        rep = NamedSharding(mesh, P())
+        rep_2d = NamedSharding(mesh, P(None, None))
+        row_sh = NamedSharding(mesh, P(None, "tp"))
+        col_sh = NamedSharding(mesh, P("tp", None))
+        sc_col_sh = NamedSharding(mesh, P("tp"))
+        sc_die_sh = NamedSharding(mesh, P("tp", None))
+        rng = np.random.default_rng(8803)
+
+        w_o = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((hidden_size, q_width)) * 0.02, jnp.bfloat16
+            )
+        )
+        w_gu = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((2 * ffn_width, hidden_size)) * 0.02, jnp.bfloat16
+            )
+        )
+        w_d = quantize_fp8_weight(
+            jnp.asarray(
+                rng.standard_normal((hidden_size, ffn_width)) * 0.02, jnp.bfloat16
+            )
+        )
+        wo_q = jax.device_put(w_o.qvalue, row_sh)
+        wo_s = jax.device_put(w_o.scale, rep)
+        wgu_q = jax.device_put(w_gu.qvalue, col_sh)
+        wgu_s = jax.device_put(w_gu.scale, sc_col_sh)
+        wd_q = jax.device_put(w_d.qvalue, row_sh)
+        wd_s = jax.device_put(w_d.scale, rep)
+        nw1 = jax.device_put(
+            jnp.asarray(rng.uniform(0.5, 1.5, (hidden_size,)), jnp.bfloat16), rep
+        )
+        nw2 = jax.device_put(
+            jnp.asarray(rng.uniform(0.5, 1.5, (hidden_size,)), jnp.bfloat16), rep
+        )
+
+        def _add_norm_quant(
+            dl: jax.Array, rl: jax.Array, w: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return jax.shard_map(
+                lambda d, r, nw: fused_add_rms_norm_fp8_quant(
+                    d,
+                    r,
+                    nw,
+                    rms_eps,
+                    dtype=jnp.float8_e4m3fn,
+                    transposed_scale=True,
+                ),
+                mesh=mesh,
+                in_specs=(P(None, None), P(None, None), P()),
+                out_specs=(P(None, None), P(None, None), P(None, None)),
+                check_vma=False,
+            )(dl, rl, w)
+
+        @jax.jit
+        def _quant_per_die(x_bf16_sh: jax.Array) -> tuple[jax.Array, jax.Array]:
+            def _q(xs: jax.Array) -> tuple[jax.Array, jax.Array]:
+                q, s = quantize_fp8_act(xs, dtype=jnp.float8_e4m3fn)
+                return q, jnp.transpose(s)
+
+            return jax.shard_map(
+                _q,
+                mesh=mesh,
+                in_specs=(P(None, "tp"),),
+                out_specs=(P(None, "tp"), P("tp", None)),
+                check_vma=False,
+            )(x_bf16_sh)
+
+        weights_arg = (wo_q, wo_s, nw1, wgu_q, wgu_s, wd_q, wd_s, nw2)
+
+        @functools.partial(jax.jit, static_argnames=("fuse",))
+        def _step_one(
+            w_tup, res_in: jax.Array, aq: jax.Array, as_t: jax.Array, *, fuse: bool
+        ):
+            o_q, o_s, w1, gu_q, gu_s, d_q, d_s, w2 = w_tup
+            if fuse:
+                mq, ms, x = sharded_fp8_row_matmul_async_ar(
+                    aq,
+                    o_q,
+                    o_s,
+                    mesh=mesh,
+                    tp_axis="tp",
+                    x_scale=as_t,
+                    out_dtype=jnp.bfloat16,
+                    residual=res_in,
+                    norm_weight=w1,
+                    eps=rms_eps,
+                    quantize_output_dtype=jnp.float8_e4m3fn,
+                    transposed_scale=True,
+                    collective_id=0,
+                )
+            else:
+                do = sharded_fp8_row_matmul_async_ar(
+                    aq,
+                    o_q,
+                    o_s,
+                    mesh=mesh,
+                    tp_axis="tp",
+                    x_scale=as_t,
+                    out_dtype=jnp.bfloat16,
+                    collective_id=0,
+                )
+                mq, ms, x = _add_norm_quant(do, res_in, w1)
+            dq, ds = sharded_fp8_gate_up_swiglu(
+                mq,
+                ms,
+                gu_q,
+                gu_s,
+                mesh=mesh,
+                sequence_parallel=False,
+                sync_tp_scale=False,
+                quantize_output=True,
+                fuse_quant_epilogue=True,
+                out_dtype=jnp.bfloat16,
+            )
+            if fuse:
+                hq, hs, x = sharded_fp8_row_matmul_async_ar(
+                    dq,
+                    d_q,
+                    d_s,
+                    mesh=mesh,
+                    tp_axis="tp",
+                    x_scale=ds,
+                    out_dtype=jnp.bfloat16,
+                    residual=x,
+                    norm_weight=w2,
+                    eps=rms_eps,
+                    quantize_output_dtype=jnp.float8_e4m3fn,
+                    transposed_scale=True,
+                    collective_id=1,
+                )
+            else:
+                dd = sharded_fp8_row_matmul_async_ar(
+                    dq,
+                    d_q,
+                    d_s,
+                    mesh=mesh,
+                    tp_axis="tp",
+                    x_scale=ds,
+                    out_dtype=jnp.bfloat16,
+                    collective_id=1,
+                )
+                hq, hs, x = _add_norm_quant(dd, x, w2)
+            return mq, ms, hq, hs, x
+
+        for b in (1, 8, 16, 32, 64, 96, 128):
+            res0 = jax.device_put(
+                jnp.asarray(rng.standard_normal((b, hidden_size)) * 0.5, jnp.bfloat16),
+                rep_2d,
+            )
+            a_bf16 = jax.device_put(
+                jnp.asarray(rng.standard_normal((b, q_width)) * 0.25, jnp.bfloat16),
+                row_sh,
+            )
+            aq, as_t = _quant_per_die(a_bf16)
+            as_t = jax.device_put(as_t, sc_die_sh)
+
+            hlo_txt = _step_one.lower(weights_arg, res0, aq, as_t, fuse=True).as_text()
+            if b <= 96:
+                assert "_add_norm_q" in hlo_txt
+            else:
+                assert "_add_norm_q" not in hlo_txt
+
+            xf, xu = res0, res0
+            got = ref = None
+            for _ in range(4):
+                got = _step_one(weights_arg, xf, aq, as_t, fuse=True)
+                ref = _step_one(weights_arg, xu, aq, as_t, fuse=False)
+                xf = got[-1]
+                xu = ref[-1]
+            got = jax.block_until_ready(got)
+            ref = jax.block_until_ready(ref)
+            for g_arr, r_arr in zip(got, ref, strict=True):
+                np.testing.assert_array_equal(np.asarray(g_arr), np.asarray(r_arr))
+
     @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
     def test_qwen3_tp2_mosaic_batched_decode_parity_and_zero_recompile(
         self, kv_dtype: jnp.dtype
@@ -4592,6 +6195,190 @@ class TestTpuHardwareMosaic:
             off = pos % 256
             np.testing.assert_array_equal(cache_host[pg, off], ref_cache_host[pg, off])
 
+    @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
+    def test_qwen3_tp2_mosaic_batched_mixed_parity_and_zero_recompile(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        mesh = make_mesh(min(len(jax.devices()), 2))
+        tp = int(mesh.shape["tp"])
+        spec = KvCacheSpec(
+            layers=1,
+            kv_heads=8,
+            head_dim=128,
+            page_tokens=256,
+            dtype=kv_dtype,
+        )
+        cache_sharding = NamedSharding(mesh, KV_PARTITION)
+        head_sharding = NamedSharding(mesh, P(None, "tp", None))
+        q_packed_sharding = NamedSharding(mesh, P("tp", None, None, None, None))
+        kv_merged_sharding = NamedSharding(mesh, P(None, "tp", None, None))
+        rep_sharding = NamedSharding(mesh, P())
+        is_fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale = 0.5 if is_fp8 else None
+        v_scale = 0.25 if is_fp8 else None
+        rtol = 3e-2 if is_fp8 else 1e-2
+        atol = 5e-2 if is_fp8 else 2e-2
+
+        max_tokens = 1024
+        max_seqs = 16
+        pages_per_seq = 8  # up to 2048 tokens/seq, crossing bkv_sz=512 and page=256
+        total_pages = 40
+        global_cache_shape = (total_pages, *spec.page_shape(tp))
+        rng = np.random.default_rng(2028)
+        nan_page = np.asarray(jnp.full(global_cache_shape[1:], jnp.nan, dtype=kv_dtype))
+        init_cache = np.repeat(nan_page[None], total_pages, axis=0)
+        init_cache[0] = 0
+
+        pages = np.full((max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        next_page = 1
+        for s in range(8):
+            pages[s, :4] = np.arange(next_page, next_page + 4, dtype=np.int32)
+            next_page += 4
+
+        cache = jax.device_put(jnp.asarray(init_cache), cache_sharding)
+        ref_cache = jax.device_put(jnp.asarray(init_cache), cache_sharding)
+
+        @functools.partial(
+            jax.jit,
+            donate_argnums=(2,),
+            out_shardings=(head_sharding, cache_sharding),
+        )
+        def mosaic_mixed(q_p, kv_m, kv_c, meta):
+            att_p, kv_out = paged_attention(
+                q_p,
+                kv_m,
+                None,
+                kv_c,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+            )
+            out_3d = jax.shard_map(
+                lambda x: prepare_outputs(x, 8, 128),
+                mesh=mesh,
+                in_specs=P("tp", None, None, None, None),
+                out_specs=P(None, "tp", None),
+            )(att_p)
+            return out_3d, kv_out
+
+        def ref_mixed(q_p, kv_m, kv_c, meta):
+            return paged_attention(
+                q_p,
+                kv_m,
+                None,
+                kv_c,
+                meta,
+                mesh=mesh,
+                sm_scale=128**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=64,
+                actual_head_dim=128,
+                impl=reference.ragged_paged_attention,
+            )
+
+        flat_pages = jax.device_put(pages.reshape(-1), rep_sharding)
+        # Step 1: initial prefill of 4 ragged sequences [300, 180, 260, 75] = 815 tokens.
+        # Step 2: continuation prefill on seqs 0,1 (+530, +390 -> kv_lens [830, 570], crossing
+        #         both page=256 and bkv_sz=512) while seqs 2,3 decode (+1 each, placed in 0..2).
+        schedules = [
+            ([0, 1, 2, 3], [300, 180, 260, 75], [300, 180, 260, 75], [0, 0, 4]),
+            ([2, 3, 0, 1], [1, 1, 530, 390], [261, 76, 830, 570], [2, 2, 4]),
+        ]
+        prepared_steps = []
+        for seq_order, q_lens_step, kv_lens_step, dist_step in schedules:
+            q_raw = jnp.asarray(
+                rng.standard_normal((max_tokens, 64, 128)) * 0.2, jnp.bfloat16
+            )
+            k_raw = quantize_kv(
+                jnp.asarray(
+                    rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
+                ),
+                kv_dtype,
+                k_scale,
+            )
+            v_raw = quantize_kv(
+                jnp.asarray(
+                    rng.standard_normal((max_tokens, 8, 128)) * 0.2, jnp.bfloat16
+                ),
+                kv_dtype,
+                v_scale,
+            )
+            q_p, kv_m = prepare_inputs(q_raw, k_raw, v_raw)
+            q_p = jax.device_put(q_p, q_packed_sharding)
+            kv_m = jax.device_put(kv_m, kv_merged_sharding)
+
+            step_pages = np.full(
+                (max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32
+            )
+            step_kv = np.zeros(max_seqs, dtype=np.int32)
+            cu_q = np.zeros(max_seqs + 1, dtype=np.int32)
+            cur = 0
+            for idx, (orig_s, ql, kvl) in enumerate(
+                zip(seq_order, q_lens_step, kv_lens_step, strict=True)
+            ):
+                step_pages[idx] = pages[orig_s]
+                step_kv[idx] = kvl
+                cur += ql
+                cu_q[idx + 1] = cur
+            cu_q[len(seq_order) :] = cur
+
+            meta = AttentionMetadata(
+                jax.device_put(step_kv, rep_sharding),
+                (jax.device_put(step_pages.reshape(-1), rep_sharding),),
+                jax.device_put(cu_q, rep_sharding),
+                jax.device_put(np.array(dist_step, dtype=np.int32), rep_sharding),
+            )
+            jax.block_until_ready((q_p, kv_m, meta))
+            prepared_steps.append((cur, q_p, kv_m, meta))
+
+        step_records = []
+        counter = CompilationCounter()
+        try:
+            warm = None
+            for cur, q_p, kv_m, meta in prepared_steps:
+                out_unpacked, cache = mosaic_mixed(q_p, kv_m, cache, meta)
+                out_unpacked.block_until_ready()
+                if warm is None:
+                    warm = counter.count
+                else:
+                    assert counter.count == warm
+                step_records.append((cur, q_p, kv_m, meta, out_unpacked))
+        finally:
+            del flat_pages
+            counter.close()
+
+        for cur, q_p, kv_m, meta, out_unpacked in step_records:
+            ref_p, ref_cache = ref_mixed(q_p, kv_m, ref_cache, meta)
+            ref_unpacked = prepare_outputs(ref_p, 8, 128)
+            out_f32 = np.asarray(out_unpacked[:cur], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_unpacked[:cur], np.float32),
+                rtol=rtol,
+                atol=atol,
+            )
+
+        cache_host = np.asarray(cache, np.float32)
+        ref_cache_host = np.asarray(ref_cache, np.float32)
+        for s, final_len in ((0, 830), (1, 570), (2, 261), (3, 76)):
+            for pos in (0, 255, 256, final_len - 1):
+                if pos < final_len:
+                    pg = int(pages[s, pos // 256])
+                    off = pos % 256
+                    np.testing.assert_array_equal(
+                        cache_host[pg, off], ref_cache_host[pg, off]
+                    )
+
 
 class TestBatchedDecodeAttention:
     def test_batched_decode_block_sizes_and_bucket_dispatch(
@@ -4659,6 +6446,197 @@ class TestBatchedDecodeAttention:
                 use_batched_decode=True,
                 interpret=True,
             )
+
+    def test_batched_decode_vmem_estimate_and_bf16_softmax_variants(self) -> None:
+        from resin.backend.tpu.kernels.ragged_paged_attention import (
+            _batched_decode_vmem_estimate_bytes,
+            _get_batched_decode_block_sizes,
+        )
+
+        vmem_64m = 64 * 1024 * 1024
+
+        # Qwen3-32B tp=2 FP8 (32 Q, 4 KV, hd=128, bkv=1280, bsz=8): 2*kv + qk_f32
+        # dominates softmax temporaries; bf16 online scratch halves (m, l, acc).
+        est_4a = _batched_decode_vmem_estimate_bytes(
+            4,
+            8,
+            128,
+            8,
+            1280,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            bf16_qk_softmax=True,
+            bf16_online_scratch=False,
+        )
+        est_4b = _batched_decode_vmem_estimate_bytes(
+            4,
+            8,
+            128,
+            8,
+            1280,
+            jnp.bfloat16,
+            jnp.float8_e4m3fn,
+            bf16_qk_softmax=True,
+            bf16_online_scratch=True,
+        )
+        assert est_4a == 59_424_768
+        assert est_4a - est_4b == (2 * 32 * 128 + 32 * 128) * 2
+
+        # High-GQA shapes step down below 64 MiB and bf16 softmax unlocks larger bkv_sz.
+        for q_h, kv_h in ((64, 1), (128, 2)):
+            bkv_bf16, bsz_bf16 = _get_batched_decode_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                q_h,
+                kv_h,
+                128,
+                256,
+                37,
+                tpu_version=7,
+                vmem_limit_bytes=vmem_64m,
+                bf16_qk_softmax=True,
+            )
+            bkv_f32, bsz_f32 = _get_batched_decode_block_sizes(
+                jnp.bfloat16,
+                jnp.float8_e4m3fn,
+                q_h,
+                kv_h,
+                128,
+                256,
+                37,
+                tpu_version=7,
+                vmem_limit_bytes=vmem_64m,
+                bf16_qk_softmax=False,
+            )
+            assert bkv_bf16 > bkv_f32
+            assert (
+                _batched_decode_vmem_estimate_bytes(
+                    kv_h,
+                    q_h // kv_h,
+                    128,
+                    bsz_f32,
+                    bkv_f32,
+                    jnp.bfloat16,
+                    jnp.float8_e4m3fn,
+                    bf16_qk_softmax=False,
+                )
+                < vmem_64m
+            )
+
+        # Kernel naming and Pallas interpret numerical parity across f32, 4A, and 4B.
+        rng = np.random.default_rng(2026)
+        page_size, pages_per_seq, num_seqs, total_pages = 8, 5, 10, 56
+        q_heads, kv_heads, head_dim = 16, 2, 128
+        sm_scale = head_dim**-0.5
+        kv_lens_np = np.array([1, 7, 8, 9, 16, 17, 24, 31, 32, 39], dtype=np.int32)
+        pages = np.full((num_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        next_page = 1
+        for s, kv_l in enumerate(kv_lens_np):
+            used = (int(kv_l) + page_size - 1) // page_size
+            pages[s, :used] = np.arange(next_page, next_page + used, dtype=np.int32)
+            next_page += used
+        cu_q_np = np.arange(num_seqs + 1, dtype=np.int32)
+        dist_np = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
+
+        q = jnp.asarray(
+            rng.standard_normal((num_seqs, q_heads, head_dim)), jnp.bfloat16
+        )
+        k = jnp.asarray(
+            rng.standard_normal((num_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+        v = jnp.asarray(
+            rng.standard_normal((num_seqs, kv_heads, head_dim)), jnp.bfloat16
+        )
+
+        for kv_dtype in (jnp.float8_e4m3fn, jnp.bfloat16):
+            fp8 = kv_dtype == jnp.float8_e4m3fn
+            k_scale = 0.5 if fp8 else None
+            v_scale = 0.25 if fp8 else None
+            cache_shape = get_kv_cache_shape(
+                total_pages, page_size, kv_heads, head_dim, kv_dtype
+            )
+            clean_cache = np.array(
+                quantize_kv(
+                    jnp.asarray(rng.standard_normal(cache_shape) * 0.25, jnp.float32),
+                    kv_dtype,
+                ),
+                copy=True,
+            )
+            poisoned_cache = clean_cache.copy()
+            nan_val = np.asarray(jnp.full((), jnp.nan, dtype=kv_dtype))
+            poisoned_cache[-1] = nan_val
+            for s, kv_l in enumerate(kv_lens_np):
+                rem = int(kv_l) % page_size
+                if rem != 0:
+                    used = (int(kv_l) + page_size - 1) // page_size
+                    poisoned_cache[pages[s, used - 1], rem:] = nan_val
+
+            ref_out, _ = _reference_rpa(
+                np.asarray(q),
+                np.asarray(k),
+                np.asarray(v),
+                clean_cache,
+                kv_lens_np,
+                pages.reshape(-1),
+                cu_q_np,
+                dist_np,
+                sm_scale=sm_scale,
+                sliding_window=20,
+                soft_cap=30.0,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
+            for bf16_qkp, bf16_sc, sfx, atol in (
+                (False, False, "-f32p", 3e-2 if fp8 else 2e-2),
+                (True, False, "", 3e-2 if fp8 else 2e-2),
+                (True, True, "-bf16s", 4e-2 if fp8 else 3e-2),
+            ):
+
+                def _call(
+                    qi: jax.Array,
+                    ki: jax.Array,
+                    vi: jax.Array,
+                    ci: jax.Array,
+                    _qkp: bool = bf16_qkp,
+                    _sc: bool = bf16_sc,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return ragged_paged_attention(
+                        qi,
+                        ki,
+                        vi,
+                        ci,
+                        jnp.asarray(kv_lens_np),
+                        jnp.asarray(pages.reshape(-1)),
+                        jnp.asarray(cu_q_np),
+                        jnp.asarray(dist_np),
+                        sm_scale=sm_scale,
+                        sliding_window=20,
+                        soft_cap=30.0,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        d_block_sizes=(1, 16, 1, 16),
+                        use_batched_decode=True,
+                        bf16_qk_softmax=_qkp,
+                        bf16_online_scratch=_sc,
+                        disable_bounds_checks=False,
+                        disable_semaphore_checks=False,
+                        interpret=True,
+                    )
+
+                jaxpr_str = str(
+                    jax.make_jaxpr(_call)(q, k, v, jnp.asarray(poisoned_cache))
+                )
+                assert f"RPAd-snh-p8-b8-q1-k16{sfx}-sw20" in jaxpr_str
+                out, _ = _call(q, k, v, jnp.asarray(poisoned_cache))
+                out_f32 = np.asarray(out, np.float32)
+                assert not np.any(np.isnan(out_f32))
+                np.testing.assert_allclose(
+                    out_f32,
+                    np.asarray(ref_out, np.float32),
+                    rtol=2e-2,
+                    atol=atol,
+                )
 
     @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
     def test_pallas_interpret_batched_decode_ragged_batches_and_page_boundaries(
@@ -4994,3 +6972,690 @@ class TestBatchedDecodeAttention:
                 rtol=2e-2,
                 atol=2e-2,
             )
+
+
+class TestBatchedMixedAttention:
+    def test_batched_mixed_block_sizes_and_bucket_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        monkeypatch.setattr(rpa_mod, "get_tpu_version", lambda: 7)
+        monkeypatch.setattr(
+            rpa_mod.pltpu,
+            "get_tpu_info",
+            lambda: type("I", (), {"smem_capacity_bytes": 1024 * 1024})(),
+        )
+        monkeypatch.setattr(
+            rpa_mod,
+            "_effective_vmem_limit",
+            lambda _v, _tv, vmem: 64 * 1024 * 1024 if vmem is None else vmem,
+        )
+
+        for tok_bucket, seq_bucket, kv_dtype, sw, expected_mixed in (
+            (8, 8, jnp.float8_e4m3fn, None, "RPAm-p_256-"),
+            (96, 96, jnp.float8_e4m3fn, None, "RPAm-p_256-"),
+            (128, 128, jnp.float8_e4m3fn, None, "RPAm-snh-p256-b2-q128_8-k512"),
+            (256, 16, jnp.bfloat16, None, "RPAm-snh-p256-b2-q256_8-k512"),
+            (4096, 320, jnp.float8_e4m3fn, None, "RPAm-snh-p256-b2-q256_8-k512"),
+            (
+                4096,
+                320,
+                jnp.float8_e4m3fn,
+                512,
+                "RPAm-snh-p256-b2-q256_8-k512-sw512",
+            ),
+        ):
+            cache = jnp.zeros(get_kv_cache_shape(4, 256, 4, 128, kv_dtype), kv_dtype)
+            q = jnp.ones((tok_bucket, 32, 128), jnp.bfloat16)
+            k = jnp.ones((tok_bucket, 4, 128), kv_dtype)
+            jaxpr_str = str(
+                jax.make_jaxpr(
+                    lambda qi, ki, ci, _sw=sw: rpa_mod.ragged_paged_attention(
+                        qi,
+                        ki,
+                        ki,
+                        ci,
+                        jnp.ones((seq_bucket,), jnp.int32),
+                        jnp.zeros((seq_bucket * 37,), jnp.int32),
+                        jnp.arange(seq_bucket + 1, dtype=jnp.int32),
+                        jnp.array([0, 0, 1], jnp.int32),
+                        sliding_window=_sw,
+                        interpret=True,
+                    )
+                )(q, k, cache)
+            )
+            assert expected_mixed in jaxpr_str
+            assert ("rpa_mixed_schedule" in jaxpr_str) is (tok_bucket >= 128)
+
+        with pytest.raises(ValueError, match="bkv_csz == bkv_sz"):
+            rpa_mod.ragged_paged_attention(
+                jnp.ones((16, 8, 128), jnp.bfloat16),
+                jnp.ones((16, 2, 128), jnp.bfloat16),
+                jnp.ones((16, 2, 128), jnp.bfloat16),
+                jnp.zeros(get_kv_cache_shape(4, 8, 2, 128, jnp.bfloat16), jnp.bfloat16),
+                jnp.ones((4,), jnp.int32),
+                jnp.zeros((8,), jnp.int32),
+                jnp.arange(5, dtype=jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                m_block_sizes=(8, 16, 4, 8),
+                use_batched_mixed=True,
+                interpret=True,
+            )
+
+    @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+    def test_pallas_interpret_batched_mixed_continuation_ragged_and_page_boundaries(
+        self, kv_dtype: jnp.dtype
+    ) -> None:
+        rng = np.random.default_rng(5150)
+        fp8 = kv_dtype == jnp.float8_e4m3fn
+        k_scale = 0.5 if fp8 else None
+        v_scale = 0.25 if fp8 else None
+        atol = 3e-2 if fp8 else 2e-2
+
+        page_size = 8
+        pages_per_seq = 6
+        max_seqs = 8
+        max_tokens = 40
+        total_pages = max_seqs * pages_per_seq + 4
+        q_heads, kv_heads, head_dim = 8, 2, 128
+        sm_scale = head_dim**-0.5
+
+        cache_shape = get_kv_cache_shape(
+            total_pages, page_size, kv_heads, head_dim, kv_dtype
+        )
+        nan_val = np.asarray(jnp.full((), jnp.nan, dtype=kv_dtype))
+        poisoned_cache = np.full(cache_shape, nan_val, dtype=kv_dtype)
+        poisoned_cache[0] = 0
+        clean_cache = np.zeros(cache_shape, dtype=kv_dtype)
+
+        seq_pages = np.full((max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32)
+        nxt = 1
+        for s in range(max_seqs):
+            seq_pages[s, :5] = np.arange(nxt, nxt + 5, dtype=np.int32)
+            nxt += 5
+
+        cache_jax = jnp.asarray(poisoned_cache)
+        ref_cache_np = clean_cache.copy()
+
+        # Exercise:
+        # 1) Mixed [1, 1, 3]: seq 2 decodes (+1 -> 1) while seqs 0,1 prefill [11, 6]
+        # 2) Continuation prefill [0, 0, 2] on seqs 0,1 (+18 -> 29 across 4 pages; +13 -> 19 across 3 pages)
+        # 3) Mixed [2, 2, 3]: seqs 0,1 decode (+1 -> 30, 20) while seq 3 prefills [19]
+        # 4) Idle [0, 0, 0] batch
+        plans = [
+            ([2, 0, 1], [1, 11, 6], [1, 11, 6], [1, 1, 3]),
+            ([0, 1], [18, 13], [29, 19], [0, 0, 2]),
+            ([0, 1, 3], [1, 1, 19], [30, 20, 19], [2, 2, 3]),
+            ([], [], [], [0, 0, 0]),
+        ]
+        step_tensors = []
+        for seq_order, q_lens_step, kv_lens_step, dist_step in plans:
+            q = jnp.asarray(
+                rng.standard_normal((max_tokens, q_heads, head_dim)) * 0.3,
+                jnp.bfloat16,
+            )
+            k = jnp.asarray(
+                rng.standard_normal((max_tokens, kv_heads, head_dim)) * 0.3,
+                jnp.bfloat16,
+            )
+            v = jnp.asarray(
+                rng.standard_normal((max_tokens, kv_heads, head_dim)) * 0.3,
+                jnp.bfloat16,
+            )
+            step_pages = np.full(
+                (max_seqs, pages_per_seq), total_pages - 1, dtype=np.int32
+            )
+            kv_lens = np.zeros(max_seqs, dtype=np.int32)
+            cu_q = np.zeros(max_seqs + 1, dtype=np.int32)
+            cur = 0
+            for i, (orig_s, ql, kvl) in enumerate(
+                zip(seq_order, q_lens_step, kv_lens_step, strict=True)
+            ):
+                step_pages[i] = seq_pages[orig_s]
+                kv_lens[i] = kvl
+                cur += ql
+                cu_q[i + 1] = cur
+            cu_q[len(seq_order) :] = cur
+            dist = np.array(dist_step, dtype=np.int32)
+            step_tensors.append(
+                (
+                    cur,
+                    q,
+                    k,
+                    v,
+                    step_pages,
+                    kv_lens,
+                    cu_q,
+                    dist,
+                    jnp.asarray(step_pages.reshape(-1)),
+                    jnp.asarray(kv_lens),
+                    jnp.asarray(cu_q),
+                    jnp.asarray(dist),
+                )
+            )
+
+        outputs = []
+        counter = CompilationCounter()
+        try:
+            warm = None
+            for (
+                cur,
+                q,
+                k,
+                v,
+                step_pages,
+                kv_lens,
+                cu_q,
+                dist,
+                pages_jax,
+                kv_lens_jax,
+                cu_q_jax,
+                dist_jax,
+            ) in step_tensors:
+                out, cache_jax = ragged_paged_attention(
+                    q,
+                    k,
+                    v,
+                    cache_jax,
+                    kv_lens_jax,
+                    pages_jax,
+                    cu_q_jax,
+                    dist_jax,
+                    sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    d_block_sizes=(1, 8, 1, 8),
+                    m_block_sizes=(8, 16, 4, 16),
+                    use_batched_decode=True,
+                    use_batched_mixed=True,
+                    disable_bounds_checks=False,
+                    disable_semaphore_checks=False,
+                    interpret=True,
+                )
+                out.block_until_ready()
+                if warm is None:
+                    warm = counter.count
+                else:
+                    assert counter.count == warm
+                outputs.append(
+                    (cur, q, k, v, step_pages, kv_lens, cu_q, dist, out, cache_jax)
+                )
+        finally:
+            counter.close()
+
+        for cur, q, k, v, step_pages, kv_lens, cu_q, dist, out, c_step in outputs:
+            if cur == 0:
+                np.testing.assert_array_equal(np.asarray(c_step[0], np.float32), 0.0)
+                continue
+
+            ref_out, ref_cache_np = _reference_rpa(
+                np.asarray(q),
+                np.asarray(k),
+                np.asarray(v),
+                ref_cache_np,
+                kv_lens,
+                step_pages.reshape(-1),
+                cu_q,
+                dist,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            out_f32 = np.asarray(out[:cur], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_out[:cur], np.float32),
+                rtol=2e-2,
+                atol=atol,
+            )
+
+        for s, final_len in ((0, 30), (1, 20), (2, 1), (3, 19)):
+            for pos in range(final_len):
+                pg = int(seq_pages[s, pos // page_size])
+                off = pos % page_size
+                np.testing.assert_array_equal(
+                    np.asarray(cache_jax[pg, off], np.float32),
+                    np.asarray(ref_cache_np[pg, off], np.float32),
+                )
+
+    def test_pallas_interpret_batched_mixed_options_and_multi_smem_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib
+
+        rpa_mod = importlib.import_module(
+            "resin.backend.tpu.kernels.ragged_paged_attention"
+        )
+        monkeypatch.setattr(rpa_mod, "_DEFAULT_SMEM_BYTES", 40 * 1024)
+
+        rng = np.random.default_rng(6060)
+        page_size, pages_per_seq = 8, 4
+        q_heads, kv_heads, head_dim = 6, 2, 64
+        sm_scale = head_dim**-0.5
+
+        # 1. Prepared + return_packed + sliding_window + soft_cap + q/k/v scales + bf16_qk_softmax
+        total_pages = 16
+        cache_shape = get_kv_cache_shape(
+            total_pages, page_size, kv_heads, head_dim, jnp.float8_e4m3fn
+        )
+        raw_cache = rng.standard_normal(cache_shape).astype(np.float32) * 0.25
+        clean_cache = np.array(
+            quantize_kv(jnp.asarray(raw_cache), jnp.float8_e4m3fn), copy=True
+        )
+        clean_cache[0] = 0
+        poisoned_cache = clean_cache.copy()
+        nan_fp8 = np.asarray(jnp.full((), jnp.nan, dtype=jnp.float8_e4m3fn))
+        # Seq 0 has kv_cache_len=11, q_len=7 (kv_len=18), sliding_window=5:
+        # earliest query pos=11 attends 7..11, so slots 0..6 are pre-window NaNs
+        # and slots 18..23 on page 3 are post-kv_len NaNs.
+        poisoned_cache[1, :7] = nan_fp8
+        poisoned_cache[2, 3:] = nan_fp8
+        poisoned_cache[3, :] = nan_fp8
+
+        pages = np.zeros((4, pages_per_seq), dtype=np.int32)
+        pages[0, :3] = [1, 2, 3]
+        pages[1, :2] = [4, 5]
+        poisoned_cache[4, :] = nan_fp8
+        poisoned_cache[5, :] = nan_fp8
+        kv_lens = np.array([18, 9, 0, 0], dtype=np.int32)
+        cu_q = np.array([0, 7, 16, 16, 16], dtype=np.int32)
+        dist = np.array([0, 0, 2], dtype=np.int32)
+
+        q_in = jnp.asarray(rng.standard_normal((16, q_heads, head_dim)), jnp.bfloat16)
+        k_in = quantize_kv(
+            jnp.asarray(rng.standard_normal((16, kv_heads, head_dim)), jnp.bfloat16),
+            jnp.float8_e4m3fn,
+            0.5,
+        )
+        v_in = quantize_kv(
+            jnp.asarray(rng.standard_normal((16, kv_heads, head_dim)), jnp.bfloat16),
+            jnp.float8_e4m3fn,
+            0.25,
+        )
+        q_pack, kv_merg = prepare_inputs(q_in, k_in, v_in)
+
+        for bf16_p in (False, True):
+            out_packed, _ = rpa_mod.ragged_paged_attention(
+                q_pack,
+                kv_merg,
+                None,
+                jnp.asarray(poisoned_cache),
+                jnp.asarray(kv_lens),
+                jnp.asarray(pages.reshape(-1)),
+                jnp.asarray(cu_q),
+                jnp.asarray(dist),
+                sm_scale=sm_scale,
+                sliding_window=5,
+                soft_cap=20.0,
+                q_scale=0.5,
+                k_scale=0.5,
+                v_scale=0.25,
+                prepared=True,
+                return_packed=True,
+                actual_num_q_heads=q_heads,
+                actual_head_dim=head_dim,
+                d_block_sizes=(1, 8, 1, 8),
+                m_block_sizes=(4, 8, 2, 8),
+                use_batched_mixed=True,
+                bf16_qk_softmax=bf16_p,
+                disable_bounds_checks=False,
+                disable_semaphore_checks=False,
+                interpret=True,
+            )
+            out_unpacked = prepare_outputs(out_packed, q_heads // kv_heads, head_dim)
+            ref_out, _ = _reference_rpa(
+                np.asarray(q_in),
+                np.asarray(k_in),
+                np.asarray(v_in),
+                clean_cache,
+                kv_lens,
+                pages.reshape(-1),
+                cu_q,
+                dist,
+                sm_scale=sm_scale,
+                sliding_window=5,
+                soft_cap=20.0,
+                q_scale=0.5,
+                k_scale=0.5,
+                v_scale=0.25,
+            )
+            out_f32 = np.asarray(out_unpacked[:16], np.float32)
+            assert not np.any(np.isnan(out_f32))
+            np.testing.assert_allclose(
+                out_f32,
+                np.asarray(ref_out[:16], np.float32),
+                rtol=2e-2,
+                atol=3e-2,
+            )
+
+        # 2. Multi-SMEM-chunk schedule straddling max_steps_ub=128 (> 256 tasks across b=2)
+        max_seqs = 36
+        max_tokens = max_seqs * 16
+        big_pages_total = max_seqs * pages_per_seq + 2
+        big_cache = jnp.zeros(
+            get_kv_cache_shape(
+                big_pages_total, page_size, kv_heads, head_dim, jnp.bfloat16
+            ),
+            jnp.bfloat16,
+        )
+        big_kv_lens = np.full(max_seqs, 30, dtype=np.int32)
+        big_pages = np.zeros((max_seqs, pages_per_seq), dtype=np.int32)
+        for s in range(max_seqs):
+            big_pages[s] = np.arange(1 + 4 * s, 5 + 4 * s, dtype=np.int32)
+        # Each seq has q_len=16 (4 q-blocks of bq_sz=4), kv_len=30 (4 k-blocks of bkv_sz=8):
+        # causal tasks per seq = 3 + 3 + 4 + 4 = 14 -> 36 * 14 = 504 tasks = 252 steps > 128!
+        big_cu_q = np.arange(0, (max_seqs + 1) * 16, 16, dtype=np.int32)
+        big_dist = np.array([0, 0, max_seqs], dtype=np.int32)
+        big_q = jnp.asarray(
+            rng.standard_normal((max_tokens, q_heads, head_dim)) * 0.2, jnp.bfloat16
+        )
+        big_k = jnp.asarray(
+            rng.standard_normal((max_tokens, kv_heads, head_dim)) * 0.2, jnp.bfloat16
+        )
+        big_v = jnp.asarray(
+            rng.standard_normal((max_tokens, kv_heads, head_dim)) * 0.2, jnp.bfloat16
+        )
+        # Pre-populate cached prefix (14 tokens per seq)
+        init_big_cache = rng.standard_normal(big_cache.shape).astype(np.float32) * 0.2
+        init_big_cache[0] = 0.0
+        big_cache_jax = jnp.asarray(init_big_cache, jnp.bfloat16)
+
+        out_big, _ = rpa_mod.ragged_paged_attention(
+            big_q,
+            big_k,
+            big_v,
+            big_cache_jax,
+            jnp.asarray(big_kv_lens),
+            jnp.asarray(big_pages.reshape(-1)),
+            jnp.asarray(big_cu_q),
+            jnp.asarray(big_dist),
+            sm_scale=sm_scale,
+            d_block_sizes=(1, 8, 1, 8),
+            m_block_sizes=(4, 8, 2, 8),
+            use_batched_mixed=True,
+            disable_bounds_checks=False,
+            disable_semaphore_checks=False,
+            interpret=True,
+        )
+        ref_big, _ = _reference_rpa(
+            np.asarray(big_q),
+            np.asarray(big_k),
+            np.asarray(big_v),
+            np.asarray(big_cache_jax),
+            big_kv_lens,
+            big_pages.reshape(-1),
+            big_cu_q,
+            big_dist,
+            sm_scale=sm_scale,
+        )
+        out_big_f32 = np.asarray(out_big, np.float32)
+        assert not np.any(np.isnan(out_big_f32))
+        np.testing.assert_allclose(
+            out_big_f32,
+            np.asarray(ref_big, np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+
+def test_pallas_fp8_qkv_norm_rope_pack_interpret() -> None:
+    from jax.experimental.pallas import tpu as pltpu
+
+    from resin.backend.tpu.kernels.fp8_matmul import sharded_fp8_matmul
+    from resin.backend.tpu.kernels.norm_rope import (
+        _half_swap_perm,
+        _slice_rope_cache_128,
+        pallas_fp8_qkv_norm_rope_pack,
+        pallas_qkv_norm_rope_pack,
+        sharded_fp8_qkv_norm_rope_pack,
+    )
+
+    rng = np.random.default_rng(20261124)
+    k_dim = 5120
+    num_q_heads_total = 64
+    num_kv_heads_total = 8
+    head_dim = 128
+    max_seq = 512
+    eps = 1e-6
+
+    w_qkv = (
+        rng.standard_normal(
+            ((num_q_heads_total + 2 * num_kv_heads_total) * head_dim, k_dim),
+            dtype=np.float32,
+        )
+        * 0.15
+    )
+    w_q = jnp.asarray(w_qkv, dtype=jnp.float8_e4m3fn)
+    w_scale = jnp.asarray(
+        np.abs(
+            rng.standard_normal(
+                ((num_q_heads_total + 2 * num_kv_heads_total) * head_dim,),
+                dtype=np.float32,
+            )
+        )
+        * 0.03
+        + 1e-3
+    )
+    q_norm_w = jnp.asarray(
+        rng.uniform(0.5, 1.5, size=(head_dim,)).astype(np.float32), dtype=jnp.bfloat16
+    )
+    k_norm_w = jnp.asarray(
+        rng.uniform(0.5, 1.5, size=(head_dim,)).astype(np.float32), dtype=jnp.bfloat16
+    )
+    angles = rng.uniform(-1.0, 1.0, size=(max_seq, head_dim // 2)).astype(np.float32)
+    cos_half = np.cos(angles)
+    sin_half = np.sin(angles)
+    cos_full = jnp.asarray(np.concatenate([cos_half, cos_half], axis=-1), jnp.float32)
+    sin_signed = jnp.asarray(
+        np.concatenate([-sin_half, sin_half], axis=-1), jnp.float32
+    )
+    rope_cache = (cos_full, sin_signed)
+
+    # Local interpret check across aligned and unaligned decode buckets for both
+    # TP=2 (group_size == 2 * num_kv_heads) and TP=1 (group_size == num_kv_heads).
+    for local_q_heads, local_kv_heads in ((32, 4), (64, 8)):
+        local_out_dim = (local_q_heads + 2 * local_kv_heads) * head_dim
+        w_q_local = w_q[:local_out_dim]
+        w_s_local = w_scale[:local_out_dim]
+        for batch in (1, 7, 8, 32, 320):
+            x_q = jnp.asarray(
+                rng.standard_normal((batch, k_dim), dtype=np.float32) * 0.5,
+                dtype=jnp.float8_e4m3fn,
+            )
+            x_scale = jnp.asarray(
+                np.abs(rng.standard_normal((1, batch), dtype=np.float32)) * 0.04 + 1e-3,
+                dtype=jnp.float32,
+            )
+            positions = jnp.asarray(
+                rng.integers(0, max_seq, size=(batch,), dtype=np.int32)
+            )
+            q_fused, kv_fused = pallas_fp8_qkv_norm_rope_pack(
+                x_q,
+                x_scale,
+                w_q_local,
+                w_s_local,
+                positions,
+                rope_cache,
+                q_norm_w,
+                k_norm_w,
+                jnp.float8_e4m3fn,
+                num_q_heads=local_q_heads,
+                num_kv_heads=local_kv_heads,
+                eps=eps,
+                interpret=pltpu.InterpretParams(detect_races=True),
+            )
+            from resin.backend.tpu.kernels.fp8_matmul import pallas_fp8_matmul
+
+            qkv_ref = pallas_fp8_matmul(
+                x_q,
+                w_q_local,
+                w_s_local,
+                x_scale=x_scale,
+                out_dtype=jnp.bfloat16,
+                interpret=True,
+            )
+            q_ref, kv_ref = pallas_qkv_norm_rope_pack(
+                qkv_ref,
+                positions,
+                rope_cache,
+                q_norm_w,
+                k_norm_w,
+                jnp.float8_e4m3fn,
+                num_q_heads=local_q_heads,
+                num_kv_heads=local_kv_heads,
+                eps=eps,
+                interpret=True,
+            )
+            np.testing.assert_array_equal(np.asarray(q_fused), np.asarray(q_ref))
+            np.testing.assert_array_equal(np.asarray(kv_fused), np.asarray(kv_ref))
+
+    # Sharded TP=2 check with hoisted cos_sin_pos + perm_128 + non-uniform fallback.
+    devs = jax.devices()
+    if len(devs) >= 2:
+        mesh = jax.sharding.Mesh(np.array(devs[:2]), ("tp",))
+        rep_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        col_spec = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("tp", None)
+        )
+        col_1d_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("tp"))
+        w_q_sharded = jax.device_put(w_q, col_spec)
+        w_s_sharded = jax.device_put(w_scale, col_1d_spec)
+        q_norm_rep = jax.device_put(q_norm_w, rep_spec)
+        k_norm_rep = jax.device_put(k_norm_w, rep_spec)
+        rope_rep = (
+            jax.device_put(cos_full, rep_spec),
+            jax.device_put(sin_signed, rep_spec),
+        )
+        for batch in (1, 8, 32, 320):
+            x_q_rep = jax.device_put(
+                jnp.asarray(
+                    rng.standard_normal((batch, k_dim), dtype=np.float32) * 0.5,
+                    dtype=jnp.float8_e4m3fn,
+                ),
+                rep_spec,
+            )
+            x_s_rep = jax.device_put(
+                jnp.asarray(
+                    np.abs(rng.standard_normal((1, batch), dtype=np.float32)) * 0.04
+                    + 1e-3,
+                    dtype=np.float32,
+                ),
+                rep_spec,
+            )
+            pos_rep = jax.device_put(
+                jnp.asarray(rng.integers(0, max_seq, size=(batch,), dtype=np.int32)),
+                rep_spec,
+            )
+            hoisted_cs = _slice_rope_cache_128(pos_rep, rope_rep)
+            hoisted_perm = _half_swap_perm(128, dtype=jnp.bfloat16)
+
+            q_sharded, kv_sharded = sharded_fp8_qkv_norm_rope_pack(
+                x_q_rep,
+                x_s_rep,
+                w_q_sharded,
+                w_s_sharded,
+                pos_rep,
+                rope_rep,
+                q_norm_rep,
+                k_norm_rep,
+                jnp.float8_e4m3fn,
+                mesh=mesh,
+                num_q_heads=num_q_heads_total,
+                num_kv_heads=num_kv_heads_total,
+                eps=eps,
+                cos_sin_pos=hoisted_cs,
+                perm_128=hoisted_perm,
+                interpret=True,
+            )
+            qkv_sharded_ref = sharded_fp8_matmul(
+                x_q_rep,
+                w_q_sharded,
+                w_s_sharded,
+                jax.sharding.PartitionSpec("tp", None),
+                mesh=mesh,
+                x_scale=x_s_rep,
+                out_dtype=jnp.bfloat16,
+                interpret=True,
+            )
+            q_sharded_ref, kv_sharded_ref = jax.shard_map(
+                lambda qkv_l, p_l, c_l, s_l, qw_l, kw_l: pallas_qkv_norm_rope_pack(
+                    qkv_l,
+                    p_l,
+                    (c_l, s_l),
+                    qw_l,
+                    kw_l,
+                    jnp.float8_e4m3fn,
+                    num_q_heads=num_q_heads_total // 2,
+                    num_kv_heads=num_kv_heads_total // 2,
+                    eps=eps,
+                    interpret=True,
+                ),
+                mesh=mesh,
+                in_specs=(
+                    jax.sharding.PartitionSpec(None, "tp"),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                    jax.sharding.PartitionSpec(),
+                ),
+                out_specs=(
+                    jax.sharding.PartitionSpec("tp", None, None, None, None),
+                    jax.sharding.PartitionSpec(None, "tp", None, None),
+                ),
+                check_vma=False,
+            )(
+                qkv_sharded_ref,
+                pos_rep,
+                rope_rep[0],
+                rope_rep[1],
+                q_norm_rep,
+                k_norm_rep,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(q_sharded), np.asarray(q_sharded_ref)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(kv_sharded), np.asarray(kv_sharded_ref)
+            )
+
+        # Fallback path when group_size is not equal to local_kv_heads or 2*local_kv_heads
+        # (e.g. num_q_heads_total=16, num_kv_heads_total=4 on tp=2 -> local_q=8, local_kv=2, group_size=4 == 2*local_kv;
+        #  for non-matching ratio use num_q_heads_total=24, num_kv_heads_total=4 on tp=2 -> local_q=12, local_kv=2, group_size=6).
+        w_fb = jax.device_put(w_q[: (24 + 2 * 4) * head_dim], col_spec)
+        w_s_fb = jax.device_put(w_scale[: (24 + 2 * 4) * head_dim], col_1d_spec)
+        x_q_fb = jax.device_put(
+            jnp.asarray(
+                rng.standard_normal((8, k_dim), dtype=np.float32) * 0.5,
+                dtype=jnp.float8_e4m3fn,
+            ),
+            rep_spec,
+        )
+        x_s_fb = jax.device_put(
+            jnp.asarray(np.ones((1, 8), dtype=np.float32) * 0.02),
+            rep_spec,
+        )
+        pos_fb = jax.device_put(jnp.arange(8, dtype=jnp.int32), rep_spec)
+        q_fb, kv_fb = sharded_fp8_qkv_norm_rope_pack(
+            x_q_fb,
+            x_s_fb,
+            w_fb,
+            w_s_fb,
+            pos_fb,
+            rope_rep,
+            q_norm_rep,
+            k_norm_rep,
+            jnp.float8_e4m3fn,
+            mesh=mesh,
+            num_q_heads=24,
+            num_kv_heads=4,
+            eps=eps,
+            interpret=True,
+        )
+        assert q_fb.shape == (4, 8, 3, 2, 128)
+        assert kv_fb.shape == (8, 2, 4, 128)

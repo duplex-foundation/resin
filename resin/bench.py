@@ -68,10 +68,12 @@ def decode_output_budget(
 ) -> int:
     """Reserve output tokens without making a trace drain the decode pipeline.
 
-    The Engine retains a continuation only with more than two maximum output
-    steps remaining. Traces need that reservation *after* their last completion,
-    in addition to the worst-case accepted output count. Before constructing a
-    runner, the default is the draft count plus one; callers with a runner use
+    A continuation lease stops at the request's output limit, so the last traced
+    completion needs two more maximum-size steps of output behind it to keep
+    overlapping. Traces reserve that *after* their last completion, in addition to
+    the worst-case accepted output count. A request that does finish leaves one
+    discarded successor step pending; ``run_sweep`` drains it. Before constructing
+    a runner, the default is the draft count plus one; callers with a runner use
     its declared output bound. Physical cache writes do not consume output budget.
     Untraced requests keep their existing budget.
     """
@@ -92,7 +94,7 @@ def decode_output_budget(
             draft_tokens + 1
         )
     generated = 1 + (warmup_steps + measure_steps + trace_passes) * (draft_tokens + 1)
-    reservation = 2 * max_accepted_per_step + 1 if overlap else 0
+    reservation = 2 * max_accepted_per_step if overlap else 0
     return generated + reservation
 
 
@@ -887,6 +889,10 @@ def run_sweep(
                 for lease in leases:
                     if not lease.done:
                         engine.cancel(lease)
+                # A request that finished at its output limit leaves the
+                # discarded successor step pending.
+                while local.has_work():
+                    engine.step()
                 local.clear_prefix_cache()
         if retain_outputs:
             records[-1]["local_output_token_ids"] = [

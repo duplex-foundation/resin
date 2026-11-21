@@ -202,15 +202,16 @@ def test_plain_trace_callback_defaults_to_three_overlap_completions():
     assert all(row["delta"] == (1, 1) for row in traced)
 
 
-def test_historical_trace_budget_reproduces_the_terminal_drain(monkeypatch):
-    # Independent negative control: the historical 19-token budget is adequate
-    # to finish three trace calls, but insufficient to keep them overlapped.
+def test_budget_without_the_reservation_ends_the_chain_at_the_last_trace(monkeypatch):
+    # Independent negative control: the traced completions alone need 19 tokens.
+    # The Engine still overlaps all three, but the final one has no continuation
+    # behind it.
     monkeypatch.setattr("resin.bench.decode_output_budget", lambda **kwargs: 19)
     raw, record, traced = exercise(drafts=0, extra_write_row=0, warmup=3, passes=3)
     assert record["overlap_counts"] == {"enqueues": 12, "continuations": 12}
-    assert [row["delta"] for row in traced] == [(1, 1), (0, 0), (0, 0)]
-    assert [row["ready"] for row in traced] == [False, True, True]
-    assert raw.synchronous_decodes == 1
+    assert [row["delta"] for row in traced] == [(1, 1)] * 3
+    assert [row["ready"] for row in traced] == [True, True, False]
+    assert raw.synchronous_decodes == 0
 
 
 @pytest.mark.parametrize("drafts", [0, 3, 5])

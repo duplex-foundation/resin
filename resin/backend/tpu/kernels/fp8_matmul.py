@@ -38,7 +38,30 @@ from resin.backend.tpu.kernels._rpa_v3_pallas import align_to, get_tpu_version
 from resin.backend.tpu.mesh import TP_AXIS
 
 _FP32_TINY_SQRT = float(jnp.sqrt(jnp.finfo(jnp.float32).tiny))
-_DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
+_MIN_VMEM_LIMIT_BYTES = 4 * 1024 * 1024
+_DEFAULT_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+_LARGE_PREFILL_SLACK_BYTES = 4 * 1024 * 1024
+# Padded token count at which the T>=2048 prefill tuning applies. Below it,
+# decode and small-chunk behavior is unchanged.
+_LARGE_PREFILL_MIN_TOKENS = 2048
+_DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: _DEFAULT_VMEM_LIMIT_BYTES}
+_SAVE_X_Q_MAX_BYTES = 16 * 1024 * 1024
+_SAVE_X_Q_SMALL_MAX_BYTES = 4 * 1024 * 1024
+_QUANT_MAX_K_TILES = 20
+
+
+def _device_vmem_limit_bytes(tpu_version: int) -> int:
+    return _DEVICE_VMEM_LIMIT.get(tpu_version, _DEFAULT_VMEM_LIMIT_BYTES)
+
+
+def _row_scale_vmem_bytes(batch_block: int) -> int:
+    return 8 * align_to(batch_block, 128) * 4
+
+
+def _clamp_vmem_limit_bytes(raw_bytes: int, tpu_version: int) -> int:
+    upper = _device_vmem_limit_bytes(tpu_version)
+    return min(max(raw_bytes, _MIN_VMEM_LIMIT_BYTES), upper)
+
 
 MatmulBackend = Literal["auto", "pallas", "xla"]
 
@@ -81,29 +104,29 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
         (1024, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
         (2048, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
         (2048, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
-        (2048, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (2048, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (2048, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (2048, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (2048, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (2048, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (2048, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (2048, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (2048, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (2048, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
+        (2048, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (2048, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (4096, 4096, 5120): Fp8MatmulTileSizes(256, 4096, 2560),
         (4096, 512, 5120): Fp8MatmulTileSizes(512, 512, 2560),
-        (4096, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (4096, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (4096, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (4096, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (4096, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (4096, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (4096, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (4096, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (4096, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (4096, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (8192, 5120, 4096): Fp8MatmulTileSizes(256, 5120, 4096),
-        (8192, 5120, 5120): Fp8MatmulTileSizes(256, 5120, 5120),
+        (4096, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (4096, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (8192, 5120, 4096): Fp8MatmulTileSizes(1024, 1280, 4096),
+        (8192, 5120, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
         (8192, 5120, 8192): Fp8MatmulTileSizes(1024, 2560, 2048),
-        (8192, 5120, 12800): Fp8MatmulTileSizes(256, 5120, 2560),
+        (8192, 5120, 12800): Fp8MatmulTileSizes(1024, 2560, 2560),
         (8192, 5120, 25600): Fp8MatmulTileSizes(1024, 2560, 2560),
-        (8192, 12800, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
-        (8192, 25600, 5120): Fp8MatmulTileSizes(512, 2560, 5120),
+        (8192, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
+        (8192, 25600, 5120): Fp8MatmulTileSizes(1024, 1280, 5120),
     }
     # Qwen3-32B tp=2 decode buckets (bs <= 320, pre-quantized FP8 activation):
     # batch_block == bs keeps n_batch == 1 (zero 128-lane scale pad) and
@@ -111,7 +134,9 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
     for bs in (8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320):
         table[(bs, 4096, 5120)] = Fp8MatmulTileSizes(bs, 1024, 5120)
         table[(bs, 512, 5120)] = Fp8MatmulTileSizes(bs, 512, 5120)
-        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(bs, 1280, 4096)
+        table[(bs, 5120, 4096)] = Fp8MatmulTileSizes(
+            bs, 640 if bs <= 192 else 1280, 4096, 3
+        )
         table[(bs, 5120, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
         table[(bs, 5120, 12800)] = Fp8MatmulTileSizes(bs, 512, 12800, 3)
         table[(bs, 12800, 5120)] = Fp8MatmulTileSizes(bs, 1280, 5120)
@@ -150,6 +175,23 @@ def _build_tpu7x_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]
 
 
 _TPU7X_FP8_TUNED_BLOCKS = _build_tpu7x_tuned_table()
+
+
+def _build_tpu7x_quant_tuned_table() -> dict[tuple[int, int, int], Fp8MatmulTileSizes]:
+    """Overrides for ``quantize_activation=True`` (bf16 input) so pipelined VMEM <= 48 MiB."""
+    table: dict[tuple[int, int, int], Fp8MatmulTileSizes] = {}
+    for bs in (2048, 4096, 8192):
+        for n_out in (5120, 12800, 25600):
+            table[(bs, n_out, 5120)] = Fp8MatmulTileSizes(512, 1280, 5120)
+        table[(bs, 51200, 5120)] = Fp8MatmulTileSizes(256, 2560, 5120)
+    return table
+
+
+_TPU7X_FP8_QUANT_TUNED_BLOCKS = _build_tpu7x_quant_tuned_table()
+
+_TPU7X_GATE_UP_TUNED_BLOCKS: dict[tuple[int, int, int], Fp8MatmulTileSizes] = {
+    (bs, 12800, 5120): Fp8MatmulTileSizes(1024, 1280, 5120) for bs in (2048, 4096, 8192)
+}
 
 
 def _fp8_bound(dtype: Any) -> float:
@@ -208,18 +250,15 @@ def quantize_fp8_act(
 
 def _quantize_fp8_with_absmax_pallas_kernel(
     x_ref,
-    absmax_row_ref,
+    scale_row_ref,
     x_q_ref,
-    scale_t_ref,
     *,
     bound: float,
 ) -> None:
-    scale_row = safe_fp8_scale(absmax_row_ref[...], bound)
-    scale_col = jnp.transpose(scale_row)
+    scale_col = jnp.transpose(scale_row_ref[...])
     x_q_ref[...] = jnp.clip(
         x_ref[...].astype(jnp.float32) / scale_col, -bound, bound
     ).astype(x_q_ref.dtype)
-    scale_t_ref[...] = scale_row
 
 
 def quantize_fp8_with_absmax(
@@ -231,7 +270,7 @@ def quantize_fp8_with_absmax(
     use_pallas: bool | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize ``x: [..., K]`` using pre-computed per-token ``abs_max`` in one VMEM pass."""
+    """Quantize ``x: [..., K]`` using pre-computed per-token ``abs_max`` via K-tiled VMEM Pallas."""
     target = jnp.dtype(dtype)
     bound = _fp8_bound(target)
     leading = x.shape[:-1]
@@ -245,13 +284,10 @@ def quantize_fp8_with_absmax(
 
     tpu_version = get_tpu_version()
     batch_block = align_to(max(8, orig_batch), 8) if orig_batch > 0 else 8
-    vmem_est = 2 * batch_block * k_dim * (x_2d.dtype.itemsize + target.itemsize)
-    vmem_cap = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
     can_pallas = (
         0 < orig_batch <= 320
         and k_dim >= 128
         and k_dim % 128 == 0
-        and vmem_est <= vmem_cap
         and (interpret or tpu_version >= 7)
     )
     if use_pallas is True and not can_pallas:
@@ -270,39 +306,57 @@ def quantize_fp8_with_absmax(
             absmax_row = abs_max
         else:
             absmax_row = abs_max.reshape(1, orig_batch).astype(jnp.float32)
+        scale_t = safe_fp8_scale(absmax_row, bound)
+        scale_in = scale_t
         if orig_batch < batch_block:
             pad_b = batch_block - orig_batch
             x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
-            absmax_row = jnp.pad(absmax_row, ((0, 0), (0, pad_b)))
+            scale_in = jnp.pad(scale_t, ((0, 0), (0, pad_b)), constant_values=1.0)
 
-        vmem_limit_bytes = vmem_cap if (tpu_version >= 7 and not interpret) else None
-        q_2d, scale_t = pl.pallas_call(
+        k_tiles = k_dim // 128
+        k_block = 128 * next(
+            d
+            for d in range(min(k_tiles, _QUANT_MAX_K_TILES), 0, -1)
+            if k_tiles % d == 0
+        )
+        n_k = k_dim // k_block
+        if tpu_version >= 7 and not interpret:
+            buf_mult = 2 if n_k > 1 else 1
+            tile_vmem = (
+                buf_mult
+                * batch_block
+                * k_block
+                * (x_2d.dtype.itemsize + target.itemsize)
+                + _row_scale_vmem_bytes(batch_block)
+                + batch_block * k_block * 4
+            )
+            vmem_limit_bytes: int | None = _clamp_vmem_limit_bytes(
+                tile_vmem, tpu_version
+            )
+        else:
+            vmem_limit_bytes = None
+        k_idx = (lambda _k: 0) if n_k == 1 else (lambda k: k)
+        q_2d = pl.pallas_call(
             functools.partial(_quantize_fp8_with_absmax_pallas_kernel, bound=bound),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
-                    pl.BlockSpec((batch_block, k_dim), lambda _b: (0, 0)),
-                    pl.BlockSpec((1, batch_block), lambda _b: (0, 0)),
+                    pl.BlockSpec((batch_block, k_block), lambda k: (0, k_idx(k))),
+                    pl.BlockSpec((1, batch_block), lambda _k: (0, 0)),
                 ],
-                out_specs=[
-                    pl.BlockSpec((batch_block, k_dim), lambda _b: (0, 0)),
-                    pl.BlockSpec((1, batch_block), lambda _b: (0, 0)),
-                ],
-                grid=(1,),
+                out_specs=pl.BlockSpec((batch_block, k_block), lambda k: (0, k_idx(k))),
+                grid=(n_k,),
             ),
-            out_shape=[
-                jax.ShapeDtypeStruct((batch_block, k_dim), target),
-                jax.ShapeDtypeStruct((1, batch_block), jnp.float32),
-            ],
+            out_shape=jax.ShapeDtypeStruct((batch_block, k_dim), target),
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("parallel",),
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
             interpret=pltpu.InterpretParams() if interpret else False,
-            name=f"quantize_fp8_with_absmax_{batch_block}_{k_dim}",
-        )(x_2d, absmax_row)
+            name=f"quantize_fp8_with_absmax_{batch_block}_{k_block}",
+        )(x_2d, scale_in)
         if orig_batch < batch_block:
-            q_2d, scale_t = q_2d[:orig_batch], scale_t[:, :orig_batch]
+            q_2d = q_2d[:orig_batch]
 
     q_out = q_2d if x.ndim == 2 else q_2d.reshape(*leading, k_dim)
     if transposed_scale:
@@ -335,6 +389,8 @@ def get_tuned_block_sizes(
     if version >= 7 and (tuned := _TPU7X_FP8_TUNED_BLOCKS.get((n_batch, n_out, n_in))):
         if not quantize_activation:
             return tuned
+        if n_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            return _TPU7X_FP8_QUANT_TUNED_BLOCKS.get((n_batch, n_out, n_in), tuned)
         if n_batch <= 320 and tuned.w_buffer_count > 2:
             return tuned._replace(w_buffer_count=2)
         if (
@@ -354,6 +410,33 @@ def get_tuned_block_sizes(
     return Fp8MatmulTileSizes(batch_block, out_block, in_block)
 
 
+def _get_tuned_gate_up_block_sizes(
+    n_batch: int,
+    n_ffn: int,
+    n_in: int,
+    *,
+    tpu_version: int | None = None,
+) -> Fp8MatmulTileSizes:
+    """Pick Pallas ``(batch_block, out_block, in_block)`` for fused gate+up SwiGLU."""
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    if version >= 7 and (
+        tuned := _TPU7X_GATE_UP_TUNED_BLOCKS.get((n_batch, n_ffn, n_in))
+    ):
+        return tuned
+    batch_block = (
+        align_to(max(8, n_batch), 8)
+        if n_batch <= 320
+        else min(align_to(n_batch, 128), 512)
+    )
+    out_block = 1280 if n_ffn % 1280 == 0 else min(align_to(max(128, n_ffn), 128), 1280)
+    in_block = (
+        n_in
+        if (n_in <= 5120 and n_in % 128 == 0)
+        else min(align_to(max(128, n_in), 128), 2560)
+    )
+    return Fp8MatmulTileSizes(batch_block, out_block, in_block)
+
+
 def _raw_vmem_estimate_bytes(
     *,
     n_batch: int,
@@ -369,6 +452,7 @@ def _raw_vmem_estimate_bytes(
     save_acc: bool,
     save_x_q: bool,
     w_buffer_count: int = 2,
+    include_headroom: bool = True,
 ) -> int:
     x_bytes = batch_block_size * in_block_size * jnp.dtype(x_dtype).itemsize
     absmax_bytes = batch_block_size * 4
@@ -376,8 +460,11 @@ def _raw_vmem_estimate_bytes(
     w_scale_bytes = out_block_size * 4
     out_bytes = batch_block_size * out_block_size * jnp.dtype(out_dtype).itemsize
     w_extra_buffers = max(0, w_buffer_count - 1)
+    base_buffers = 2 if include_headroom else 1
 
-    in_out = 2 * (x_bytes + absmax_bytes + w_bytes + w_scale_bytes + out_bytes)
+    in_out = base_buffers * (
+        x_bytes + absmax_bytes + w_bytes + w_scale_bytes + out_bytes
+    )
     if n_batch > 1 or n_in > 1:
         in_out += x_bytes
     if n_batch > 1:
@@ -396,7 +483,7 @@ def _raw_vmem_estimate_bytes(
         scratch += (
             n_in * batch_block_size * in_block_size * jnp.dtype(x_q_dtype).itemsize
         )
-    return in_out + 2 * scratch
+    return in_out + (2 if include_headroom else 1) * scratch
 
 
 def _estimate_vmem_limit_bytes(
@@ -416,7 +503,7 @@ def _estimate_vmem_limit_bytes(
     tpu_version: int,
     w_buffer_count: int = 2,
 ) -> int:
-    upper = _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
+    large_prefill = n_batch * batch_block_size >= _LARGE_PREFILL_MIN_TOKENS
     raw = _raw_vmem_estimate_bytes(
         n_batch=n_batch,
         n_out=n_out,
@@ -431,8 +518,56 @@ def _estimate_vmem_limit_bytes(
         save_acc=save_acc,
         save_x_q=save_x_q,
         w_buffer_count=w_buffer_count,
+        include_headroom=not large_prefill,
     )
-    return min(max(raw, 4 * 1024 * 1024), upper)
+    if large_prefill:
+        raw += _LARGE_PREFILL_SLACK_BYTES
+    return _clamp_vmem_limit_bytes(raw, tpu_version)
+
+
+def _should_save_x_q(
+    *,
+    quantize_activation: bool,
+    n_batch: int,
+    n_out: int,
+    n_in: int,
+    batch_block_size: int,
+    out_block_size: int,
+    in_block_size: int,
+    x_dtype: Any,
+    x_q_dtype: Any,
+    w_q_dtype: Any,
+    out_dtype: Any,
+    save_acc: bool,
+    tpu_version: int,
+    w_buffer_count: int = 2,
+) -> bool:
+    if not quantize_activation or n_out <= 1:
+        return False
+    q_dtype = jnp.dtype(x_q_dtype)
+    x_q_scratch_bytes = n_in * batch_block_size * in_block_size * q_dtype.itemsize
+    if n_batch * batch_block_size < _LARGE_PREFILL_MIN_TOKENS:
+        return x_q_scratch_bytes <= _SAVE_X_Q_SMALL_MAX_BYTES
+    if x_q_scratch_bytes > _SAVE_X_Q_MAX_BYTES:
+        return False
+    vmem_upper = _device_vmem_limit_bytes(tpu_version)
+    raw_bytes = _raw_vmem_estimate_bytes(
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block_size,
+        out_block_size=out_block_size,
+        in_block_size=in_block_size,
+        x_dtype=x_dtype,
+        x_q_dtype=q_dtype,
+        w_q_dtype=w_q_dtype,
+        out_dtype=out_dtype,
+        save_acc=save_acc,
+        save_x_q=True,
+        w_buffer_count=w_buffer_count,
+        include_headroom=False,
+    )
+    return raw_bytes + _LARGE_PREFILL_SLACK_BYTES <= vmem_upper
 
 
 def _unfold_bools(
@@ -680,12 +815,7 @@ def pallas_fp8_matmul(
         if tile_sizes is None
         else tile_sizes
     )
-    batch_block, out_block, in_block, w_buffer_count = (
-        resolved_tiles.batch_block_size,
-        resolved_tiles.out_block_size,
-        resolved_tiles.in_block_size,
-        resolved_tiles.w_buffer_count,
-    )
+    batch_block, out_block, in_block, w_buffer_count = resolved_tiles
     if w_buffer_count < 1:
         raise ValueError(f"Expected w_buffer_count >= 1, got {w_buffer_count}")
 
@@ -712,10 +842,21 @@ def pallas_fp8_matmul(
     n_in = padded_k // in_block
 
     save_acc = n_in > 1
-    save_x_q = (
-        quantize_activation
-        and n_out > 1
-        and (n_in * batch_block * in_block * x_q_dtype.itemsize <= 4 * 1024 * 1024)
+    save_x_q = _should_save_x_q(
+        quantize_activation=quantize_activation,
+        n_batch=n_batch,
+        n_out=n_out,
+        n_in=n_in,
+        batch_block_size=batch_block,
+        out_block_size=out_block,
+        in_block_size=in_block,
+        x_dtype=x_2d.dtype,
+        x_q_dtype=x_q_dtype,
+        w_q_dtype=w.dtype,
+        out_dtype=kernel_out_dtype,
+        save_acc=save_acc,
+        tpu_version=tpu_version,
+        w_buffer_count=w_buffer_count,
     )
     vmem_limit_bytes = _estimate_vmem_limit_bytes(
         n_batch=n_batch,
@@ -737,6 +878,12 @@ def pallas_fp8_matmul(
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
     o_idx = (lambda _o: 0) if n_out == 1 else (lambda o: o)
     i_idx = (lambda _i: 0) if n_in == 1 else (lambda i: i)
+    # Pin o > 0 to the last tile loaded during o == 0 (n_in - 1) so Pallas skips redundant x DMAs.
+    x_in_idx = (
+        (lambda b, o, i: (b_idx(b), jnp.where(o == 0, i, n_in - 1)))
+        if (save_x_q and n_in > 1 and padded_batch >= _LARGE_PREFILL_MIN_TOKENS)
+        else (lambda b, _o, i: (b_idx(b), i_idx(i)))
+    )
     x_q_scratch_shape = (
         (batch_block, in_block) if n_in == 1 else (n_in, batch_block, in_block)
     )
@@ -746,7 +893,7 @@ def pallas_fp8_matmul(
         else None
     )
     in_specs = [
-        pl.BlockSpec((batch_block, in_block), lambda b, _o, i: (b_idx(b), i_idx(i))),
+        pl.BlockSpec((batch_block, in_block), x_in_idx),
         pl.BlockSpec(
             (out_block, in_block),
             lambda _b, o, i: (o_idx(o), i_idx(i)),
@@ -767,7 +914,7 @@ def pallas_fp8_matmul(
         pltpu.VMEM(x_q_scratch_shape, x_q_dtype) if save_x_q else None,
     ]
     grid = (n_batch, n_out, n_in)
-    dim_semantics = ("parallel", "arbitrary", "arbitrary")
+    dim_semantics: tuple[Any, ...] = ("parallel", "arbitrary", "arbitrary")
     kernel_body = functools.partial(
         _fp8_matmul_pallas_kernel,
         x_q_dtype=x_q_dtype,
@@ -839,6 +986,8 @@ def pallas_fp8_matmul(
         )
 
     if tpu_version >= 6 and not interpret:
+        if scatter_axis is not None and padded_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            x_2d = pltpu.with_memory_space_constraint(x_2d, pltpu.HBM)
         w = pltpu.with_memory_space_constraint(w, pltpu.HBM)
         w_scale_2d = pltpu.with_memory_space_constraint(w_scale_2d, pltpu.HBM)
 
@@ -907,6 +1056,323 @@ def _gate_up_swiglu_pallas_kernel(
     _unfold_bools((is_first, is_last), (), body)
 
 
+def _fp8_gate_up_swiglu_quant_kernel(
+    x_q_ref: Any,
+    w_in_hbm: Any,
+    ws_2d_hbm: Any,
+    x_scale_ref: Any,
+    gated_q_ref: Any,
+    gated_scale_ref: Any,
+    w_gate_buf: Any,
+    w_up_buf: Any,
+    ws_gate_buf: Any,
+    ws_up_buf: Any,
+    gated_bf16_scratch: Any,
+    absmax_scratch: Any,
+    w_gate_sems: Any,
+    w_up_sems: Any,
+    ws_gate_sems: Any,
+    ws_up_sems: Any,
+    *,
+    n_out: int,
+    n_w_slots: int,
+    out_block: int,
+    bound: float,
+) -> None:
+    batch_block = x_q_ref.shape[0]
+    target_q_dtype = gated_q_ref.dtype
+    xs_col = jnp.transpose(x_scale_ref[...])
+
+    def _start_w_dma(tile_idx: Any, slot: Any) -> None:
+        g_slice = pl.ds(tile_idx * out_block, out_block)
+        u_slice = pl.ds((n_out + tile_idx) * out_block, out_block)
+        pltpu.make_async_copy(
+            w_in_hbm.at[g_slice, :],
+            w_gate_buf.at[slot],
+            w_gate_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            w_in_hbm.at[u_slice, :],
+            w_up_buf.at[slot],
+            w_up_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, g_slice],
+            ws_gate_buf.at[slot],
+            ws_gate_sems.at[slot],
+        ).start()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, u_slice],
+            ws_up_buf.at[slot],
+            ws_up_sems.at[slot],
+        ).start()
+
+    def _wait_w_dma(tile_idx: Any, slot: Any) -> None:
+        g_slice = pl.ds(tile_idx * out_block, out_block)
+        u_slice = pl.ds((n_out + tile_idx) * out_block, out_block)
+        pltpu.make_async_copy(
+            w_in_hbm.at[g_slice, :],
+            w_gate_buf.at[slot],
+            w_gate_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            w_in_hbm.at[u_slice, :],
+            w_up_buf.at[slot],
+            w_up_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, g_slice],
+            ws_gate_buf.at[slot],
+            ws_gate_sems.at[slot],
+        ).wait()
+        pltpu.make_async_copy(
+            ws_2d_hbm.at[:, u_slice],
+            ws_up_buf.at[slot],
+            ws_up_sems.at[slot],
+        ).wait()
+
+    for slot in range(n_w_slots):
+        _start_w_dma(slot, slot)
+
+    absmax_scratch[...] = jnp.zeros((batch_block, 128), dtype=jnp.float32)
+
+    def _tile_step(t: jax.Array, _: None) -> None:
+        slot = jax.lax.rem(t, n_w_slots)
+        _wait_w_dma(t, slot)
+        lhs = x_q_ref[...]
+        g_acc = jax.lax.dot_general(
+            lhs,
+            w_gate_buf[slot],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        u_acc = jax.lax.dot_general(
+            lhs,
+            w_up_buf[slot],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        gate = ((g_acc * ws_gate_buf[slot]) * xs_col).astype(jnp.bfloat16)
+        up = ((u_acc * ws_up_buf[slot]) * xs_col).astype(jnp.bfloat16)
+        if n_out > n_w_slots:
+            next_t = t + n_w_slots
+
+            @pl.when(next_t < n_out)
+            def _prefetch_next() -> None:
+                _start_w_dma(next_t, slot)
+
+        gated_bf16 = (jax.nn.silu(gate) * up).astype(jnp.bfloat16)
+        gated_bf16_scratch[t] = gated_bf16
+        tile_max = jnp.max(
+            jnp.abs(gated_bf16.astype(jnp.float32)), axis=-1, keepdims=True
+        )
+        absmax_scratch[...] = jnp.maximum(
+            absmax_scratch[...],
+            jnp.broadcast_to(tile_max, (batch_block, 128)),
+        )
+        return None
+
+    if n_out == 1:
+        _tile_step(jnp.int32(0), None)
+    else:
+        jax.lax.fori_loop(0, n_out, _tile_step, None)
+
+    row_absmax = jnp.max(absmax_scratch[...], axis=-1, keepdims=True)
+    scale_col = safe_fp8_scale(row_absmax, bound)
+    gated_scale_ref[...] = jnp.transpose(scale_col)
+    inv_scale = 1.0 / scale_col
+    for t in range(n_out):
+        gated_q_ref[:, pl.ds(t * out_block, out_block)] = jnp.clip(
+            gated_bf16_scratch[t].astype(jnp.float32) * inv_scale,
+            -bound,
+            bound,
+        ).astype(target_q_dtype)
+
+
+def _pick_gate_up_quant_tiles(
+    orig_batch: int, orig_ffn: int, orig_k: int
+) -> Fp8MatmulTileSizes:
+    batch_block = align_to(max(8, orig_batch), 8)
+    target_out = 1280 if batch_block >= 288 else 640
+    w_buf = 2 if batch_block >= 288 else 3
+    if orig_ffn % target_out == 0:
+        out_block = target_out
+    elif orig_ffn % 128 == 0:
+        out_block = next(
+            blk
+            for blk in range(min(target_out, orig_ffn), 127, -128)
+            if orig_ffn % blk == 0
+        )
+    else:
+        out_block = min(align_to(max(128, orig_ffn), 128), target_out)
+    in_block = align_to(max(128, orig_k), 128)
+    return Fp8MatmulTileSizes(batch_block, out_block, in_block, w_buf)
+
+
+def pallas_fp8_gate_up_swiglu_quant(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_gate_up: jax.Array,
+    w_scale: jax.Array,
+    *,
+    out_dtype: Any | None = None,
+    transposed_scale: bool = True,
+    tile_sizes: Fp8MatmulTileSizes | None = None,
+    interpret: bool | pltpu.InterpretParams = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Single-kernel Pallas W8A8 ``gate_up`` + SwiGLU + per-token FP8 quant."""
+    _validate_matmul_shapes(x_q.shape[-1], w_gate_up, w_scale)
+    if x_q.dtype != w_gate_up.dtype:
+        raise ValueError(
+            f"pallas_fp8_gate_up_swiglu_quant expects pre-quantized {w_gate_up.dtype} x_q, got {x_q.dtype}"
+        )
+    if w_gate_up.shape[0] % 2 != 0:
+        raise ValueError(f"Expected even gate_up rows, got {w_gate_up.shape[0]}")
+
+    leading = x_q.shape[:-1]
+    orig_k = x_q.shape[-1]
+    orig_ffn = w_gate_up.shape[0] // 2
+    x_2d = x_q if x_q.ndim == 2 else x_q.reshape(-1, orig_k)
+    orig_batch = x_2d.shape[0]
+    if orig_batch > 320:
+        raise ValueError(
+            f"pallas_fp8_gate_up_swiglu_quant expects orig_batch <= 320, got {orig_batch}"
+        )
+
+    target_q_dtype = jnp.dtype(w_gate_up.dtype if out_dtype is None else out_dtype)
+    bound = _fp8_bound(target_q_dtype)
+
+    if x_scale.shape == (1, orig_batch) and x_scale.dtype == jnp.float32:
+        x_scale_row = x_scale
+    else:
+        x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
+
+    resolved_tiles = (
+        _pick_gate_up_quant_tiles(orig_batch, orig_ffn, orig_k)
+        if tile_sizes is None
+        else tile_sizes
+    )
+    batch_block, out_block, in_block, w_buffer_count = resolved_tiles
+    if batch_block < orig_batch or batch_block % 8 != 0:
+        raise ValueError(
+            f"Expected batch_block >= {orig_batch} and multiple of 8, got {batch_block}"
+        )
+    if out_block % 128 != 0 or in_block < orig_k or in_block % 128 != 0:
+        raise ValueError(
+            f"Invalid gate_up_swiglu_quant tiles {resolved_tiles} for (ffn={orig_ffn}, k={orig_k})"
+        )
+    if w_buffer_count < 1:
+        raise ValueError(f"Expected w_buffer_count >= 1, got {w_buffer_count}")
+
+    padded_batch = batch_block
+    padded_ffn = align_to(orig_ffn, out_block)
+    padded_k = in_block
+
+    if orig_batch < padded_batch:
+        pad_b = padded_batch - orig_batch
+        x_2d = jnp.pad(x_2d, ((0, pad_b), (0, 0)))
+        x_scale_row = jnp.pad(x_scale_row, ((0, 0), (0, pad_b)), constant_values=1.0)
+    if orig_k < padded_k:
+        x_2d = jnp.pad(x_2d, ((0, 0), (0, padded_k - orig_k)))
+
+    if orig_ffn == padded_ffn and orig_k == padded_k:
+        w_in = w_gate_up
+        ws_2d = jnp.expand_dims(w_scale.astype(jnp.float32), axis=0)
+    else:
+        pad_n = padded_ffn - orig_ffn
+        pad_k = padded_k - orig_k
+        w_gate = jnp.pad(w_gate_up[:orig_ffn], ((0, pad_n), (0, pad_k)))
+        w_up = jnp.pad(w_gate_up[orig_ffn:], ((0, pad_n), (0, pad_k)))
+        w_in = jnp.concatenate([w_gate, w_up], axis=0)
+        ws_gate = jnp.pad(w_scale[:orig_ffn].astype(jnp.float32), (0, pad_n))
+        ws_up = jnp.pad(w_scale[orig_ffn:].astype(jnp.float32), (0, pad_n))
+        ws_2d = jnp.expand_dims(jnp.concatenate([ws_gate, ws_up], axis=0), axis=0)
+
+    n_out = padded_ffn // out_block
+    n_w_slots = min(w_buffer_count, n_out)
+    is_interpret = bool(interpret)
+    tpu_version = get_tpu_version()
+
+    if tpu_version >= 6 and not is_interpret:
+        row_scale_bytes = _row_scale_vmem_bytes(batch_block)
+        est_bytes = (
+            batch_block * padded_k * x_2d.dtype.itemsize
+            + row_scale_bytes
+            + 2 * n_w_slots * out_block * (padded_k * w_in.dtype.itemsize + 8 * 4)
+            + n_out * batch_block * out_block * 2
+            + batch_block * 128 * 4
+            + batch_block * padded_ffn * target_q_dtype.itemsize
+            + row_scale_bytes
+        )
+        vmem_limit_bytes: int | None = min(
+            max(est_bytes + 4 * 1024 * 1024, 8 * 1024 * 1024),
+            _device_vmem_limit_bytes(tpu_version),
+        )
+        w_in = pltpu.with_memory_space_constraint(w_in, pltpu.HBM)
+        ws_2d = pltpu.with_memory_space_constraint(ws_2d, pltpu.HBM)
+    else:
+        vmem_limit_bytes = None
+
+    interpret_arg = (
+        interpret
+        if isinstance(interpret, pltpu.InterpretParams)
+        else (pltpu.InterpretParams() if interpret else False)
+    )
+    kernel = pl.pallas_call(
+        functools.partial(
+            _fp8_gate_up_swiglu_quant_kernel,
+            n_out=n_out,
+            n_w_slots=n_w_slots,
+            out_block=out_block,
+            bound=bound,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec((batch_block, padded_k), lambda: (0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((1, batch_block), lambda: (0, 0)),
+            ],
+            out_specs=[
+                pl.BlockSpec((batch_block, padded_ffn), lambda: (0, 0)),
+                pl.BlockSpec((1, batch_block), lambda: (0, 0)),
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((n_w_slots, out_block, padded_k), w_in.dtype),
+                pltpu.VMEM((n_w_slots, out_block, padded_k), w_in.dtype),
+                pltpu.VMEM((n_w_slots, 1, out_block), jnp.float32),
+                pltpu.VMEM((n_w_slots, 1, out_block), jnp.float32),
+                pltpu.VMEM((n_out, batch_block, out_block), jnp.bfloat16),
+                pltpu.VMEM((batch_block, 128), jnp.float32),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+                pltpu.SemaphoreType.DMA((n_w_slots,)),
+            ],
+            grid=(),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((padded_batch, padded_ffn), target_q_dtype),
+            jax.ShapeDtypeStruct((1, padded_batch), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
+        interpret=interpret_arg,
+        name=(
+            f"fp8_gate_up_swiglu_quant_{batch_block}_{out_block}_{padded_k}"
+            if n_w_slots == 2
+            else f"fp8_gate_up_swiglu_quant_{batch_block}_{out_block}_{padded_k}_b{n_w_slots}"
+        ),
+    )
+
+    gated_q_padded, scale_padded = kernel(x_2d, w_in, ws_2d, x_scale_row)
+    gated_q = gated_q_padded[:orig_batch, :orig_ffn].reshape(*leading, orig_ffn)
+    scale_row = scale_padded[:, :orig_batch]
+    if transposed_scale:
+        return gated_q, scale_row
+    return gated_q, jnp.transpose(scale_row).reshape(*leading, 1)
+
+
 def pallas_fp8_gate_up_swiglu(
     x_q: jax.Array,
     x_scale: jax.Array,
@@ -936,28 +1402,15 @@ def pallas_fp8_gate_up_swiglu(
     else:
         x_scale_row = x_scale.reshape(1, orig_batch).astype(jnp.float32)
 
-    if tile_sizes is None:
-        batch_block = (
-            align_to(max(8, orig_batch), 8)
-            if orig_batch <= 320
-            else min(align_to(orig_batch, 128), 512)
+    tpu_version = get_tpu_version()
+    resolved_tiles = (
+        _get_tuned_gate_up_block_sizes(
+            orig_batch, orig_ffn, orig_k, tpu_version=tpu_version
         )
-        out_block = (
-            1280
-            if orig_ffn % 1280 == 0
-            else min(align_to(max(128, orig_ffn), 128), 1280)
-        )
-        in_block = (
-            orig_k
-            if (orig_k <= 5120 and orig_k % 128 == 0)
-            else min(align_to(max(128, orig_k), 128), 2560)
-        )
-    else:
-        batch_block, out_block, in_block = (
-            tile_sizes.batch_block_size,
-            tile_sizes.out_block_size,
-            tile_sizes.in_block_size,
-        )
+        if tile_sizes is None
+        else tile_sizes
+    )
+    batch_block, out_block, in_block, _ = resolved_tiles
 
     padded_batch = align_to(orig_batch, batch_block)
     padded_ffn = align_to(orig_ffn, out_block)
@@ -989,12 +1442,29 @@ def pallas_fp8_gate_up_swiglu(
     save_acc = n_in > 1
     target_out_dtype = jnp.dtype(out_dtype)
 
-    tpu_version = get_tpu_version()
-    vmem_limit_bytes = (
-        _DEVICE_VMEM_LIMIT.get(tpu_version, 48 * 1024 * 1024)
-        if (tpu_version >= 6 and not interpret)
-        else None
-    )
+    if tpu_version >= 6 and not interpret:
+        if padded_batch >= _LARGE_PREFILL_MIN_TOKENS:
+            vmem_limit_bytes: int | None = _device_vmem_limit_bytes(tpu_version)
+        else:
+            row_scale_bytes = _row_scale_vmem_bytes(batch_block)
+            # w_in packs [gate; up] along axis 0, so its block specs are non-trivial (2x buffered).
+            gate_up_vmem = (
+                (2 if (n_batch > 1 or save_acc) else 1)
+                * batch_block
+                * in_block
+                * x_2d.dtype.itemsize
+                + 4 * out_block * (in_block * w_in.dtype.itemsize + 8 * 4)
+                + (2 if n_batch > 1 else 1) * row_scale_bytes
+                + (2 if (n_batch > 1 or n_out > 1) else 1)
+                * (
+                    batch_block * out_block * target_out_dtype.itemsize
+                    + row_scale_bytes
+                )
+                + (6 if save_acc else 4) * batch_block * out_block * 4
+            )
+            vmem_limit_bytes = _clamp_vmem_limit_bytes(gate_up_vmem, tpu_version)
+    else:
+        vmem_limit_bytes = None
 
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
     o_idx = (lambda _o: 0) if n_out == 1 else (lambda o: o)
@@ -1312,6 +1782,7 @@ def sharded_fp8_gate_up_swiglu(
     sequence_parallel: bool = True,
     sync_tp_scale: bool = True,
     quantize_output: bool = False,
+    fuse_quant_epilogue: bool = True,
     out_dtype: Any = jnp.bfloat16,
     backend: MatmulBackend = "auto",
     interpret: bool = False,
@@ -1328,6 +1799,39 @@ def sharded_fp8_gate_up_swiglu(
     scale_out_spec = P(None, None) if sync_tp_scale else P(TP_AXIS, None)
 
     if use_pallas:
+        n_rows = x_q.reshape(-1, x_q.shape[-1]).shape[0]
+        if (
+            quantize_output
+            and fuse_quant_epilogue
+            and not sequence_parallel
+            and not sync_tp_scale
+            and n_rows <= 320
+        ):
+
+            def _pallas_fused_quant_local(
+                xq_local: jax.Array,
+                xs_local: jax.Array,
+                w_local: jax.Array,
+                ws_local: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                return pallas_fp8_gate_up_swiglu_quant(
+                    xq_local,
+                    xs_local,
+                    w_local,
+                    ws_local,
+                    out_dtype=w_local.dtype,
+                    transposed_scale=True,
+                    interpret=interpret,
+                )
+
+            return jax.shard_map(
+                _pallas_fused_quant_local,
+                mesh=mesh,
+                in_specs=(x_spec, x_spec, P(TP_AXIS, None), P(TP_AXIS)),
+                out_specs=(P(None, TP_AXIS), scale_out_spec),
+                check_vma=False,
+            )(x_q, x_scale, w_gate_up, w_scale)
+
         aux_out_spec = (
             scale_out_spec
             if quantize_output
@@ -1546,6 +2050,7 @@ __all__ = [
     "fp8_matmul_prequantized",
     "get_tuned_block_sizes",
     "pallas_fp8_gate_up_swiglu",
+    "pallas_fp8_gate_up_swiglu_quant",
     "pallas_fp8_matmul",
     "quantize_fp8_act",
     "quantize_fp8_weight",

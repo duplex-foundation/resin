@@ -243,8 +243,8 @@ python/sglang/kernels/jit/csrc/inkling2/routed_quant.cuh, under Apache-2.0.
 The adaptation retains device arithmetic and uses Resin's existing FlashInfer
 compilation toolchain with int64 route indices and indirect route weights.
 
-The TPU ragged paged attention v3, batched decode attention, FP8 W8A8 quantized
-matmul, RMSNorm, and rotary positional embedding kernels in
+The TPU ragged paged attention v3, batched decode and mixed attention, FP8 W8A8
+quantized matmul, RMSNorm, and rotary positional embedding kernels in
 resin/backend/tpu/kernels adapt vllm-project/tpu-inference at revisions
 d9c7e19da8c497ec63b9381bb0bc9b2a5e0d4bb2 and
 da76a6a40bf4cc8fd32c0d07b471c0b4ae32754c:

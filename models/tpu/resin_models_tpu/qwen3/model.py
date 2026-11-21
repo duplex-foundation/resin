@@ -49,9 +49,11 @@ from resin.backend.tpu.kernels import (
     sharded_fp8_matmul,
     sharded_fp8_matmul_all_gather,
     sharded_fp8_matmul_reduce_scatter,
+    sharded_fp8_qkv_norm_rope_pack,
     sharded_fp8_row_matmul_async_ar,
 )
 from resin.backend.tpu.kernels._rpa_v3_pallas import get_tpu_version
+from resin.backend.tpu.kernels.norm_rope import _half_swap_perm, _slice_rope_cache_128
 from resin.backend.tpu.mesh import TP_AXIS, tp_size
 from resin.backend.tpu.metadata import ModelInputs
 from resin.models.qwen3.config import Qwen3Config
@@ -134,6 +136,7 @@ class Qwen3Model:
     sequence_parallel_min_tokens: int = _PREFILL_MATMUL_MIN_TOKENS
     _force_fused_qkv_pack_interpret: bool = field(default=False, repr=False)
     _force_decode_pallas_interpret: bool = field(default=False, repr=False)
+    sync_tp_scale: bool = False
     vocab_size: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -217,6 +220,8 @@ class Qwen3Model:
         inputs: ModelInputs,
         rope_cache: tuple[jax.Array, jax.Array] | None,
         *,
+        cos_sin_pos: tuple[jax.Array, jax.Array] | None = None,
+        perm_128: jax.Array | None = None,
         return_packed: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         config = self.config
@@ -232,26 +237,37 @@ class Qwen3Model:
         use_fused_pack = self._can_use_fused_qkv_pack(qkv_out.dtype, rope_cache)
         if use_fused_pack:
             assert rope_cache is not None
-            cos_full, sin_signed = rope_cache
+            cos_pos, sin_pos = (
+                _slice_rope_cache_128(inputs.positions, rope_cache)
+                if cos_sin_pos is None
+                else cos_sin_pos
+            )
+            eff_perm = (
+                _half_swap_perm(128, dtype=jnp.bfloat16)
+                if perm_128 is None
+                else perm_128
+            )
 
             def _pack_local(
                 qkv_local: jax.Array,
-                pos: Any,
-                cos_t: jax.Array,
-                sin_t: jax.Array,
+                cos_p: jax.Array,
+                sin_p: jax.Array,
                 qw: jax.Array,
                 kw: jax.Array,
+                perm_l: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
                 return pallas_qkv_norm_rope_pack(
                     qkv_local,
-                    pos,
-                    (cos_t, sin_t),
+                    None,
+                    None,
                     qw,
                     kw,
                     kv_cache.dtype,
                     num_q_heads=local_heads,
                     num_kv_heads=local_kv_heads,
                     eps=eps,
+                    cos_sin_pos=(cos_p, sin_p),
+                    perm_128=perm_l,
                     interpret=self._force_fused_qkv_pack_interpret,
                 )
 
@@ -263,11 +279,11 @@ class Qwen3Model:
                 check_vma=False,
             )(
                 qkv_out,
-                inputs.positions,
-                cos_full,
-                sin_signed,
+                cos_pos,
+                sin_pos,
                 weights.q_norm,
                 weights.k_norm,
+                eff_perm,
             )
             return paged_attention(
                 q_packed,
@@ -389,8 +405,19 @@ class Qwen3Model:
         eps = config.rms_norm_eps
         tokens = inputs.input_ids.shape[0]
         q_width = config.num_attention_heads * config.head_dim
+        group_size = config.num_attention_heads // config.num_key_value_heads
+        tp = tp_size(self.mesh)
         layers = params.layers
         backend = self._resolve_prefill_matmul_backend(tokens)
+        pallas_interp = self._force_fused_qkv_pack_interpret
+        # Require 128-lane local contracting widths and a shard_map-backed matmul backend.
+        per_die_scale = (
+            not self.sync_tp_scale
+            and backend != "gspmd_xla"
+            and (q_width // tp) >= 128
+            and (config.intermediate_size // tp) >= 128
+        )
+        sp_sync_tp_scale = not per_die_scale
 
         x = jax.shard_map(
             lambda ids, emb: emb[ids],
@@ -399,12 +426,18 @@ class Qwen3Model:
             out_specs=TOKENS_SHARDED,
         )(inputs.input_ids, params.embed)
         act_dtype = x.dtype
+        use_fused_unpack = (
+            self.fuse_unpack_attn_quant
+            and (get_tpu_version() >= 7 or pallas_interp)
+            and self._can_use_fused_qkv_pack(act_dtype, params.rope_cache)
+            and (q_width // tp) % 128 == 0
+        )
 
         def _sharded_norm_quant(
             x_in: jax.Array, norm_w: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
             return jax.shard_map(
-                lambda xl, nw: rms_norm_fp8_quant(xl, nw, eps),
+                lambda xl, nw: rms_norm_fp8_quant(xl, nw, eps, interpret=pallas_interp),
                 mesh=self.mesh,
                 in_specs=(TOKENS_SHARDED, P()),
                 out_specs=(TOKENS_SHARDED, TOKENS_SHARDED),
@@ -415,12 +448,24 @@ class Qwen3Model:
             delta: jax.Array, res: jax.Array, norm_w: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             return jax.shard_map(
-                lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(dl, rl, nw, eps),
+                lambda dl, rl, nw: fused_add_rms_norm_fp8_quant(
+                    dl, rl, nw, eps, interpret=pallas_interp
+                ),
                 mesh=self.mesh,
                 in_specs=(TOKENS_SHARDED, TOKENS_SHARDED, P()),
                 out_specs=(TOKENS_SHARDED, TOKENS_SHARDED, TOKENS_SHARDED),
                 check_vma=False,
             )(delta, res, norm_w)
+
+        def _unpack_synced(packed_l: jax.Array) -> tuple[jax.Array, jax.Array]:
+            bf16_l, absmax_l = pallas_unpack_attn_fp8_quant(
+                packed_l,
+                group_size,
+                config.head_dim,
+                return_bf16_and_absmax=True,
+                interpret=pallas_interp,
+            )
+            return bf16_l, jax.lax.pmax(absmax_l, axis_name=TP_AXIS)
 
         h_q, h_scale = _sharded_norm_quant(x, layers[0].input_norm)
         layer_caches = []
@@ -441,19 +486,66 @@ class Qwen3Model:
                 out_dtype=act_dtype,
                 backend=backend,
             )
-            attended, kv_cache = self._attend_qkv(
-                qkv_out, weights, kv_cache, inputs, params.rope_cache
-            )
-            layer_caches.append(kv_cache)
-
-            o_out = sharded_fp8_matmul_reduce_scatter(
-                attended.reshape(tokens, q_width),
-                weights.o.qvalue,
-                weights.o.scale,
-                mesh=self.mesh,
-                out_dtype=act_dtype,
-                backend=backend,
-            )
+            if use_fused_unpack:
+                att_packed, kv_cache = self._attend_qkv(
+                    qkv_out,
+                    weights,
+                    kv_cache,
+                    inputs,
+                    params.rope_cache,
+                    return_packed=True,
+                )
+                layer_caches.append(kv_cache)
+                if sp_sync_tp_scale:
+                    att_in, att_absmax = jax.shard_map(
+                        _unpack_synced,
+                        mesh=self.mesh,
+                        in_specs=Q_PACKED_PARTITION,
+                        out_specs=(ROW, P()),
+                        check_vma=False,
+                    )(att_packed)
+                    att_scale = None
+                else:
+                    o_q_dtype = weights.o.qvalue.dtype
+                    att_in, att_scale = jax.shard_map(
+                        lambda packed_l, _dt=o_q_dtype: pallas_unpack_attn_fp8_quant(
+                            packed_l,
+                            group_size,
+                            config.head_dim,
+                            dtype=_dt,
+                            interpret=pallas_interp,
+                        ),
+                        mesh=self.mesh,
+                        in_specs=Q_PACKED_PARTITION,
+                        out_specs=(ROW, P(TP_AXIS, None)),
+                        check_vma=False,
+                    )(att_packed)
+                    att_absmax = None
+                o_out = sharded_fp8_matmul_reduce_scatter(
+                    att_in,
+                    weights.o.qvalue,
+                    weights.o.scale,
+                    mesh=self.mesh,
+                    x_scale=att_scale,
+                    x_abs_max=att_absmax,
+                    sync_tp_scale=sp_sync_tp_scale,
+                    out_dtype=act_dtype,
+                    backend=backend,
+                )
+            else:
+                attended, kv_cache = self._attend_qkv(
+                    qkv_out, weights, kv_cache, inputs, params.rope_cache
+                )
+                layer_caches.append(kv_cache)
+                o_out = sharded_fp8_matmul_reduce_scatter(
+                    attended.reshape(tokens, q_width),
+                    weights.o.qvalue,
+                    weights.o.scale,
+                    mesh=self.mesh,
+                    sync_tp_scale=sp_sync_tp_scale,
+                    out_dtype=act_dtype,
+                    backend=backend,
+                )
             mlp_q, mlp_scale, x = _sharded_add_norm_quant(o_out, x, weights.post_norm)
 
             gated, gated_absmax = sharded_fp8_gate_up_swiglu(
@@ -463,6 +555,7 @@ class Qwen3Model:
                 weights.gate_up.scale,
                 mesh=self.mesh,
                 sequence_parallel=True,
+                sync_tp_scale=sp_sync_tp_scale,
                 out_dtype=act_dtype,
                 backend=backend,
             )
@@ -472,6 +565,7 @@ class Qwen3Model:
                 weights.down.scale,
                 mesh=self.mesh,
                 x_abs_max=gated_absmax,
+                sync_tp_scale=sp_sync_tp_scale,
                 out_dtype=act_dtype,
                 backend=backend,
             )
@@ -560,6 +654,8 @@ class Qwen3Model:
 
         x = params.embed[inputs.input_ids]
         act_dtype = x.dtype
+        if self.sync_tp_scale:
+            row_sync_tp_scale = True
         use_async_row_ar = (
             self.decode_async_all_reduce
             and not is_prefill
@@ -573,9 +669,64 @@ class Qwen3Model:
             self.fuse_unpack_attn_quant
             and not is_prefill
             and not row_sync_tp_scale
+            and (get_tpu_version() >= 7 or self._force_fused_qkv_pack_interpret)
             and self._can_use_fused_qkv_pack(act_dtype, params.rope_cache)
             and (q_width // tp) % 128 == 0
         )
+
+        def _row_proj_add_norm_quant(
+            row_in: jax.Array,
+            row_w: Fp8Weight,
+            res: jax.Array,
+            norm_w: jax.Array,
+            q_out_dtype: Any,
+            *,
+            x_scale: jax.Array | None = None,
+            x_abs_max: jax.Array | None = None,
+            sync_scale: bool,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            if use_async_row_ar:
+                return sharded_fp8_row_matmul_async_ar(
+                    row_in,
+                    row_w.qvalue,
+                    row_w.scale,
+                    mesh=self.mesh,
+                    x_scale=x_scale,
+                    x_abs_max=x_abs_max,
+                    sync_tp_scale=sync_scale,
+                    out_dtype=act_dtype,
+                    residual=res,
+                    norm_weight=norm_w,
+                    eps=eps,
+                    quantize_output_dtype=q_out_dtype,
+                    transposed_scale=True,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                )
+            row_out = self._linear(
+                row_in,
+                row_w,
+                ROW,
+                x_scale=x_scale,
+                x_abs_max=x_abs_max,
+                sync_tp_scale=sync_scale,
+                async_all_reduce=False,
+                out_dtype=act_dtype,
+                backend=proj_backend,
+                interpret=dec_interp,
+            )
+            return _rep_add_norm_quant(row_out, res, norm_w)
+
+        if params.rope_cache is not None and self._can_use_fused_qkv_pack(
+            act_dtype, params.rope_cache
+        ):
+            hoisted_cos_sin: tuple[jax.Array, jax.Array] | None = _slice_rope_cache_128(
+                inputs.positions, params.rope_cache
+            )
+            hoisted_perm: jax.Array | None = _half_swap_perm(128, dtype=jnp.bfloat16)
+        else:
+            hoisted_cos_sin = None
+            hoisted_perm = None
 
         h_q, h_scale = _rep_norm_quant(x, layers[0].input_norm)
         layer_caches = []
@@ -587,23 +738,40 @@ class Qwen3Model:
             assert isinstance(weights.gate_up, Fp8Weight)
             assert isinstance(weights.down, Fp8Weight)
 
-            qkv_out = self._linear(
-                h_q,
-                weights.qkv,
-                COLUMN,
-                x_scale=h_scale,
-                out_dtype=act_dtype,
-                backend=proj_backend,
-                interpret=dec_interp,
-            )
             if use_fused_unpack_quant:
-                att_packed, kv_cache = self._attend_qkv(
-                    qkv_out,
-                    weights,
-                    kv_cache,
-                    inputs,
+                q_packed, kv_merged = sharded_fp8_qkv_norm_rope_pack(
+                    h_q,
+                    h_scale,
+                    weights.qkv.qvalue,
+                    weights.qkv.scale,
+                    inputs.positions,
                     params.rope_cache,
+                    weights.q_norm,
+                    weights.k_norm,
+                    kv_cache.dtype,
+                    mesh=self.mesh,
+                    num_q_heads=config.num_attention_heads,
+                    num_kv_heads=config.num_key_value_heads,
+                    eps=eps,
+                    cos_sin_pos=hoisted_cos_sin,
+                    perm_128=hoisted_perm,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                    pack_interpret=self._force_fused_qkv_pack_interpret,
+                )
+                att_packed, kv_cache = paged_attention(
+                    q_packed,
+                    kv_merged,
+                    None,
+                    kv_cache,
+                    inputs.attention,
+                    mesh=self.mesh,
+                    sm_scale=config.head_dim**-0.5,
+                    prepared=True,
                     return_packed=True,
+                    actual_num_q_heads=config.num_attention_heads,
+                    actual_head_dim=config.head_dim,
+                    impl=self.impl,
                 )
                 layer_caches.append(kv_cache)
                 o_q_dtype = weights.o.qvalue.dtype
@@ -620,34 +788,43 @@ class Qwen3Model:
                     out_specs=(ROW, P(TP_AXIS, None)),
                     check_vma=False,
                 )(att_packed)
-                o_out = self._linear(
+                mlp_q, mlp_scale, x = _row_proj_add_norm_quant(
                     att_q,
                     weights.o,
-                    ROW,
+                    x,
+                    weights.post_norm,
+                    weights.gate_up.qvalue.dtype,
                     x_scale=att_scale,
-                    sync_tp_scale=False,
-                    async_all_reduce=use_async_row_ar,
-                    out_dtype=act_dtype,
-                    backend=proj_backend,
-                    interpret=dec_interp,
+                    sync_scale=False,
                 )
             else:
-                attended, kv_cache = self._attend_qkv(
-                    qkv_out, weights, kv_cache, inputs, params.rope_cache
-                )
-                layer_caches.append(kv_cache)
-                o_out = self._linear(
-                    attended.reshape(tokens, q_width),
-                    weights.o,
-                    ROW,
-                    sync_tp_scale=row_sync_tp_scale,
-                    async_all_reduce=use_async_row_ar,
+                qkv_out = self._linear(
+                    h_q,
+                    weights.qkv,
+                    COLUMN,
+                    x_scale=h_scale,
                     out_dtype=act_dtype,
                     backend=proj_backend,
                     interpret=dec_interp,
                 )
-
-            mlp_q, mlp_scale, x = _rep_add_norm_quant(o_out, x, weights.post_norm)
+                attended, kv_cache = self._attend_qkv(
+                    qkv_out,
+                    weights,
+                    kv_cache,
+                    inputs,
+                    params.rope_cache,
+                    cos_sin_pos=hoisted_cos_sin,
+                    perm_128=hoisted_perm,
+                )
+                layer_caches.append(kv_cache)
+                mlp_q, mlp_scale, x = _row_proj_add_norm_quant(
+                    attended.reshape(tokens, q_width),
+                    weights.o,
+                    x,
+                    weights.post_norm,
+                    weights.gate_up.qvalue.dtype,
+                    sync_scale=row_sync_tp_scale,
+                )
 
             gated_in, gated_aux = sharded_fp8_gate_up_swiglu(
                 mlp_q,
@@ -658,27 +835,37 @@ class Qwen3Model:
                 sequence_parallel=False,
                 sync_tp_scale=row_sync_tp_scale,
                 quantize_output=prequantize_gated,
+                fuse_quant_epilogue=proj_backend != "xla",
                 out_dtype=act_dtype,
                 backend=gu_backend,
                 interpret=dec_interp,
             )
-            down_out = self._linear(
-                gated_in,
-                weights.down,
-                ROW,
-                x_scale=gated_aux if prequantize_gated else None,
-                x_abs_max=None if prequantize_gated else gated_aux,
-                sync_tp_scale=row_sync_tp_scale,
-                async_all_reduce=use_async_row_ar,
-                out_dtype=act_dtype,
-                backend=proj_backend,
-                interpret=dec_interp,
-            )
             if idx + 1 < num_layers:
-                h_q, h_scale, x = _rep_add_norm_quant(
-                    down_out, x, layers[idx + 1].input_norm
+                next_layer = layers[idx + 1]
+                assert isinstance(next_layer.qkv, Fp8Weight)
+                h_q, h_scale, x = _row_proj_add_norm_quant(
+                    gated_in,
+                    weights.down,
+                    x,
+                    next_layer.input_norm,
+                    next_layer.qkv.qvalue.dtype,
+                    x_scale=gated_aux if prequantize_gated else None,
+                    x_abs_max=None if prequantize_gated else gated_aux,
+                    sync_scale=row_sync_tp_scale,
                 )
             else:
+                down_out = self._linear(
+                    gated_in,
+                    weights.down,
+                    ROW,
+                    x_scale=gated_aux if prequantize_gated else None,
+                    x_abs_max=None if prequantize_gated else gated_aux,
+                    sync_tp_scale=row_sync_tp_scale,
+                    async_all_reduce=use_async_row_ar,
+                    out_dtype=act_dtype,
+                    backend=proj_backend,
+                    interpret=dec_interp,
+                )
                 normed, _ = fused_add_rms_norm(down_out, x, params.norm, eps)
 
         return normed, (tuple(layer_caches),)

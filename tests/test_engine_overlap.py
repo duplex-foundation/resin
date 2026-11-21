@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import pytest
 from output_helpers import forward_output
 
-from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig, SamplingParams
+from resin import (
+    BatchPhase,
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    RunnerConfig,
+    SamplingParams,
+)
 
 
 @dataclass
@@ -126,8 +133,48 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
     runner.shutdown()
 
 
+def test_a_waiting_request_the_running_limit_blocks_does_not_stop_overlap():
+    runner = AsyncRunner()
+    engine = Engine(runner, max_running_requests=1)
+    first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
+    second = engine.submit([10], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    assert [event.token_id for event in engine.step()] == [3, 4]
+    assert engine.ready_request_count == 1
+    assert engine.overlap_stats == (2, 1)
+    while engine.has_work():
+        engine.step()
+    assert first.take_result() == list(range(2, 26))
+    assert second.take_result() == list(range(11, 35))
+    assert engine.overlap_stats[1] > 1
+    engine.close()
+    runner.shutdown()
+
+
+def test_a_new_arrival_with_a_free_slot_drains_the_overlap_chain():
+    runner = AsyncRunner()
+    engine = Engine(runner, max_running_requests=2)
+    first = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [event.token_id for event in engine.step()] == [2]
+    assert engine.step() == []
+    second = engine.submit([10], sampling_params=SamplingParams(max_output_tokens=24))
+    assert [(event.request_id, event.token_id) for event in engine.step()] == [
+        (first.id, 3),
+        (first.id, 4),
+    ]
+    assert engine.overlap_stats == (1, 0)
+    assert not engine.overlap_pending
+    while engine.has_work():
+        engine.step()
+    assert first.take_result() == list(range(2, 26))
+    assert second.take_result() == list(range(11, 35))
+    engine.close()
+    runner.shutdown()
+
+
 @pytest.mark.parametrize("output_count", [16, 32])
-def test_eight_token_verification_requires_output_headroom(output_count):
+def test_eight_token_verification_overlaps_up_to_the_output_limit(output_count):
     runner = AsyncRunner()
     runner.runner_config = RunnerConfig(
         cache_layout=runner.runner_config.cache_layout,
@@ -141,10 +188,7 @@ def test_eight_token_verification_requires_output_headroom(output_count):
         while engine.has_work():
             engine.step()
         assert request.take_result() == list(range(2, output_count + 2))
-        if output_count == 16:
-            assert engine.overlap_stats == (0, 0)
-        else:
-            assert engine.overlap_stats[1] > 0
+        assert engine.overlap_stats[1] > 0
     finally:
         engine.close()
         runner.shutdown()
@@ -282,16 +326,58 @@ def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
     runner.shutdown()
 
 
-def test_short_budgets_use_synchronous_reference():
+def test_a_short_budget_overlaps_and_discards_the_finished_successor():
     runner = AsyncRunner()
     engine = Engine(runner)
     request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=4))
-    engine.step()
-    assert engine.step()
-    assert not runner.pending and not engine.overlap_pending
+    while engine.has_work():
+        engine.step()
+    assert request.take_result() == [2, 3, 4, 5]
+    assert engine.overlap_stats[1] > 0
+    assert runner.released == [request.id]
+    assert engine.cache_free_parent_count == 16
     engine.close()
-    assert request.done
     runner.shutdown()
+
+
+def test_overlap_runs_at_most_one_discarded_row_per_request():
+    class TwoTokenRunner(AsyncRunner):
+        def forward(self, plan):
+            self.plans.append(plan)
+            width = 1 if plan.phase == BatchPhase.PREFILL else 2
+            lasts = [int(plan.token_ids[int(end) - 1]) for end in plan.token_indptr[1:]]
+            return forward_output(
+                [[last + n + 1 for n in range(width)] for last in lasts]
+            )
+
+    def run(overlap, limits):
+        runner = TwoTokenRunner()
+        engine = Engine(runner, enable_overlap=overlap, max_running_requests=3)
+        leases = [
+            engine.submit(
+                [1] * 129, sampling_params=SamplingParams(max_output_tokens=n)
+            )
+            for n in limits
+        ]
+        while engine.has_work():
+            engine.step()
+        results = [lease.take_result() for lease in leases]
+        rows = sum(
+            len(plan.sequence_ids)
+            for plan in runner.plans
+            if plan.phase == BatchPhase.DECODE
+        )
+        engine.close()
+        runner.shutdown()
+        return results, rows
+
+    for limits in ([40, 40, 40], [38, 40, 41], [16, 32, 40]):
+        synchronous, sync_rows = run(False, limits)
+        overlapped, overlap_rows = run(True, limits)
+        assert overlapped == synchronous
+        # A request that finishes by length leaves its already enqueued
+        # successor step behind; that step counts one row for the request.
+        assert 0 <= overlap_rows - sync_rows <= len(limits)
 
 
 @pytest.mark.parametrize("stop", [3, 4])

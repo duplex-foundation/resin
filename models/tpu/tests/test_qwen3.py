@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import closing
 from pathlib import Path
 
@@ -277,7 +278,7 @@ class TestFp8Weights:
         hd_model.save_pretrained(hd128_dir)
 
         outs = []
-        for tp in (1, 2):
+        for tp, sync_scale in ((1, False), (2, False), (2, True)):
             mesh = make_mesh(tp, devices)
             m, p = load_model(
                 hd128_dir,
@@ -287,6 +288,7 @@ class TestFp8Weights:
                 kv_dtype=jnp.float8_e4m3fn,
             )
             m.sequence_parallel_min_tokens = 8
+            m.sync_tp_scale = sync_scale
             m._force_fused_qkv_pack_interpret = True
             import functools as _ft
 
@@ -330,6 +332,225 @@ class TestFp8Weights:
             assert r.compilations_after_warmup == 0
             outs.append([ev.logprobs.logprob for ev in evs if ev.logprobs is not None])
         np.testing.assert_allclose(outs[1], outs[0], rtol=2e-2, atol=5e-2)
+        np.testing.assert_allclose(outs[2], outs[0], rtol=2e-2, atol=5e-2)
+
+    def test_sequence_parallel_prefill_fusion_jaxpr_and_tpu7x_export(self) -> None:
+        import unittest.mock as mock
+
+        from jax import export
+        from jax._src import tpu_info
+        from jax._src.pallas.mosaic import lowering as mosaic_lowering
+        from jax.sharding import NamedSharding
+
+        from resin.backend.tpu.arena import KV_PARTITION, KvCacheSpec
+        from resin.backend.tpu.kernels import ragged_paged_attention
+        from resin.backend.tpu.metadata import AttentionMetadata, ModelInputs
+        from resin.models.qwen3.config import Qwen3Config
+        from resin_models_tpu.qwen3.model import (
+            COLUMN,
+            ROW,
+            LayerParams,
+            Qwen3Model,
+            Qwen3Params,
+        )
+
+        devices = jax.devices("cpu")
+        if len(devices) < 2:
+            pytest.skip("needs 2 host devices")
+
+        cfg = Qwen3Config(
+            vocab_size=1024,
+            hidden_size=5120,
+            intermediate_size=25600,
+            num_hidden_layers=2,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            rope_theta=1e6,
+            eos_token_id=2,
+            bos_token_id=1,
+            dtype="bfloat16",
+        )
+        v7x_info = tpu_info.get_tpu_info_for_chip(tpu_info.ChipVersion("7x"), 1)
+        mesh = make_mesh(2, devices)
+        rep = NamedSharding(mesh, P())
+        col = NamedSharding(mesh, COLUMN)
+        row = NamedSharding(mesh, ROW)
+        sc_col = NamedSharding(mesh, P("tp"))
+        cache_sh = NamedSharding(mesh, KV_PARTITION)
+
+        def _fp8_sds(shape, qsh, ssh):
+            return Fp8Weight(
+                jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn, sharding=qsh),
+                jax.ShapeDtypeStruct((shape[0],), jnp.float32, sharding=ssh),
+            )
+
+        lp = LayerParams(
+            input_norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            q_norm=jax.ShapeDtypeStruct((128,), jnp.bfloat16, sharding=rep),
+            k_norm=jax.ShapeDtypeStruct((128,), jnp.bfloat16, sharding=rep),
+            post_norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            qkv=_fp8_sds((10240, 5120), col, sc_col),
+            o=_fp8_sds((5120, 8192), row, rep),
+            gate_up=_fp8_sds((51200, 5120), col, sc_col),
+            down=_fp8_sds((5120, 25600), row, rep),
+        )
+        params = Qwen3Params(
+            embed=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=rep),
+            layers=(lp, lp),
+            norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
+            lm_head=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=col),
+            rope_cache=(
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32, sharding=rep),
+                jax.ShapeDtypeStruct((4096, 128), jnp.float32, sharding=rep),
+            ),
+        )
+        spec = KvCacheSpec(2, 8, 128, 256, jnp.float8_e4m3fn)
+        caches = (
+            (
+                jax.ShapeDtypeStruct(
+                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
+                ),
+                jax.ShapeDtypeStruct(
+                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
+                ),
+            ),
+        )
+
+        def _iter_outer_eqns(jaxpr_obj):
+            jaxpr = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+            for eqn in jaxpr.eqns:
+                yield eqn
+                if eqn.primitive.name == "pallas_call":
+                    continue
+                for val in eqn.params.values():
+                    if hasattr(val, "jaxpr") or hasattr(val, "eqns"):
+                        yield from _iter_outer_eqns(val)
+                    elif isinstance(val, (tuple, list)):
+                        for item in val:
+                            if hasattr(item, "jaxpr") or hasattr(item, "eqns"):
+                                yield from _iter_outer_eqns(item)
+
+        def _inp(toks: int) -> ModelInputs:
+            return ModelInputs(
+                input_ids=jax.ShapeDtypeStruct((toks,), jnp.int32, sharding=rep),
+                positions=jax.ShapeDtypeStruct((toks,), jnp.int32, sharding=rep),
+                logits_indices=jax.ShapeDtypeStruct((320,), jnp.int32, sharding=rep),
+                attention=AttentionMetadata(
+                    jax.ShapeDtypeStruct((320,), jnp.int32, sharding=rep),
+                    (jax.ShapeDtypeStruct((320 * 17,), jnp.int32, sharding=rep),),
+                    jax.ShapeDtypeStruct((321,), jnp.int32, sharding=rep),
+                    jax.ShapeDtypeStruct((3,), jnp.int32, sharding=rep),
+                ),
+            )
+
+        with (
+            mock.patch(
+                "resin.backend.tpu.kernels.norm_rope.get_tpu_version", return_value=7
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.fp8_matmul.get_tpu_version", return_value=7
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.ragged_paged_attention.get_tpu_version",
+                return_value=7,
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.ragged_paged_attention.pltpu.get_tpu_info",
+                return_value=v7x_info,
+            ),
+            mock.patch.object(tpu_info, "get_tpu_info", return_value=v7x_info),
+            mock.patch.object(
+                mosaic_lowering.tpu_info, "get_tpu_info", return_value=v7x_info
+            ),
+            mock.patch(
+                "jax._src.pallas.mosaic.pallas_call_registration.tpu_info.get_tpu_info",
+                return_value=v7x_info,
+            ),
+            mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
+        ):
+            per_die_model = Qwen3Model(
+                cfg,
+                mesh,
+                jnp.float8_e4m3fn,
+                page_tokens=256,
+                impl=ragged_paged_attention,
+            )
+            sync_model = Qwen3Model(
+                cfg,
+                mesh,
+                jnp.float8_e4m3fn,
+                page_tokens=256,
+                sync_tp_scale=True,
+                impl=ragged_paged_attention,
+            )
+
+            for sp_tokens in (512, 1024, 2048, 4096):
+                inp = _inp(sp_tokens)
+                per_die_prims = [
+                    e.primitive.name
+                    for e in _iter_outer_eqns(
+                        jax.make_jaxpr(per_die_model.hidden_states)(params, caches, inp)
+                    )
+                ]
+                assert "pad" not in per_die_prims
+                assert "transpose" not in per_die_prims
+                assert "pmax" not in per_die_prims
+
+                sync_eqns = list(
+                    _iter_outer_eqns(
+                        jax.make_jaxpr(sync_model.hidden_states)(params, caches, inp)
+                    )
+                )
+                sync_prims = [e.primitive.name for e in sync_eqns]
+                assert "pad" not in sync_prims
+                # The XLA absmax-quantize fallback may transpose a per-token scale.
+                assert all(
+                    e.invars[0].aval.shape in ((sp_tokens, 1), (1, sp_tokens))
+                    for e in sync_eqns
+                    if e.primitive.name == "transpose"
+                )
+                assert sync_prims.count("pmax") == 2 * cfg.num_hidden_layers
+
+            for exp_tokens in (1024, 4096):
+                mlir_txt = export.export(
+                    jax.jit(per_die_model.hidden_states, donate_argnums=(1,)),
+                    platforms=["tpu"],
+                )(params, caches, _inp(exp_tokens)).mlir_module()
+                assert "qkv_norm_rope_pack_512_32_4" in mlir_txt
+                assert "unpack_attn_fp8_quant_512_4096" in mlir_txt
+                assert "fused_add_rms_norm_fp8_quant_256_5120" in mlir_txt
+
+            dec_sync_prims = [
+                e.primitive.name
+                for e in _iter_outer_eqns(
+                    jax.make_jaxpr(sync_model.hidden_states)(params, caches, _inp(320))
+                )
+            ]
+            assert dec_sync_prims.count("pmax") >= 2 * cfg.num_hidden_layers
+
+            sync_mlir = export.export(
+                jax.jit(sync_model.hidden_states, donate_argnums=(1,)),
+                platforms=["tpu"],
+            )(params, caches, _inp(4096)).mlir_module()
+            assert "unpack_attn_absmax_512_4096" in sync_mlir
+
+            with mock.patch(
+                "resin_models_tpu.qwen3.model.get_tpu_version", return_value=6
+            ):
+                for v6_tokens in (320, 1024):
+                    v6_pallas = [
+                        e.params.get("name", "")
+                        for e in _iter_outer_eqns(
+                            jax.make_jaxpr(per_die_model.hidden_states)(
+                                params, caches, _inp(v6_tokens)
+                            )
+                        )
+                        if e.primitive.name == "pallas_call"
+                    ]
+                    assert all("unpack_attn_" not in name for name in v6_pallas)
 
     def test_offline_tpu_v7x_mosaic_mlir_export(self) -> None:
         import unittest.mock as mock
@@ -445,12 +666,13 @@ class TestFp8Weights:
             ),
             mock.patch("resin_models_tpu.qwen3.model.get_tpu_version", return_value=7),
         ):
-            export_modes: tuple[DecodeMatmulMode, ...] = (
-                "auto",
-                "pallas",
-                "xla",
+            export_variants: tuple[tuple[DecodeMatmulMode, bool], ...] = (
+                ("auto", False),
+                ("pallas", False),
+                ("xla", False),
+                ("auto", True),
             )
-            for mode in export_modes:
+            for mode, sync_tp_scale in export_variants:
                 model = Qwen3Model(
                     cfg,
                     mesh,
@@ -458,6 +680,7 @@ class TestFp8Weights:
                     page_tokens=256,
                     decode_matmul_mode=mode,
                     impl=ragged_paged_attention,
+                    sync_tp_scale=sync_tp_scale,
                 )
                 if mode == "auto":
                     assert model._resolve_prefill_matmul_backend(512) == "xla"
@@ -477,11 +700,22 @@ class TestFp8Weights:
                     )
                     if mode == "auto"
                     else (
-                        ((8, 8), (16, 16), (96, 96), (160, 160), (320, 320))
+                        (
+                            (1, 1),
+                            (8, 8),
+                            (16, 16),
+                            (96, 96),
+                            (160, 160),
+                            (192, 192),
+                            (256, 256),
+                            (320, 320),
+                        )
                         if mode == "pallas"
                         else ((8, 8), (320, 320))
                     )
                 )
+                if sync_tp_scale:
+                    tokens_to_check = ((8, 8), (320, 320))
                 for tokens, seqs in tokens_to_check:
                     inp = ModelInputs(
                         input_ids=jax.ShapeDtypeStruct(
@@ -511,28 +745,87 @@ class TestFp8Weights:
                     mlir_txt = exported.mlir_module()
                     assert "tpu_custom_call" in mlir_txt
                     assert "func.func private @_run(" not in mlir_txt
-                    if tokens <= 320:
-                        assert f"quantize_fp8_with_absmax_{tokens}_12800" in mlir_txt
+                    if tokens <= 320 and (mode == "xla" or sync_tp_scale):
+                        assert f"quantize_fp8_with_absmax_{tokens}_2560" in mlir_txt
+                        assert (
+                            f"quantize_fp8_with_absmax_{tokens}_12800" not in mlir_txt
+                        )
                     else:
                         assert "quantize_fp8_with_absmax_" not in mlir_txt
-                    if mode == "xla":
-                        assert "fp8_w8a8_matmul_" not in mlir_txt
+                    if mode == "xla" or sync_tp_scale:
+                        if mode == "xla":
+                            assert "fp8_w8a8_matmul_" not in mlir_txt
                         assert "fp8_w8a8_async_ar_" not in mlir_txt
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode in ("auto", "pallas") and tokens <= 320:
-                        assert f"fp8_w8a8_async_ar_{tokens}_1280_4096" in mlir_txt
-                        assert f"fp8_w8a8_matmul_{tokens}_1280_5120" in mlir_txt
-                        assert f"fp8_w8a8_async_ar_{tokens}_512_12800_b3" in mlir_txt
+                        padded_b = max(8, ((tokens + 7) // 8) * 8)
+                        o_blk = 640 if padded_b <= 192 else 1280
+                        if padded_b <= 96:
+                            assert (
+                                f"fp8_w8a8_async_ar_{padded_b}_{o_blk}_4096_b3_add_norm_q"
+                                in mlir_txt
+                            )
+                            assert (
+                                f"fp8_w8a8_async_ar_{padded_b}_512_12800_b3_add_norm_q"
+                                in mlir_txt
+                            )
+                            assert (
+                                'kernel_name = "fused_add_rms_norm_fp8_quant_'
+                                not in mlir_txt
+                            )
+                        else:
+                            assert (
+                                f'kernel_name = "fp8_w8a8_async_ar_{padded_b}_{o_blk}_4096_b3"'
+                                in mlir_txt
+                            )
+                            assert (
+                                f'kernel_name = "fused_add_rms_norm_fp8_quant_{padded_b}_5120"'
+                                in mlir_txt
+                            )
+                        assert (
+                            f"fp8_qkv_norm_rope_pack_{padded_b}_1024_5120_b3"
+                            in mlir_txt
+                        )
+                        assert 'kernel_name = "qkv_norm_rope_pack_' not in mlir_txt
+                        assert f"fp8_w8a8_matmul_{padded_b}_" not in mlir_txt
+                        assert (
+                            f'kernel_name = "fp8_w8a8_async_ar_{padded_b}_512_12800_b3"'
+                            in mlir_txt
+                        )
+                        assert mlir_txt.count('kernel_name = "rms_norm_fp8_quant_') <= 1
+                        assert "quantize_fp8_with_absmax_" not in mlir_txt
+                        gu_blk = 1280 if padded_b >= 288 else 640
+                        gu_suffix = "" if padded_b >= 288 else "_b3"
+                        assert (
+                            f"fp8_gate_up_swiglu_quant_{padded_b}_{gu_blk}_5120{gu_suffix}"
+                            in mlir_txt
+                        )
+                        scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
+                        custom_calls = [
+                            line
+                            for line in mlir_txt.splitlines()
+                            if "tpu_custom_call" in line
+                        ]
+                        sizes = [
+                            int(m.group(1))
+                            for line in custom_calls
+                            if f'kernel_name = "fp8_gate_up_swiglu_quant_{padded_b}_'
+                            in line
+                            and (m := scoped_vmem_re.search(line))
+                        ]
+                        assert sizes and all(size <= 46 * 1024**2 for size in sizes)
                         assert "stablehlo.all_reduce" not in mlir_txt
                     elif mode == "auto" and tokens == 384:
                         assert "fp8_w8a8_async_ar_" not in mlir_txt
                         assert "stablehlo.all_reduce" in mlir_txt
                     elif mode == "auto" and tokens == 1024:
-                        assert "fp8_gate_up_swiglu_512_" not in mlir_txt
+                        assert "fp8_gate_up_swiglu_" not in mlir_txt
                         assert "fp8_w8a8_matmul_" not in mlir_txt
                     elif mode == "auto" and tokens == 4096:
-                        assert "fp8_gate_up_swiglu_512_1280_5120" in mlir_txt
-                        assert "fp8_w8a8_matmul_256_5120_5120" in mlir_txt
+                        assert "fp8_gate_up_swiglu_1024_1280_5120" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_1280_5120" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_1280_4096" in mlir_txt
+                        assert "fp8_w8a8_matmul_1024_2560_2560" in mlir_txt
 
     def test_decode_matmul_modes_tp2_vs_tp1_parity_and_zero_pmax(
         self, tmp_path
@@ -638,6 +931,112 @@ class TestFp8Weights:
         np.testing.assert_array_equal(tp2_async_lps, tp2_psum_lps)
         for lps in (tp2_async_lps, _run_mode(2, "xla")):
             np.testing.assert_allclose(lps, tp1_ref, rtol=2e-2, atol=5e-2)
+
+        # Direct full-vocab logit KL budget (<= 0.002) and greedy top-1 parity
+        # across unaligned (1) and aligned (8, 16) decode buckets on TP=2.
+        from resin.backend.tpu.metadata import AttentionMetadata, ModelInputs
+
+        mesh2 = make_mesh(2, devices)
+        m_fused, p_fused = load_model(
+            hd128_dir,
+            mesh2,
+            page_tokens=8,
+            quantization="fp8",
+            kv_dtype=jnp.float8_e4m3fn,
+        )
+        m_fused.decode_matmul_mode = "pallas"
+        m_fused.decode_async_all_reduce = True
+        m_fused._force_fused_qkv_pack_interpret = True
+        m_fused._force_decode_pallas_interpret = True
+        m_fused.impl = _ft.partial(
+            ragged_paged_attention,
+            d_block_sizes=(1, 8, 1, 8),
+            m_block_sizes=(4, 8, 4, 8),
+            interpret=True,
+        )
+
+        m_xla, p_xla = load_model(
+            hd128_dir,
+            mesh2,
+            page_tokens=8,
+            quantization="fp8",
+            kv_dtype=jnp.float8_e4m3fn,
+        )
+        m_xla.decode_matmul_mode = "xla"
+        m_xla.decode_async_all_reduce = False
+        m_xla._force_fused_qkv_pack_interpret = True
+        m_xla.impl = m_fused.impl
+
+        from resin.backend.tpu.arena import KV_PARTITION, KvCacheSpec
+
+        spec = KvCacheSpec(
+            values["num_hidden_layers"],
+            values["num_key_value_heads"],
+            128,
+            8,
+            jnp.float8_e4m3fn,
+        )
+        cache_sh = jax.sharding.NamedSharding(mesh2, KV_PARTITION)
+        rep_sh = jax.sharding.NamedSharding(mesh2, jax.sharding.PartitionSpec())
+        pps = spec.pages_per_seq(32)
+        caches_f = (
+            tuple(
+                jnp.zeros(
+                    (64, *spec.page_shape(2)), dtype=jnp.float8_e4m3fn, device=cache_sh
+                )
+                for _ in range(spec.layers)
+            ),
+        )
+        caches_x = (
+            tuple(
+                jnp.zeros(
+                    (64, *spec.page_shape(2)), dtype=jnp.float8_e4m3fn, device=cache_sh
+                )
+                for _ in range(spec.layers)
+            ),
+        )
+        rng = np.random.default_rng(20261125)
+        for bsz in (1, 8, 16):
+            ids = jax.device_put(
+                jnp.asarray(
+                    rng.integers(0, values["vocab_size"], size=(bsz,), dtype=np.int32)
+                ),
+                rep_sh,
+            )
+            pos = jax.device_put(jnp.zeros((bsz,), dtype=jnp.int32), rep_sh)
+            lidx = jax.device_put(jnp.arange(bsz, dtype=jnp.int32), rep_sh)
+            kv_lens = jax.device_put(jnp.ones((bsz,), dtype=jnp.int32), rep_sh)
+            pages_np = np.zeros((bsz * pps,), dtype=np.int32)
+            pages_np[::pps] = np.arange(1, bsz + 1, dtype=np.int32)
+            pages = jax.device_put(jnp.asarray(pages_np), rep_sh)
+            cu_q = jax.device_put(jnp.arange(bsz + 1, dtype=jnp.int32), rep_sh)
+            dist = jax.device_put(jnp.array([bsz, bsz, bsz], dtype=jnp.int32), rep_sh)
+            inp = ModelInputs(
+                input_ids=ids,
+                positions=pos,
+                logits_indices=lidx,
+                attention=AttentionMetadata(kv_lens, (pages,), cu_q, dist),
+            )
+            hs_f, _ = m_fused.hidden_states(p_fused, caches_f, inp)
+            logits_f = np.asarray(m_fused.logits(p_fused, hs_f), dtype=np.float32)
+            hs_x, _ = m_xla.hidden_states(p_xla, caches_x, inp)
+            logits_x = np.asarray(m_xla.logits(p_xla, hs_x), dtype=np.float32)
+
+            logp_x = np.asarray(jax.nn.log_softmax(logits_x, axis=-1))
+            logp_f = np.asarray(jax.nn.log_softmax(logits_f, axis=-1))
+            kl = float(np.mean(np.sum(np.exp(logp_x) * (logp_x - logp_f), axis=-1)))
+            assert kl <= 0.002, f"bucket={bsz} mean KL {kl:.6f} > 0.002"
+            assert float(np.max(np.abs(logits_f - logits_x))) <= 0.05
+            part_x = np.partition(logits_x, -2, axis=-1)
+            clear_margin = (part_x[:, -1] - part_x[:, -2]) >= 0.05
+            if np.any(clear_margin):
+                top1_agree = float(
+                    np.mean(
+                        logits_f[clear_margin].argmax(axis=-1)
+                        == logits_x[clear_margin].argmax(axis=-1)
+                    )
+                )
+                assert top1_agree >= 0.98, f"bucket={bsz} top1_agree={top1_agree:.4f}"
 
     def test_logits_track_the_reference(self, checkpoint) -> None:
         directory, reference = checkpoint
