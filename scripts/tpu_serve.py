@@ -91,6 +91,10 @@ def main(argv=None) -> None:
             schedule_conservativeness=args.schedule_conservativeness,
         ),
     )
+    slabs = engine.cache_parent_capacity
+    group = engine.cache_layout.groups[0]
+    tokens = slabs * group.block_tokens * group.blocks_per_slab
+    print(f"[serve] kv pool: {slabs} slabs = {tokens} tokens", flush=True)
     warmup = getattr(runner, "benchmark_metadata", {}).get("warmup_seconds")
     ready = f"[serve] {spec.name} {args.workload} ready in {time.perf_counter() - started:.1f}s"
     if warmup is not None:
