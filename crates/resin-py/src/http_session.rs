@@ -405,7 +405,8 @@ impl Session {
             let Some(request) = self.active.get_mut(&request_id) else {
                 continue;
             };
-            if !tokens.is_empty() && request.first_token_at.is_none() {
+            let first_batch = !tokens.is_empty() && request.first_token_at.is_none();
+            if first_batch {
                 request.first_token_at = Some(Instant::now());
                 if let Some(metrics) = &self.metrics {
                     metrics.observe_first_token(request.started.elapsed().as_secs_f64());
@@ -491,6 +492,16 @@ impl Session {
                 Ok(events) => {
                     request.stream.events = events;
                     request.stream.scores = scores;
+                    // A first token that decodes to no text still has to reach
+                    // the client now: clients time the first chunk, not the
+                    // first character. Sent outside the stream buffer so
+                    // coalescing and score delivery are unchanged.
+                    if first_batch && request.stream.events.is_empty() {
+                        let _ = request.events.try_send(GenerationEvent::TextDelta {
+                            delta: String::new(),
+                            logprobs: Vec::new(),
+                        });
+                    }
                     !request
                         .stream
                         .ready(self.stream_interval, finished.is_some())
