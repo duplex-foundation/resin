@@ -94,7 +94,9 @@ generation cap. `schedule_conservativeness` scales that estimate:
 
 - larger values reserve more admission headroom and reduce retractions;
 - smaller values admit more concurrent work and may replay more often;
-- `1.0` is the default, while `0.0` is maximally aggressive.
+- `1.0` is the default, while `0.0` is maximally aggressive. The TPU presets
+  in `deploy/models.py` set `0.0`, and `scripts/tpu_serve.py` accepts
+  `--schedule-conservativeness` to override it. GPU presets keep `1.0`.
 
 The estimated new-token ratio begins at
 `min(0.7 * schedule_conservativeness, 1.0)`, decays during successful decode,

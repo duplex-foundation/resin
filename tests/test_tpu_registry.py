@@ -13,6 +13,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from deploy.models import (  # noqa: E402
     COMPILE_CACHE_ENV,
+    MODEL_SPECS,
     TPU_COMPILE_CACHE_DIR,
     TPU_WORKLOADS,
     create_recipe,
@@ -47,8 +48,14 @@ def test_workloads_are_the_published_server_shapes():
     assert spec.context_length == 9216
     assert spec.max_batch_size == 320
     assert spec.prefill_chunk_size == 4096
+    assert spec.schedule_conservativeness == 0.0
     assert spec.gpu_memory_utilization == 0.98
     assert spec.text_only is True
+    assert {
+        name
+        for name, other in MODEL_SPECS.items()
+        if other.schedule_conservativeness != 1.0
+    } == {"qwen3-32b"}
 
 
 def test_unpinned_tpu_host_refuses_before_jax_starts(monkeypatch):

@@ -132,7 +132,7 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 4096,
         "prefill_chunk_size": 4096,
-        "schedule_conservativeness": 1.0,
+        "schedule_conservativeness": 0.0,
     }
     assert seen["engine"]["context_length"] == 9216
     assert seen["engine"]["max_running_requests"] == 320

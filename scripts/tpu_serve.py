@@ -45,8 +45,8 @@ def main(argv=None) -> None:
     parser.add_argument(
         "--schedule-conservativeness",
         type=float,
-        default=1.0,
-        help="scales the admission reserve for future output tokens; lower admits more",
+        help="scales the admission reserve for future output tokens; lower admits "
+        "more; defaults to the preset's",
     )
     parser.add_argument(
         "--prefill-chunk-size",
@@ -62,6 +62,11 @@ def main(argv=None) -> None:
 
     spec = get_model(args.model)
     workload = TPU_WORKLOADS[args.workload]
+    conservativeness = (
+        spec.schedule_conservativeness
+        if args.schedule_conservativeness is None
+        else args.schedule_conservativeness
+    )
     chunk = (
         spec.prefill_chunk_size
         if args.prefill_chunk_size is None
@@ -88,7 +93,7 @@ def main(argv=None) -> None:
         scheduler_config=SchedulerConfig(
             max_batch_tokens=chunk,
             prefill_chunk_size=chunk,
-            schedule_conservativeness=args.schedule_conservativeness,
+            schedule_conservativeness=conservativeness,
         ),
     )
     slabs = engine.cache_parent_capacity
