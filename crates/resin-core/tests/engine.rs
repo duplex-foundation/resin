@@ -2515,7 +2515,10 @@ fn oversubscribed_multi_chunk_long_prompts_drain_without_livelock() {
 #[test]
 fn aggressive_conservativeness_zero_drains_multi_chunk_oversubscribed_queue() {
     let retracted = drain_oversubscribed_long_prompts(OVERSUBSCRIBED, 0.0);
-    assert!(retracted <= 16, "{retracted} retractions");
+    // The ratio decays back to 0 after each retraction, so sustained
+    // oversubscription retracts about twice as often as when it stayed raised
+    // (13 before, 30 after). The bound still catches a retraction storm.
+    assert!(retracted <= 32, "{retracted} retractions");
 }
 
 #[test]
@@ -2698,6 +2701,69 @@ fn running_retraction_keeps_waiting_rows_out_of_the_retry_and_raises_the_ratio()
     assert_eq!(engine.metrics_snapshot().unwrap().retracted_requests, 1);
     assert_eq!(before, 0.0);
     assert!(after > 0.0 && after < 0.8, "{after}");
+}
+
+/// Runs the engine until it is idle. Returns the step of the first running
+/// retraction, the ratio just before it, and the retractions in the burst.
+fn run_burst(
+    engine: &mut EngineCore<&'static str>,
+    model: &mut Model,
+    requests: Vec<Submission<&'static str>>,
+) -> (Option<usize>, f64, u64) {
+    let retracted_before = engine.metrics_snapshot().unwrap().retracted_requests;
+    for request in requests {
+        engine.submit(request).unwrap();
+    }
+    let mut first = None;
+    let mut ratio_before_first = f64::NAN;
+    let mut retracted = retracted_before;
+    for step in 0..2000 {
+        if !engine.has_work() {
+            break;
+        }
+        let ratio = engine.new_token_ratio();
+        let plan = engine.prepare_step(model, None).unwrap().unwrap();
+        let total = engine.metrics_snapshot().unwrap().retracted_requests;
+        if total > retracted && first.is_none() {
+            first = Some(step);
+            ratio_before_first = ratio;
+        }
+        retracted = total;
+        complete_with_next_tokens(engine, model, &plan);
+    }
+    assert!(!engine.has_work(), "the burst never finished");
+    (first, ratio_before_first, retracted - retracted_before)
+}
+
+#[test]
+fn zero_conservativeness_second_burst_behaves_like_the_first_after_a_retraction() {
+    // At conservativeness 0 the initial ratio, its floor and its decay step
+    // are all 0. A retraction raises the ratio, and it must still decay back
+    // to 0 so the next burst is admitted without the decode-headroom floor.
+    let mut engine = pressure_engine_with_context(40, 2, 512, 0.0, false);
+    engine.enable_metrics().unwrap();
+    let mut model = Model::default();
+    let burst = || vec![input(vec![1; 8], 100), input(vec![50; 8], 100)];
+
+    let (first_step, first_ratio, first_retractions) = run_burst(&mut engine, &mut model, burst());
+    assert!(first_retractions > 0, "the first burst must retract");
+    assert_eq!(first_ratio, 0.0);
+
+    // A solo request fits the pool, so these steps only decay the ratio.
+    for _ in 0..8 {
+        let (retracted_at, _, retractions) =
+            run_burst(&mut engine, &mut model, vec![input(vec![9; 8], 100)]);
+        assert_eq!((retracted_at, retractions), (None, 0));
+    }
+    assert_eq!(engine.new_token_ratio(), 0.0);
+
+    let (second_step, second_ratio, second_retractions) =
+        run_burst(&mut engine, &mut model, burst());
+    assert_eq!(second_ratio, 0.0);
+    assert_eq!(
+        (second_step, second_retractions),
+        (first_step, first_retractions)
+    );
 }
 
 #[test]

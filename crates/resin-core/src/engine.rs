@@ -2163,7 +2163,15 @@ impl<P: Clone> EngineCore<P> {
                 .min(1.0)
         };
         // A retraction only ever makes admission more conservative.
-        self.new_token_ratio = self.new_token_ratio.max(observed);
+        if observed > self.new_token_ratio {
+            self.new_token_ratio = observed;
+            if self.scheduler_config.initial_new_token_ratio() == 0.0 {
+                // The configured decay is 0 here, so derive one that returns
+                // the raised ratio to its floor over the usual number of steps.
+                self.new_token_ratio_decay = (self.new_token_ratio - self.minimum_new_token_ratio)
+                    / NEW_TOKEN_RATIO_DECAY_STEPS;
+            }
+        }
     }
 
     fn retract_one_matching(
