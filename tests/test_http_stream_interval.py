@@ -165,7 +165,7 @@ def assert_scores(events, expected_ids):
         [-(index + 1) / 10 for index in range(len(raw))]
     )
     for _, data in text_events(events):
-        assert score_bytes(data["logprobs"]) == data["delta"].encode()
+        assert score_bytes(data.get("logprobs", [])) == data["delta"].encode()
 
 
 @pytest.mark.parametrize(
@@ -229,6 +229,21 @@ def test_raw_only_flushes_never_consume_the_first_semantic_output():
                 )
             output.extend(step)
         assert_scores(output, recipe.ids)
+
+
+def test_silent_first_token_sends_one_empty_chunk_and_later_silent_tokens_none():
+    with session_case(["~"] * 2 + ["a"], 1, silent=("~",)) as (
+        session,
+        engine,
+        _,
+        _,
+    ):
+        session.admit(admission("silent", 3))
+        deltas = [
+            [data["delta"] for _, data in text_events(tick(session, engine))]
+            for _ in range(3)
+        ]
+        assert deltas == [[""], [], ["a"]]
 
 
 def test_native_session_rejects_zero_interval():

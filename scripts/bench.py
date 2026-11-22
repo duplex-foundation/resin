@@ -489,6 +489,7 @@ def _rank(
         scheduler_config=SchedulerConfig(
             max_batch_tokens=prefill_budget,
             prefill_chunk_size=options["prefill_chunk_size"],
+            schedule_conservativeness=spec.schedule_conservativeness,
         ),
     )
     worker = None if groups is None else DistributedWorker(observed, groups)

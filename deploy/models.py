@@ -63,6 +63,8 @@ class ModelSpec:
     context_length: int = 131_072
     max_batch_size: int = 128
     prefill_chunk_size: int = 4096
+    # Scales the admission reserve for future output tokens; 0 admits the most.
+    schedule_conservativeness: float = 1.0
     draft_tokens: int = 0
     gpu_memory_utilization: float = 0.9
     expert_backend: str = "flashinfer"
@@ -404,6 +406,7 @@ MODEL_SPECS.update(
             context_length=9216,
             max_batch_size=320,
             prefill_chunk_size=4096,
+            schedule_conservativeness=0.0,
             draft_tokens=0,
             gpu_memory_utilization=0.98,
             expert_backend="none",

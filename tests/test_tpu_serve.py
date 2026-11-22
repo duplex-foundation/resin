@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -81,6 +81,10 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
 
     class Engine:
         closed = False
+        cache_parent_capacity = 4868
+        cache_layout = SimpleNamespace(
+            groups=(SimpleNamespace(block_tokens=256, blocks_per_slab=1),)
+        )
 
         def __init__(self, runner, **kwargs):
             seen["engine"] = kwargs
@@ -128,12 +132,14 @@ def test_serve_builds_the_workload_and_keeps_prefix_cache(
     assert seen["engine"]["scheduler_config"] == {
         "max_batch_tokens": 4096,
         "prefill_chunk_size": 4096,
-        "schedule_conservativeness": 1.0,
+        "schedule_conservativeness": 0.0,
     }
     assert seen["engine"]["context_length"] == 9216
     assert seen["engine"]["max_running_requests"] == 320
     assert seen["serve"] == ("127.0.0.1", 9)
-    assert "warmup 1.5s" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "[serve] kv pool: 4868 slabs = 1246208 tokens" in out
+    assert "warmup 1.5s" in out
     assert os.environ["JAX_COMPILATION_CACHE_DIR"]
     with pytest.raises(SystemExit):
         tpu_serve.main(["--model", "qwen3-32b", "--checkpoint", str(checkpoint)])
@@ -148,6 +154,10 @@ def test_serve_flags_override_the_chunk_and_conservativeness(monkeypatch, tmp_pa
 
     class Engine:
         closed = False
+        cache_parent_capacity = 4868
+        cache_layout = SimpleNamespace(
+            groups=(SimpleNamespace(block_tokens=256, blocks_per_slab=1),)
+        )
 
         def __init__(self, runner, **kwargs):
             seen["engine"] = kwargs
