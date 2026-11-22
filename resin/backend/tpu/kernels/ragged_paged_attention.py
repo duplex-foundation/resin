@@ -42,6 +42,7 @@ from resin.backend.tpu.kernels._rpa_v3_pallas import (
     cdiv,
     generate_batched_decode_schedule,
     generate_batched_mixed_schedule,
+    generate_switched_batched_decode_schedule,
     get_dtype_packing,
     get_tpu_version,
     has_bank_conflicts,
@@ -953,23 +954,16 @@ def _batched_decode_vmem_estimate_bytes(
     )
 
 
-def _batched_decode_candidates(
-    max_num_seqs: int, horizon_kv: int
-) -> tuple[tuple[int, int], ...]:
-    small_batch = ((8, 512), (8, 256), (4, 512), (4, 256))
-    if max_num_seqs <= 8 or (max_num_seqs <= 16 and horizon_kv <= 4096):
-        return small_batch
-    if max_num_seqs <= 16:
-        return ((16, 512), *small_batch)
-    long_kv = ((8, 1280),) if horizon_kv > 4096 and max_num_seqs >= 32 else ()
-    return (
-        *long_kv,
-        (16, 512),
-        *small_batch,
-    )
+_BATCHED_DECODE_SMALL_BATCH_CANDIDATES: tuple[tuple[int, int], ...] = (
+    (8, 512),
+    (8, 256),
+    (4, 512),
+    (4, 256),
+)
+_BATCHED_DECODE_SHORT_KV_CEILING = 4096
 
 
-def _select_batched_decode_config(
+def _select_batched_decode_configs(
     q_dtype: Any,
     kv_dtype: Any,
     actual_num_q_heads: int,
@@ -979,6 +973,7 @@ def _select_batched_decode_config(
     pages_per_seq: int,
     max_num_seqs: int,
     *,
+    allow_below_min_seqs: bool = False,
     sm_scale: float = 1.0,
     mask_value: float = _DEFAULT_MASK_VALUE,
     sliding_window: int | None = None,
@@ -995,21 +990,7 @@ def _select_batched_decode_config(
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
     interpret_mode: bool = False,
-) -> BatchedDecodeConfig | None:
-    if page_size <= 0 or pages_per_seq <= 0 or max_num_seqs <= 0:
-        return None
-    version = get_tpu_version() if tpu_version is None else tpu_version
-    eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
-
-    horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
-    min_unit = math.lcm(page_size, 128)
-    max_useful_bkv = max(256, min_unit, align_to(horizon_kv, min_unit))
-    q_per_kv = actual_num_q_heads // actual_num_kv_heads
-    q_dt_name = jnp.dtype(q_dtype).name
-    kv_dt_name = jnp.dtype(kv_dtype).name
-    kv_itemsize = jnp.dtype(kv_dtype).itemsize
-    aligned_hd = align_to(head_dim, 128)
-
+) -> tuple[BatchedDecodeConfig, ...]:
     env_bsz = os.environ.get("RESIN_TPU_BATCHED_DECODE_BATCH_SIZE")
     env_bkv = os.environ.get("RESIN_TPU_BATCHED_DECODE_BKV_SZ")
     if bool(env_bsz) != bool(env_bkv):
@@ -1023,17 +1004,36 @@ def _select_batched_decode_config(
         bsz_ov, bkv_ov = int(env_bsz), int(env_bkv)
         if bsz_ov <= 0 or bkv_ov <= 0:
             raise ValueError(f"invalid batched decode override: ({bsz_ov}, {bkv_ov})")
-        candidates: tuple[tuple[int, int], ...] = ((bsz_ov, bkv_ov),)
-        vmem_budget = int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
-    else:
-        candidates = _batched_decode_candidates(max_num_seqs, horizon_kv)
-        vmem_budget = int(eff_vmem * _BATCHED_DECODE_SELECT_VMEM_FRACTION)
 
-    for batch_size, bkv_sz in candidates:
+    if page_size <= 0 or pages_per_seq <= 0 or max_num_seqs <= 0:
+        return ()
+    if not allow_below_min_seqs and max_num_seqs < _BATCHED_DECODE_MIN_SEQS:
+        return ()
+
+    version = get_tpu_version() if tpu_version is None else tpu_version
+    eff_vmem = _effective_vmem_limit(version, tpu_version, vmem_limit_bytes)
+
+    horizon_kv = _decode_horizon_kv(page_size, pages_per_seq, sliding_window)
+    eff_horizon_kv = (
+        min(horizon_kv, sliding_window) if sliding_window is not None else horizon_kv
+    )
+    min_unit = math.lcm(page_size, 128)
+    max_useful_bkv = max(256, min_unit, align_to(horizon_kv, min_unit))
+    q_per_kv = actual_num_q_heads // actual_num_kv_heads
+    q_dt_name = jnp.dtype(q_dtype).name
+    kv_dt_name = jnp.dtype(kv_dtype).name
+    kv_itemsize = jnp.dtype(kv_dtype).itemsize
+    aligned_hd = align_to(head_dim, 128)
+    select_budget = int(eff_vmem * _BATCHED_DECODE_SELECT_VMEM_FRACTION)
+    override_budget = int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
+
+    def _make_cfg(
+        batch_size: int, bkv_sz: int, *, allow_long_fp8_budget: bool
+    ) -> BatchedDecodeConfig | None:
         if bkv_sz < min_unit or bkv_sz % min_unit != 0:
-            continue
+            return None
         if not has_env_override and bkv_sz > max_useful_bkv:
-            continue
+            return None
         est_bytes = _batched_decode_vmem_estimate_bytes(
             actual_num_kv_heads,
             q_per_kv,
@@ -1046,17 +1046,19 @@ def _select_batched_decode_config(
             bf16_online_scratch=bf16_online_scratch,
         )
         cand_budget = (
-            int(eff_vmem * _BATCHED_DECODE_VMEM_FRACTION)
-            if not has_env_override
-            and (batch_size, bkv_sz) == (8, 1280)
-            and horizon_kv > 4096
-            and max_num_seqs >= 32
-            and kv_itemsize == 1
-            and actual_num_kv_heads * aligned_hd <= 512
-            else vmem_budget
+            override_budget
+            if has_env_override
+            or (
+                allow_long_fp8_budget
+                and (batch_size, bkv_sz) == (8, 1280)
+                and max_num_seqs >= 32
+                and kv_itemsize == 1
+                and actual_num_kv_heads * aligned_hd <= 512
+            )
+            else select_budget
         )
         if est_bytes > cand_budget:
-            continue
+            return None
         scoped_vmem = min(
             eff_vmem,
             max(
@@ -1098,14 +1100,113 @@ def _select_batched_decode_config(
             max_num_seqs >= 32
             and cfg.max_steps_ub < _BATCHED_DECODE_MIN_HIGH_BATCH_STEPS_UB
         ):
-            continue
+            return None
         return cfg
+
     if has_env_override:
-        raise ValueError(
-            f"batched decode override ({bsz_ov}, {bkv_ov}) rejected for "
-            f"max_num_seqs={max_num_seqs}, min_unit={min_unit}, vmem_budget={vmem_budget}"
+        cfg_ov = _make_cfg(bsz_ov, bkv_ov, allow_long_fp8_budget=False)
+        if cfg_ov is None:
+            raise ValueError(
+                f"batched decode override ({bsz_ov}, {bkv_ov}) rejected for "
+                f"max_num_seqs={max_num_seqs}, min_unit={min_unit}, "
+                f"vmem_budget={override_budget}"
+            )
+        return (cfg_ov,)
+
+    if max_num_seqs <= 16:
+        for batch_size, bkv_sz in _BATCHED_DECODE_SMALL_BATCH_CANDIDATES:
+            cfg = _make_cfg(batch_size, bkv_sz, allow_long_fp8_budget=False)
+            if cfg is not None:
+                return (cfg,)
+        return ()
+
+    if eff_horizon_kv > 1280:
+        cfg_long = _make_cfg(8, 1280, allow_long_fp8_budget=True)
+        cfg_short = _make_cfg(16, 512, allow_long_fp8_budget=False)
+        if cfg_long is not None and cfg_short is not None:
+            return (cfg_long, cfg_short)
+
+    allow_long = (
+        eff_horizon_kv > _BATCHED_DECODE_SHORT_KV_CEILING
+        or 1024 < eff_horizon_kv <= 1280
+    )
+    fallback_candidates = (
+        *(((8, 1280),) if eff_horizon_kv > 1024 else ()),
+        (16, 512),
+        *_BATCHED_DECODE_SMALL_BATCH_CANDIDATES,
+    )
+    for batch_size, bkv_sz in fallback_candidates:
+        cfg = _make_cfg(batch_size, bkv_sz, allow_long_fp8_budget=allow_long)
+        if cfg is not None:
+            return (cfg,)
+    return ()
+
+
+def _select_batched_decode_config(
+    q_dtype: Any,
+    kv_dtype: Any,
+    actual_num_q_heads: int,
+    actual_num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pages_per_seq: int,
+    max_num_seqs: int,
+    **kwargs: Any,
+) -> BatchedDecodeConfig | None:
+    cfgs = _select_batched_decode_configs(
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+        page_size,
+        pages_per_seq,
+        max_num_seqs,
+        allow_below_min_seqs=True,
+        **kwargs,
+    )
+    return cfgs[0] if cfgs else None
+
+
+def _batched_decode_branch_idx(
+    kv_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    cfg_long: BatchedDecodeConfig,
+    cfg_short: BatchedDecodeConfig,
+    sliding_window: int | None = None,
+) -> jax.Array:
+    """Return 0 when decode is inactive, 1 for cfg_long, or 2 for cfg_short."""
+    max_num_seqs = kv_lens.shape[0]
+    num_decode = distribution[0]
+    active = (jnp.arange(max_num_seqs, dtype=jnp.int32) < num_decode) & (kv_lens > 0)
+    eff_kv = jnp.where(active, kv_lens, 0)
+    eff_attended = (
+        eff_kv if sliding_window is None else jnp.minimum(eff_kv, sliding_window)
+    )
+    sw_start = 0 if sliding_window is None else jnp.maximum(0, eff_kv - sliding_window)
+
+    def _steps(cfg: BatchedDecodeConfig) -> jax.Array:
+        return cdiv(
+            jnp.sum(cdiv(eff_kv, cfg.bkv_sz) - (sw_start // cfg.bkv_sz)),
+            cfg.batch_size,
         )
-    return None
+
+    steps_long = _steps(cfg_long)
+    steps_short = _steps(cfg_short)
+    below_hbm_ceiling = jnp.sum(eff_attended) <= (
+        _BATCHED_DECODE_SHORT_KV_CEILING * jnp.maximum(num_decode, 1)
+    )
+    use_short = (
+        (10 * steps_short < 11 * steps_long)
+        & (steps_short <= cfg_short.max_steps_ub)
+        & below_hbm_ceiling
+    )
+    return jnp.where(
+        num_decode <= 0,
+        jnp.int32(0),
+        jnp.where(use_short, jnp.int32(2), jnp.int32(1)),
+    )
 
 
 def _batched_mixed_vmem_estimate_bytes(
@@ -1615,7 +1716,7 @@ def ragged_paged_attention(
         if use_batched_decode is None
         else use_batched_decode
     )
-    batched_cfgs: BatchedDecodeConfig | None = None
+    batched_cfgs: tuple[BatchedDecodeConfig, ...] = ()
     if try_batched_decode:
         assert vmem_limit_bytes is not None
         smem_bytes = (
@@ -1644,22 +1745,24 @@ def ragged_paged_attention(
                 raise ValueError(
                     f"batched decode requires bq_sz == bq_csz == 1, got {d_block_sizes=}"
                 )
-            batched_cfgs = BatchedDecodeConfig(
-                batch_size=_BATCHED_DECODE_DEFAULT_BATCH_SIZE,
-                bkv_sz=d_block_sizes[1],
-                page_size=page_size,
-                pages_per_seq=pages_per_seq,
-                max_num_seqs=max_num_seqs,
-                num_q_heads=eff_q_heads,
-                num_kv_heads=actual_num_kv_heads,
-                head_dim=eff_head_dim,
-                q_dtype_name=jnp.dtype(q.dtype).name,
-                kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
-                vmem_limit_bytes=vmem_limit_bytes,
-                **decode_common,
+            batched_cfgs = (
+                BatchedDecodeConfig(
+                    batch_size=_BATCHED_DECODE_DEFAULT_BATCH_SIZE,
+                    bkv_sz=d_block_sizes[1],
+                    page_size=page_size,
+                    pages_per_seq=pages_per_seq,
+                    max_num_seqs=max_num_seqs,
+                    num_q_heads=eff_q_heads,
+                    num_kv_heads=actual_num_kv_heads,
+                    head_dim=eff_head_dim,
+                    q_dtype_name=jnp.dtype(q.dtype).name,
+                    kv_dtype_name=jnp.dtype(kv_cache.dtype).name,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    **decode_common,
+                ),
             )
         else:
-            batched_cfgs = _select_batched_decode_config(
+            batched_cfgs = _select_batched_decode_configs(
                 q.dtype,
                 kv_cache.dtype,
                 eff_q_heads,
@@ -1668,23 +1771,25 @@ def ragged_paged_attention(
                 page_size,
                 pages_per_seq,
                 max_num_seqs,
+                allow_below_min_seqs=bool(use_batched_decode),
                 tpu_version=tpu_version,
                 vmem_limit_bytes=vmem_limit_bytes,
                 **decode_common,
             )
-            if batched_cfgs is None and use_batched_decode is True:
+            if not batched_cfgs and use_batched_decode is True:
                 raise ValueError(
                     "no batched decode config fits VMEM and alignment constraints"
                 )
 
-    if batched_cfgs is not None:
+    if len(batched_cfgs) == 1:
+        single_cfg = batched_cfgs[0]
         # Emit schedule generation outside lax.cond so XLA CSE shares one
         # schedule call across all layers of the forward step.
         decode_schedule = generate_batched_decode_schedule(
             kv_lens,
             cu_q_lens,
             distribution,
-            cfgs=batched_cfgs,
+            cfgs=single_cfg,
         )
         q, kv_cache = jax.lax.cond(
             distribution[0] > 0,
@@ -1695,10 +1800,47 @@ def ragged_paged_attention(
                 args[0],
                 kv,
                 args[1],
-                cfgs=batched_cfgs,
+                cfgs=single_cfg,
                 tpu_version=tpu_version,
             ),
             lambda args: args,
+            (q, kv_cache),
+        )
+    elif len(batched_cfgs) == 2:
+        cfg_long, cfg_short = batched_cfgs
+        branch_idx = _batched_decode_branch_idx(
+            kv_lens,
+            distribution,
+            cfg_long=cfg_long,
+            cfg_short=cfg_short,
+            sliding_window=sliding_window,
+        )
+        sched_long, sched_short = generate_switched_batched_decode_schedule(
+            branch_idx,
+            kv_lens,
+            cu_q_lens,
+            distribution,
+            cfg_long=cfg_long,
+            cfg_short=cfg_short,
+        )
+        q, kv_cache = jax.lax.switch(
+            branch_idx,
+            (
+                lambda args: args,
+                *(
+                    lambda args, _s=sched, _c=cfg: run_batched_decode_rpa(
+                        kv_lens,
+                        page_indices,
+                        _s,
+                        args[0],
+                        kv,
+                        args[1],
+                        cfgs=_c,
+                        tpu_version=tpu_version,
+                    )
+                    for sched, cfg in ((sched_long, cfg_long), (sched_short, cfg_short))
+                ),
+            ),
             (q, kv_cache),
         )
     else:
