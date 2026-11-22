@@ -362,7 +362,7 @@ class TestFp8Weights:
             vocab_size=1024,
             hidden_size=5120,
             intermediate_size=25600,
-            num_hidden_layers=2,
+            num_hidden_layers=3,
             num_attention_heads=64,
             num_key_value_heads=8,
             head_dim=128,
@@ -399,7 +399,7 @@ class TestFp8Weights:
         )
         params = Qwen3Params(
             embed=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=rep),
-            layers=(lp, lp),
+            layers=(lp, lp, lp),
             norm=jax.ShapeDtypeStruct((5120,), jnp.bfloat16, sharding=rep),
             lm_head=jax.ShapeDtypeStruct((1024, 5120), jnp.bfloat16, sharding=col),
             rope_cache=(
@@ -407,17 +407,11 @@ class TestFp8Weights:
                 jax.ShapeDtypeStruct((4096, 128), jnp.float32, sharding=rep),
             ),
         )
-        spec = KvCacheSpec(2, 8, 128, 256, jnp.float8_e4m3fn)
-        caches = (
-            (
-                jax.ShapeDtypeStruct(
-                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
-                ),
-                jax.ShapeDtypeStruct(
-                    (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
-                ),
-            ),
+        spec = KvCacheSpec(3, 8, 128, 256, jnp.float8_e4m3fn)
+        kv_sds = jax.ShapeDtypeStruct(
+            (64, *spec.page_shape(2)), jnp.float8_e4m3fn, sharding=cache_sh
         )
+        caches = ((kv_sds, kv_sds, kv_sds),)
 
         def _iter_outer_eqns(jaxpr_obj):
             jaxpr = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
@@ -452,6 +446,10 @@ class TestFp8Weights:
             ),
             mock.patch(
                 "resin.backend.tpu.kernels.fp8_matmul.get_tpu_version", return_value=7
+            ),
+            mock.patch(
+                "resin.backend.tpu.kernels.collective_fp8_matmul.get_tpu_version",
+                return_value=7,
             ),
             mock.patch(
                 "resin.backend.tpu.kernels.ragged_paged_attention.get_tpu_version",
@@ -514,14 +512,79 @@ class TestFp8Weights:
                 )
                 assert sync_prims.count("pmax") == 2 * cfg.num_hidden_layers
 
-            for exp_tokens in (1024, 4096):
+            scoped_vmem_re = re.compile(r"size\\22:\s*([0-9]+)")
+            hbm_colors = (
+                r"\22output_memory_space_colors\22: "
+                r"[{\22color\22:0,\22shape_index\22:[0]},{\22color\22:0,\22shape_index\22:[1]}]"
+            )
+            for exp_tokens in (1024, 2048, 4096):
                 mlir_txt = export.export(
                     jax.jit(per_die_model.hidden_states, donate_argnums=(1,)),
                     platforms=["tpu"],
                 )(params, caches, _inp(exp_tokens)).mlir_module()
                 assert "qkv_norm_rope_pack_512_32_4" in mlir_txt
                 assert "unpack_attn_fp8_quant_512_4096" in mlir_txt
-                assert "fused_add_rms_norm_fp8_quant_256_5120" in mlir_txt
+                if exp_tokens == 1024:
+                    assert "fused_add_rms_norm_fp8_quant_256_5120" in mlir_txt
+                    assert "stablehlo.reduce_scatter" in mlir_txt
+                else:
+                    assert "fused_add2_rms_norm_fp8_quant_256_5120" in mlir_txt
+                    assert "fp8_w8a8_async_rs_1024_1280_4096" in mlir_txt
+                    assert "fp8_w8a8_async_rs_1024_2560_2560" in mlir_txt
+                    assert "stablehlo.reduce_scatter" not in mlir_txt
+                    custom_lines = [
+                        ln for ln in mlir_txt.splitlines() if "tpu_custom_call" in ln
+                    ]
+                    async_rs_lines = [
+                        ln
+                        for ln in custom_lines
+                        if 'kernel_name = "fp8_w8a8_async_rs_' in ln
+                    ]
+                    add2_lines = [
+                        ln
+                        for ln in custom_lines
+                        if 'kernel_name = "fused_add2_rms_norm_fp8_quant_' in ln
+                    ]
+                    fp8_lines = [
+                        ln for ln in custom_lines if 'kernel_name = "fp8_' in ln
+                    ]
+                    assert len(async_rs_lines) == 2 * cfg.num_hidden_layers
+                    assert len(add2_lines) == 2 * cfg.num_hidden_layers - 1
+                    assert all(hbm_colors in ln for ln in async_rs_lines)
+                    assert all(
+                        int(m.group(1)) <= 48 * 1024**2
+                        for ln in fp8_lines
+                        if (m := scoped_vmem_re.search(ln))
+                    )
+                    assert all(
+                        int(m.group(1)) <= 32 * 1024**2
+                        for ln in add2_lines
+                        if (m := scoped_vmem_re.search(ln))
+                    )
+                    assert (
+                        sum(
+                            1
+                            for ln in mlir_txt.splitlines()
+                            if "stablehlo.slice" in ln and "bf16>" in ln
+                        )
+                        == 1
+                    )
+
+            no_async_rs_model = Qwen3Model(
+                cfg,
+                mesh,
+                jnp.float8_e4m3fn,
+                page_tokens=256,
+                prefill_sp_async_rs=False,
+                impl=ragged_paged_attention,
+            )
+            no_async_rs_mlir = export.export(
+                jax.jit(no_async_rs_model.hidden_states, donate_argnums=(1,)),
+                platforms=["tpu"],
+            )(params, caches, _inp(4096)).mlir_module()
+            assert "fused_add_rms_norm_fp8_quant_256_5120" in no_async_rs_mlir
+            assert "fp8_w8a8_async_rs_" not in no_async_rs_mlir
+            assert "stablehlo.reduce_scatter" in no_async_rs_mlir
 
             dec_sync_prims = [
                 e.primitive.name
@@ -787,8 +850,10 @@ class TestFp8Weights:
                     elif mode == "auto" and tokens == 4096:
                         assert "fp8_gate_up_swiglu_1024_1280_5120" in mlir_txt
                         assert "fp8_w8a8_matmul_1024_1280_5120" in mlir_txt
-                        assert "fp8_w8a8_matmul_1024_1280_4096" in mlir_txt
-                        assert "fp8_w8a8_matmul_1024_2560_2560" in mlir_txt
+                        assert "fp8_w8a8_async_rs_1024_1280_4096" in mlir_txt
+                        assert "fp8_w8a8_async_rs_1024_2560_2560" in mlir_txt
+                        assert "fused_add2_rms_norm_fp8_quant_256_5120" in mlir_txt
+                        assert "stablehlo.reduce_scatter" not in mlir_txt
 
     def test_decode_matmul_modes_tp2_vs_tp1_parity_and_zero_pmax(
         self, tmp_path

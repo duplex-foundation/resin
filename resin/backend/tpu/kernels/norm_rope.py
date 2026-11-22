@@ -109,6 +109,37 @@ def _fused_add_rms_norm_fp8_pallas_kernel(
     scale_t_ref[...] = jnp.transpose(scale)
 
 
+def _fused_add2_rms_norm_fp8_pallas_kernel(
+    x_a_ref,
+    x_b_ref,
+    res_ref,
+    w_ref,
+    x_q_ref,
+    scale_t_ref,
+    next_res_ref,
+    *,
+    eps: float,
+    bound: float,
+) -> None:
+    rs_bf16 = (
+        x_a_ref[...].astype(jnp.float32) + x_b_ref[...].astype(jnp.float32)
+    ).astype(x_a_ref.dtype)
+    next_res = (rs_bf16.astype(jnp.float32) + res_ref[...].astype(jnp.float32)).astype(
+        x_a_ref.dtype
+    )
+    next_res_ref[...] = next_res
+    x_f32 = next_res.astype(jnp.float32)
+    var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
+    normed = (x_f32 * jax.lax.rsqrt(var + eps) * w_ref[...].astype(jnp.float32)).astype(
+        x_a_ref.dtype
+    )
+    normed_f32 = normed.astype(jnp.float32)
+    absmax = jnp.max(jnp.abs(normed_f32), axis=-1, keepdims=True)
+    scale = safe_fp8_scale(absmax, bound)
+    x_q_ref[...] = jnp.clip(normed_f32 / scale, -bound, bound).astype(x_q_ref.dtype)
+    scale_t_ref[...] = jnp.transpose(scale)
+
+
 def _pallas_vmem_limit_bytes(*, interpret: bool, need_48m: bool = False) -> int | None:
     if interpret:
         return None
@@ -118,6 +149,37 @@ def _pallas_vmem_limit_bytes(*, interpret: bool, need_48m: bool = False) -> int 
     return 32 * 1024 * 1024 if tpu_ver >= 6 else None
 
 
+def _validate_norm_pair_args(
+    x: jax.Array,
+    residual: jax.Array | None,
+    extra_x: jax.Array | None,
+    x_pair_index: int | None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    k_dim = x.shape[-1]
+    if extra_x is not None and residual is None:
+        raise ValueError("extra_x requires residual is not None")
+    if x_pair_index is not None:
+        if x_pair_index not in (0, 1):
+            raise ValueError(f"Expected x_pair_index in (0, 1), got {x_pair_index}")
+        if x.ndim < 3 or x.shape[0] != 2:
+            raise ValueError(
+                f"Expected x with leading pair axis 2 when x_pair_index is set, got {x.shape=}"
+            )
+        leading = x.shape[1:-1]
+    else:
+        leading = x.shape[:-1]
+    expected_shape = (*leading, k_dim)
+    if residual is not None and residual.shape != expected_shape:
+        raise ValueError(
+            f"Expected residual shape {expected_shape}, got {residual.shape}"
+        )
+    if extra_x is not None and extra_x.shape != expected_shape:
+        raise ValueError(
+            f"Expected extra_x shape {expected_shape}, got {extra_x.shape}"
+        )
+    return leading, expected_shape
+
+
 @overload
 def pallas_rms_norm_fp8_quant(
     x: jax.Array,
@@ -125,9 +187,11 @@ def pallas_rms_norm_fp8_quant(
     eps: float = 1e-6,
     *,
     residual: None = None,
+    extra_x: None = None,
+    x_pair_index: int | None = None,
     dtype: Any = jnp.float8_e4m3fn,
     transposed_scale: bool = False,
-    interpret: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
 ) -> tuple[jax.Array, jax.Array]: ...
 
 
@@ -138,9 +202,11 @@ def pallas_rms_norm_fp8_quant(
     eps: float = 1e-6,
     *,
     residual: jax.Array,
+    extra_x: jax.Array | None = None,
+    x_pair_index: int | None = None,
     dtype: Any = jnp.float8_e4m3fn,
     transposed_scale: bool = False,
-    interpret: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
 
 
@@ -150,24 +216,37 @@ def pallas_rms_norm_fp8_quant(
     eps: float = 1e-6,
     *,
     residual: jax.Array | None = None,
+    extra_x: jax.Array | None = None,
+    x_pair_index: int | None = None,
     dtype: Any = jnp.float8_e4m3fn,
     transposed_scale: bool = False,
-    interpret: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Single-pass Pallas VMEM kernel fusing optional residual add, RMSNorm, and FP8 quant."""
     target = jnp.dtype(dtype)
     bound = float(jnp.finfo(target).max)
-    leading = x.shape[:-1]
     k_dim = x.shape[-1]
     if k_dim % 128 != 0:
         raise ValueError(f"Pallas RMSNorm+FP8 requires K divisible by 128, got {k_dim}")
-    if residual is not None and residual.shape != x.shape:
-        raise ValueError(f"Expected residual shape {x.shape}, got {residual.shape}")
+    leading, _ = _validate_norm_pair_args(x, residual, extra_x, x_pair_index)
+    is_interpret = bool(interpret)
+    interpret_arg: bool | pltpu.InterpretParams = (
+        interpret
+        if isinstance(interpret, pltpu.InterpretParams)
+        else (pltpu.InterpretParams() if interpret else False)
+    )
 
-    x_2d = x if x.ndim == 2 else x.reshape(-1, k_dim)
-    orig_batch = x_2d.shape[0]
+    if x_pair_index is not None:
+        x_arg = x if x.ndim == 3 else x.reshape(2, -1, k_dim)
+        orig_batch = x_arg.shape[1]
+    else:
+        x_arg = x if x.ndim == 2 else x.reshape(-1, k_dim)
+        orig_batch = x_arg.shape[0]
+
     if residual is not None:
-        max_block = 128 if k_dim > 8192 else (256 if k_dim >= 4096 else 512)
+        hi_thresh = 6144 if extra_x is not None else 8192
+        mid_thresh = 2048 if extra_x is not None else 4096
+        max_block = 128 if k_dim > hi_thresh else (256 if k_dim >= mid_thresh else 512)
     else:
         max_block = 512 if k_dim <= 8192 else 256
     single_tile_cap = 320 if k_dim <= 6144 else min(256, max_block)
@@ -178,7 +257,12 @@ def pallas_rms_norm_fp8_quant(
     )
     padded_batch = align_to(orig_batch, batch_block)
     if orig_batch < padded_batch:
-        x_2d = jnp.pad(x_2d, ((0, padded_batch - orig_batch), (0, 0)))
+        pad_spec = (
+            ((0, 0), (0, padded_batch - orig_batch), (0, 0))
+            if x_pair_index is not None
+            else ((0, padded_batch - orig_batch), (0, 0))
+        )
+        x_arg = jnp.pad(x_arg, pad_spec)
 
     w_2d = (
         jnp.ones((1, k_dim), dtype=jnp.float32)
@@ -187,7 +271,16 @@ def pallas_rms_norm_fp8_quant(
     )
     n_batch = padded_batch // batch_block
     b_idx = (lambda _b: 0) if n_batch == 1 else (lambda b: b)
-    vmem_limit_bytes = _pallas_vmem_limit_bytes(interpret=interpret)
+    vmem_limit_bytes = _pallas_vmem_limit_bytes(interpret=is_interpret)
+    out_is_2d = len(leading) == 1
+    x_in_spec = (
+        pl.BlockSpec(
+            (None, batch_block, k_dim),
+            lambda b, _idx=x_pair_index: (_idx, b_idx(b), 0),
+        )
+        if x_pair_index is not None
+        else pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0))
+    )
 
     if residual is None:
         kernel = pl.pallas_call(
@@ -195,7 +288,7 @@ def pallas_rms_norm_fp8_quant(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
-                    pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
+                    x_in_spec,
                     pl.BlockSpec((1, k_dim), lambda _b: (0, 0)),
                 ],
                 out_specs=[
@@ -212,16 +305,16 @@ def pallas_rms_norm_fp8_quant(
                 dimension_semantics=("parallel",),
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
-            interpret=pltpu.InterpretParams() if interpret else False,
+            interpret=interpret_arg,
             name=f"rms_norm_fp8_quant_{batch_block}_{k_dim}",
         )
-        x_q, scale_t = kernel(x_2d, w_2d)
+        x_q, scale_t = kernel(x_arg, w_2d)
         if orig_batch < padded_batch:
             x_q = x_q[:orig_batch]
             scale_t = scale_t[:, :orig_batch]
         scale_out = scale_t if transposed_scale else scale_t.reshape(*leading, 1)
         return (
-            x_q if x.ndim == 2 else x_q.reshape(*leading, k_dim),
+            x_q if out_is_2d else x_q.reshape(*leading, k_dim),
             scale_out,
         )
 
@@ -231,19 +324,33 @@ def pallas_rms_norm_fp8_quant(
     if orig_batch < padded_batch:
         res_2d = jnp.pad(res_2d, ((0, padded_batch - orig_batch), (0, 0)))
 
+    res_spec = pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0))
+    w_spec = pl.BlockSpec((1, k_dim), lambda _b: (0, 0))
+    if extra_x is not None:
+        extra_2d = extra_x.astype(x.dtype)
+        if extra_2d.ndim != 2:
+            extra_2d = extra_2d.reshape(-1, k_dim)
+        if orig_batch < padded_batch:
+            extra_2d = jnp.pad(extra_2d, ((0, padded_batch - orig_batch), (0, 0)))
+        body_fn = _fused_add2_rms_norm_fp8_pallas_kernel
+        in_specs = [x_in_spec, res_spec, res_spec, w_spec]
+        call_args: tuple[jax.Array, ...] = (x_arg, extra_2d, res_2d, w_2d)
+        kernel_tag = "fused_add2_rms_norm_fp8_quant"
+    else:
+        body_fn = _fused_add_rms_norm_fp8_pallas_kernel
+        in_specs = [x_in_spec, res_spec, w_spec]
+        call_args = (x_arg, res_2d, w_2d)
+        kernel_tag = "fused_add_rms_norm_fp8_quant"
+
     fused_kernel = pl.pallas_call(
-        functools.partial(_fused_add_rms_norm_fp8_pallas_kernel, eps=eps, bound=bound),
+        functools.partial(body_fn, eps=eps, bound=bound),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
-                pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
-                pl.BlockSpec((1, k_dim), lambda _b: (0, 0)),
-            ],
+            in_specs=in_specs,
             out_specs=[
-                pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
+                res_spec,
                 pl.BlockSpec((1, batch_block), lambda b: (0, b_idx(b))),
-                pl.BlockSpec((batch_block, k_dim), lambda b: (b_idx(b), 0)),
+                res_spec,
             ],
             grid=(n_batch,),
         ),
@@ -256,19 +363,19 @@ def pallas_rms_norm_fp8_quant(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=vmem_limit_bytes,
         ),
-        interpret=pltpu.InterpretParams() if interpret else False,
-        name=f"fused_add_rms_norm_fp8_quant_{batch_block}_{k_dim}",
+        interpret=interpret_arg,
+        name=f"{kernel_tag}_{batch_block}_{k_dim}",
     )
-    x_q, scale_t, next_res = fused_kernel(x_2d, res_2d, w_2d)
+    x_q, scale_t, next_res = fused_kernel(*call_args)
     if orig_batch < padded_batch:
         x_q = x_q[:orig_batch]
         scale_t = scale_t[:, :orig_batch]
         next_res = next_res[:orig_batch]
     scale_out = scale_t if transposed_scale else scale_t.reshape(*leading, 1)
     return (
-        x_q if x.ndim == 2 else x_q.reshape(*leading, k_dim),
+        x_q if out_is_2d else x_q.reshape(*leading, k_dim),
         scale_out,
-        next_res if x.ndim == 2 else next_res.reshape(*leading, k_dim),
+        next_res if out_is_2d else next_res.reshape(*leading, k_dim),
     )
 
 
@@ -303,22 +410,35 @@ def fused_add_rms_norm_fp8_quant(
     weight: jax.Array | None = None,
     eps: float = 1e-6,
     *,
+    extra_x: jax.Array | None = None,
+    x_pair_index: int | None = None,
     dtype: Any = jnp.float8_e4m3fn,
     transposed_scale: bool = False,
-    interpret: bool = False,
+    interpret: bool | pltpu.InterpretParams = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Fuse residual add, RMSNorm, and dynamic per-token FP8 quantization."""
-    if x.shape[-1] % 128 == 0 and (interpret or get_tpu_version() >= 6):
+    _validate_norm_pair_args(x, residual, extra_x, x_pair_index)
+    if x.shape[-1] % 128 == 0 and (bool(interpret) or get_tpu_version() >= 6):
         return pallas_rms_norm_fp8_quant(
             x,
             weight=weight,
             eps=eps,
             residual=residual,
+            extra_x=extra_x,
+            x_pair_index=x_pair_index,
             dtype=dtype,
             transposed_scale=transposed_scale,
             interpret=interpret,
         )
-    normed, next_res = fused_add_rms_norm(x, residual, weight=weight, eps=eps)
+    x_slice = x[x_pair_index] if x_pair_index is not None else x
+    x_eff = (
+        (x_slice.astype(jnp.float32) + extra_x.astype(jnp.float32)).astype(
+            x_slice.dtype
+        )
+        if extra_x is not None
+        else x_slice
+    )
+    normed, next_res = fused_add_rms_norm(x_eff, residual, weight=weight, eps=eps)
     x_q, x_scale = quantize_fp8_act(normed, dtype=dtype)
     if transposed_scale:
         x_scale = jnp.transpose(x_scale.reshape(-1, 1))
